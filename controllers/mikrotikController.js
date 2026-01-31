@@ -1,0 +1,2485 @@
+const crypto = require("crypto");
+const axios = require("axios");
+const fs = require("fs");
+const fsp = require("fs").promises;
+const path = require("path");
+const appRoot = require("app-root-path").path;
+const dns = require("dns").promises;
+const { exec, execFile } = require("child_process");
+const { socketManager } = require("./socketController");
+
+const { DataBase } = require("../helpers/databaseOperation");
+const { Mikrotik } = require("../helpers/mikrotikOperation");
+const { MikrotikConnection } = require("../configs/mikrotikConfig");
+const { Utils } = require("../utils/Functions");
+const { Mailer } = require("./mailerController");
+const { SMS } = require("./smsController");
+const { Auth } = require("./authController");
+
+class Mikrotikcontroller {
+    constructor() {
+        this.db = new DataBase();
+        this.mikrotik = new Mikrotik();
+        this.config = new MikrotikConnection();
+        this.mailer = new Mailer();
+        this.sms = new SMS();
+        this.auth = new Auth();
+        this.routerAutoSessions = new Map();
+    }
+
+    async safeCloseChannel(channel) {
+        if (!channel) return;
+        try {
+            await channel.close();
+        } catch (error) { }
+    }
+
+    async ensureHotspotMacCookie(channel, sessionTimeout) {
+        try {
+            const loginBy = "http-chap,http-pap,mac-cookie";
+            const profiles = await this.mikrotik.getHotspotProfiles(channel);
+            if (!profiles || profiles.length === 0) return;
+            for (const profile of profiles) {
+                const updates = {
+                    "login-by": loginBy,
+                    "mac-cookie": "yes",
+                };
+                if (sessionTimeout) {
+                    updates["mac-cookie-timeout"] = sessionTimeout;
+                }
+                await this.mikrotik.updateHotspotServerProfile(channel, profile[".id"], updates);
+            }
+        } catch (error) { }
+    }
+
+    getNextAutoRouterIp(usedHosts) {
+        const used = new Set(
+            (usedHosts || [])
+                .filter((host) => typeof host === "string" && host.startsWith("10.10.10."))
+                .map((host) => host.trim())
+        );
+        for (let i = 2; i <= 254; i += 1) {
+            const candidate = `10.10.10.${i}`;
+            if (!used.has(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    async manageMikrotikUser(data) {
+        const { platformID, action, profileName, host, code, password, username } = data;
+        if (!platformID || !action) {
+            return { success: false, message: "platformID and action are required parameters" };
+        }
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                if (action === "add") {
+                    if (!profileName) return { success: false, message: `Profile name is required when adding users` };
+                    const profiles = await this.mikrotik.listHotspotProfiles(channel);
+                    const existingProfiles = profiles.filter(p => p.name === profileName);
+                    if (existingProfiles.length === 0) return { success: false, message: `Profile '${profileName}' not found` };
+                    const packages = await this.db.getPackagesByPlatformID(platformID);
+                    if (!packages || packages.length === 0) return { success: false, message: `No packages found for platform ${platformID}` };
+                    const pkg = packages.find(pkg => pkg.name === profileName);
+                    if (!pkg) return { success: false, message: `Package for profile '${profileName}' not found` };
+                    const users = await this.mikrotik.listHotspotUsers(channel);
+                    const existingUser = users.find(u => u.name === (code || username));
+                    if (existingUser) {
+                        return {
+                            success: true,
+                            message: `User '${code || username}' already exists`,
+                            username: code || username,
+                            password: code || username,
+                            profile: profileName,
+                            limits: {
+                                uptime: pkg.uptime,
+                                data: pkg.usage,
+                                speed: pkg.speed ? `${pkg.speed} Mbps` : 'Unlimited'
+                            }
+                        };
+                    }
+                    let uptimeLimit = '';
+                    if (pkg.period && pkg.period.trim().toLowerCase() !== 'noexpiry') uptimeLimit = this.formatUptime(pkg.period);
+                    let bytesTotal = '';
+                    if (pkg.usage && pkg.usage !== 'Unlimited') {
+                        const [value, unit] = pkg.usage.split(' ');
+                        bytesTotal = this.convertToBytes(parseFloat(value), unit).toString();
+                    }
+                    let finalUsername = "";
+                    let finalPassword = "";
+                    if (code && code.trim()) { finalUsername = code; finalPassword = code; }
+                    else if (username && username.trim() && password && password.trim()) { finalUsername = username; finalPassword = password; }
+                    else {
+                        const cred = this.generateCode();
+                        finalUsername = cred;
+                        finalPassword = cred;
+                    }
+                    await this.mikrotik.addHotspotUser(channel, {
+                        name: finalUsername,
+                        password: finalPassword,
+                        profile: profileName,
+                        limitUptime: uptimeLimit,
+                        limitBytesTotal: bytesTotal ? bytesTotal : 0
+                    });
+                    return {
+                        success: true,
+                        message: "User added successfully",
+                        username: finalUsername,
+                        password: finalPassword,
+                        profile: profileName,
+                        limits: {
+                            uptime: pkg.uptime,
+                            data: pkg.usage,
+                            speed: pkg.speed ? `${pkg.speed} Mbps` : 'Unlimited'
+                        }
+                    };
+                } else if (action === "remove") {
+                    if (!username) return { success: true, message: `username is required for removal` };
+                    const profiles = await this.mikrotik.listHotspotUsers(channel);
+                    const existingUser = profiles.find(p => p.name === username);
+                    const mikrotikActiveUsers = await this.mikrotik.listHotspotActiveUsers(channel);
+                    const mikrotikActiveUser = mikrotikActiveUsers.find(u => u.name === username);
+                    const cookies = await this.mikrotik.listHotspotCookies(channel);
+                    const targetCookies = cookies.filter(c => c.user === username);
+                    if (!existingUser) return { success: true, message: `User '${username}' not found` };
+                    if (Array.isArray(targetCookies) && targetCookies.length > 0) {
+                        for (const cookie of targetCookies) await this.mikrotik.deleteHotspotCookie(channel, cookie['.id']);
+                    }
+                    await this.mikrotik.deleteHotspotUser(channel, existingUser['.id']);
+                    if (mikrotikActiveUser && mikrotikActiveUser['.id']) await this.mikrotik.deleteHotspotActiveUser(channel, mikrotikActiveUser['.id']);
+                    return { success: true, message: "User removed successfully" };
+                } else {
+                    return { success: false, message: "Invalid action. Use 'add' or 'remove'" };
+                }
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message, errorDetails: error.stack, action: action, profileName: profileName, username: username };
+        }
+    }
+
+    async manageMikrotikPPPoE(data) {
+        const { platformID, user, host } = data;
+        if (!platformID || !user || !host) return { success: false, message: "platformID, user, host, and action are required parameters" };
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                const response = await this.mikrotik.listSecrets(channel);
+                const secret = response.find(s => s.name === user);
+                if (!secret) return { success: false, message: `PPP secret (user) "${user}" does not exist.` };
+                await this.mikrotik.updateSecret(channel, secret['.id'], { disabled: false });
+                return { success: true, message: `PPP secret (user) "${user}" has been enabled.` };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message || "An unexpected error occurred.", error: error.stack };
+        }
+    }
+
+    async createMikrotikProfile(platformID, profileName, rateLimit, pool, host, sharedUsers, uptimeLimit, category) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                const profiles = await this.mikrotik.listHotspotProfiles(channel);
+                const existingProfile = profiles.find(p => p.name === profileName);
+                if (existingProfile) return { success: false, message: "Profile name already exists" };
+                let sharedUsersValue = sharedUsers;
+                if (sharedUsers !== undefined && sharedUsers !== null) {
+                    if (String(sharedUsers).toLowerCase() === "unlimited") sharedUsersValue = "unlimited";
+                    else {
+                        const numUsers = Number(sharedUsers);
+                        if (isNaN(numUsers) || numUsers < 1) return { success: false, message: "Invalid shared users value. Use a positive number or 'Unlimited'" };
+                        sharedUsersValue = numUsers.toString();
+                    }
+                }
+                let time = '';
+                if (uptimeLimit && uptimeLimit.trim() !== "NoExpiry") {
+                    time = this.formatUptime(uptimeLimit);
+                    if (!this.isValidMikrotikTime(time)) return { success: false, message: `Invalid session-timeout format: ${time}. Use format like "1h30m" or "1d"` };
+                }
+                const isDataPackage = String(category || '').toLowerCase() === 'data';
+                const addMacCookie = isDataPackage ? "no" : "yes";
+                const macCookieTimeout = !isDataPackage && time ? time : undefined;
+                await this.mikrotik.addHotspotProfile(channel, {
+                    name: profileName,
+                    rateLimit: rateLimit,
+                    sharedUsers: sharedUsersValue || 0,
+                    pool: pool,
+                    time,
+                    addMacCookie,
+                    macCookieTimeout,
+                });
+                await this.ensureHotspotMacCookie(channel, time);
+                return { success: true, message: "Profile created successfully" };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message, errorDetails: error.stack };
+        }
+    }
+
+    async verifyMikrotikUser(data) {
+        const { platformID, code, host } = data;
+        if (!platformID || !code || !host) return { success: false, message: "Missing credentials are required parameters" };
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                const profiles = await this.mikrotik.listHotspotUsers(channel);
+                const existingUser = profiles.find(p => p.name === code);
+                if (!existingUser) return { success: true, message: `User '${code}' not found` };
+                return { success: true, message: "User found" };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    formatUptime(input) {
+        const timeMap = { minutes: 'm', hours: 'h', days: 'd' };
+        const [value, unit] = input.split(' ');
+        if (!timeMap[unit]) throw new Error(`Invalid time unit: ${unit}. Use minutes/hours/days`);
+        return `${value}${timeMap[unit]}`;
+    }
+
+    isValidMikrotikTime(time) {
+        return /^(\d+d)?(\d+h)?(\d+m)?$/.test(time);
+    }
+
+    convertToBytes(value, unit) {
+        const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+        if (!unitMap[unit]) throw new Error(`Unsupported unit: ${unit}`);
+        return Math.round(value * unitMap[unit]);
+    }
+
+    async updateMikrotikProfile(platformID, currentProfileName, newProfileName, rateLimit, pool, host, sharedUsers, uptimeLimit) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                const profiles = await this.mikrotik.listHotspotProfiles(channel);
+                const existingProfile = profiles.find(p => p.name === currentProfileName);
+                if (!existingProfile) return { success: false, message: "Profile not found" };
+                const currentProfile = existingProfile;
+                const profileData = {};
+                if (newProfileName && newProfileName !== currentProfileName) {
+                    const nameCheck = profiles.find(p => p.name === newProfileName);
+                    if (nameCheck) return { success: false, message: "New profile name already exists" };
+                    profileData.name = newProfileName;
+                }
+                if (rateLimit !== undefined && rateLimit !== currentProfile['rate-limit']) profileData['rate-limit'] = rateLimit;
+                if (pool !== undefined && pool !== currentProfile['address-pool']) profileData['address-pool'] = pool;
+                if (sharedUsers !== undefined) {
+                    if (String(sharedUsers).toLowerCase() === 'unlimited') profileData['shared-users'] = 'unlimited';
+                    else {
+                        const numUsers = Number(sharedUsers);
+                        if (isNaN(numUsers)) throw new Error("Invalid shared users value. Use a number or 'unlimited'");
+                        profileData['shared-users'] = numUsers.toString();
+                    }
+                }
+                if (uptimeLimit && uptimeLimit.trim() !== "Unlimited" && uptimeLimit.trim() !== "NoExpiry") {
+                    const time = this.formatUptime(uptimeLimit);
+                    if (!this.isValidMikrotikTime(time)) throw new Error(`Invalid session-timeout: ${time}. Use format like '1h30m' or '1d'`);
+                    profileData['session-timeout'] = time;
+                }
+                if (Object.keys(profileData).length === 0) return { success: false, message: "No valid changes provided" };
+                await this.mikrotik.updateHotspotProfile(channel, currentProfile['.id'], profileData);
+                if (profileData["session-timeout"]) {
+                    await this.ensureHotspotMacCookie(channel, profileData["session-timeout"]);
+                }
+                return { success: true, message: "Profile updated successfully" };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message, errorDetails: error.stack };
+        }
+    }
+
+    async deleteMikrotikProfile(platformID, profileName, host) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
+            const { channel } = connection;
+            try {
+                const profiles = await this.mikrotik.listHotspotProfiles(channel);
+                const existingProfile = profiles.find(p => p.name === profileName);
+                if (!existingProfile) return { success: true, message: "Profile not found" };
+                await this.mikrotik.deleteHotspotProfile(channel, existingProfile['.id']);
+                return { success: true, message: "Profile deleted successfully" };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return { success: false, message: error.message, errorDetails: error.stack };
+        }
+    }
+
+    async handlePackageLifecycle(platformID, packageData, action) {
+        const { speed } = packageData;
+        try {
+            if (action === 'create') return await this.createMikrotikProfile(platformID, speed, speed);
+            if (action === 'delete') return await this.deleteMikrotikProfile(platformID, speed);
+        } catch (error) {
+            return { success: false, message: `Failed to ${action} package profile: ${error.message}` };
+        }
+    }
+
+    async fetchAddressPoolsFromConnections(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const stations = await this.db.getStations(platformID);
+            const results = [];
+            await Promise.all(stations.map(async (station) => {
+                try {
+                    const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                    if (!connection?.channel) {
+                        results.push({ id: station.id, host: station.mikrotikHost, username: station.mikrotikUser, status: "error", data: { pools: [] }, message: "Failed to connect to router" });
+                        return;
+                    }
+                    const { channel } = connection;
+                    try {
+                        const pools = await this.mikrotik.listPools(channel);
+                        results.push({ id: station.id, host: station.mikrotikHost, username: station.mikrotikUser, status: "success", data: { pools: pools.map((p) => ({ name: p.name, ranges: p.ranges, comment: p.comment || "" })) } });
+                    } finally {
+                        await this.safeCloseChannel(channel);
+                    }
+                } catch (error) {
+                    results.push({ id: station.id, host: station.mikrotikHost, username: station.mikrotikUser, status: "error", data: { pools: [] }, message: error.message || "Error fetching pools" });
+                }
+            }));
+            return res.status(200).json({ success: true, message: "Address pools fetched successfully", pools: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching address pools." });
+        }
+    }
+
+    async fetchMikrotikProfiles(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const results = [];
+            const stations = await this.db.getStations(platformID);
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+                const { channel } = connection;
+                try {
+                    const response = await this.mikrotik.listHotspotProfiles(channel);
+                    const profiles = response.map(item => ({
+                        id: item['.id'] || '',
+                        name: item['name'] || '',
+                        rateLimit: item['rate-limit'] || '',
+                        sharedUsers: item['shared-users'] || '',
+                        idleTimeout: item['idle-timeout'] || '',
+                        keepaliveTimeout: item['keepalive-timeout'] || '',
+                        sessionTimeout: item['session-timeout'] || '',
+                        statusAutorefresh: item['status-autorefresh'] || '',
+                        addMacCookie: item['add-mac-cookie'] || '',
+                        macCookieTimeout: item['mac-cookie-timeout'] || '',
+                        addressPool: item['address-pool'] || '',
+                        addressList: item['address-list'] || '',
+                        transparentProxy: item['transparent-proxy'] || '',
+                    }));
+                    results.push({ id: station.id, username: station.mikrotikUser, host: station.mikrotikHost, status: 'success', data: { profiles } });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return res.status(200).json({ success: true, message: "Hotspot user profiles fetched successfully", profiles: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching hotspot user profiles." });
+        }
+    }
+
+    async fetchStations(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        const auth = await this.auth.AuthenticateRequest(token);
+        if (!auth.success) return res.json({ success: false, message: auth.message });
+        if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+        const platformID = auth.admin.platformID;
+        if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+        try {
+            const stations = await this.db.getMikrotikPlatformConfig(platformID);
+            const sanitizedStations = stations.map(station => {
+                const { mikrotikPassword, ...sanitizedStation } = station;
+                return sanitizedStation;
+            });
+            return res.status(200).json({ success: true, message: "Stations fetched successfully", stations: sanitizedStations });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching stations." });
+        }
+    }
+
+    async fetchAdminStations(req, res) {
+        const { token } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: "Missing credentials required!" });
+        const auth = await this.auth.AuthenticateRequest(token);
+        if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+        try {
+            const stations = await this.db.getAdminStations();
+            if (!stations || stations.length === 0) return res.status(200).json({ success: true, message: "No stations found for this platform.", stations: [] });
+            const stationsWithStatus = await Promise.all(stations.map(async (station) => {
+                const connection = await this.config.createMikrotikConnection(station);
+                return { ...station, connectionStatus: connection?.status, connectionMessage: connection?.message };
+            }));
+            return res.status(200).json({ success: true, message: "Stations fetched successfully", stations: stationsWithStatus });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching stations." });
+        }
+    }
+
+    async fetchInterfaces(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const results = [];
+            const stations = await this.db.getStations(platformID);
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+                const { channel } = connection;
+                try {
+                    const response = await this.mikrotik.listInterfaces(channel);
+                    const interfaces = response.map(item => ({ name: item?.name || '', type: item?.type || '', disabled: item?.disabled || '', macAddress: item['mac-address'] || '', mtu: item.mtu || '' }));
+                    results.push({ id: station.id, station: station.mikrotikHost, host: station.mikrotikHost, status: 'success', data: { interfaces } });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return res.status(200).json({ success: true, message: "Interfaces fetched successfully", profiles: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching interfaces." });
+        }
+    }
+
+    async fetchPPPSecret(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const connections = await this.config.createMikrotikClient(token);
+            if (!connections || connections.length === 0) return res.status(400).json({ success: false, message: "No valid router connections." });
+            const validConnections = connections.filter(conn => conn.status === "Connected" && conn.channel);
+            const results = [];
+            for (const conn of validConnections) {
+                const { id, host, username, channel } = conn;
+                try {
+                    const response = await this.mikrotik.listInterfaces(channel);
+                    const interfaces = response.map(item => ({ name: item?.name || '' }));
+                    results.push({ id, host, username, status: 'success', data: { interfaces } });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return res.status(200).json({ success: true, message: "Interfaces fetched successfully", profiles: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching interfaces." });
+        }
+    }
+
+    async fetchPPPprofile(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const results = [];
+            const stations = await this.db.getStations(platformID);
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+                const { channel } = connection;
+                try {
+                    const response = await this.mikrotik.listPPPProfiles(channel);
+                    const profiles = response.map(item => ({ name: item?.name || '', localAddress: item['local-address'] || '', remoteAddress: item['remote-address'] || '', rateLimit: item['rate-limit'] || '', dnsServer: item['dns-server'] || '' }));
+                    results.push({ id: station.id, station: station.name || station.mikrotikHost, host: station.mikrotikHost, status: 'success', data: { profiles } });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return res.status(200).json({ success: true, message: "PPP profiles fetched successfully", profiles: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching PPP profiles." });
+        }
+    }
+
+    async fetchPPPoEServers(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const results = [];
+            const stations = await this.db.getStations(platformID);
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+                const { channel } = connection;
+                try {
+                    const response = await this.mikrotik.listPPPServers(channel);
+                    const servers = response.map(item => ({ serviceName: item['service-name'] || '', interface: item['interface'] || '', authentication: item['authentication'] || '', maxSessions: item['max-sessions'] || '', defaultProfile: item['default-profile'] || '', disabled: item['disabled'] || 'no', id: item['.id'] || '' }));
+                    results.push({ id: station.id, station: station.name || station.mikrotikHost, host: station.mikrotikHost, status: 'success', data: { servers } });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return res.status(200).json({ success: true, message: "PPPoE servers fetched successfully", servers: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching PPPoE servers." });
+        }
+    }
+
+    async fetchStationSummary(req, res) {
+        const { token, stationId, host } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        if (!stationId && !host) {
+            return res.status(400).json({ success: false, message: "Missing stationId or host." });
+        }
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+
+            const station = stationId
+                ? await this.db.getStationByID(stationId)
+                : await this.db.getStationByHost(host);
+            if (!station) {
+                return res.status(404).json({ success: false, message: "Station not found." });
+            }
+
+            const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+            if (!connection?.channel) {
+                return res.status(200).json({
+                    success: false,
+                    message: "Mikrotik failed to connect",
+                    data: { pools: [], interfaces: [], hotspotProfiles: [], pppProfiles: [], pppServers: [] },
+                });
+            }
+
+            const { channel } = connection;
+            try {
+                const [pools, interfaces, hotspotProfiles, pppProfiles, pppServers] = await Promise.all([
+                    this.mikrotik.listPools(channel),
+                    this.mikrotik.listInterfaces(channel),
+                    this.mikrotik.listHotspotProfiles(channel),
+                    this.mikrotik.listPPPProfiles(channel),
+                    this.mikrotik.listPPPServers(channel),
+                ]);
+
+                return res.status(200).json({
+                    success: true,
+                    message: "Station summary fetched successfully",
+                    data: {
+                        pools: pools.map((p) => ({ name: p.name, ranges: p.ranges, comment: p.comment || "" })),
+                        interfaces: interfaces.map((item) => ({
+                            name: item?.name || "",
+                            type: item?.type || "",
+                            disabled: item?.disabled || "",
+                            macAddress: item["mac-address"] || "",
+                            mtu: item.mtu || "",
+                        })),
+                        hotspotProfiles: hotspotProfiles.map((item) => ({
+                            id: item[".id"] || "",
+                            name: item["name"] || "",
+                            rateLimit: item["rate-limit"] || "",
+                            sharedUsers: item["shared-users"] || "",
+                            idleTimeout: item["idle-timeout"] || "",
+                            keepaliveTimeout: item["keepalive-timeout"] || "",
+                            sessionTimeout: item["session-timeout"] || "",
+                            statusAutorefresh: item["status-autorefresh"] || "",
+                            addMacCookie: item["add-mac-cookie"] || "",
+                            macCookieTimeout: item["mac-cookie-timeout"] || "",
+                            addressPool: item["address-pool"] || "",
+                            addressList: item["address-list"] || "",
+                            transparentProxy: item["transparent-proxy"] || "",
+                        })),
+                        pppProfiles: pppProfiles.map((item) => ({
+                            name: item?.name || "",
+                            localAddress: item["local-address"] || "",
+                            remoteAddress: item["remote-address"] || "",
+                            rateLimit: item["rate-limit"] || "",
+                            dnsServer: item["dns-server"] || "",
+                        })),
+                        pppServers: pppServers.map((item) => ({
+                            serviceName: item["service-name"] || "",
+                            interface: item["interface"] || "",
+                            authentication: item["authentication"] || "",
+                            maxSessions: item["max-sessions"] || "",
+                            defaultProfile: item["default-profile"] || "",
+                            disabled: item["disabled"] || "no",
+                            id: item[".id"] || "",
+                        })),
+                    },
+                });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching station summary." });
+        }
+    }
+
+    async updateAddressPool(req, res) {
+        try {
+            const { token, poolData } = req.body;
+            if (!token || !poolData?.newName || !poolData?.ranges || !poolData?.station) return res.status(400).json({ success: false, message: "Missing required parameters" });
+            const cidrRegex = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\/([0-9]|[1-2]\d|3[0-2])$/;
+            const rangeRegex = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+            const trimmedRange = poolData.ranges.trim();
+            const ipToNumber = (ip) => ip.split('.').reduce((acc, oct) => acc * 256 + Number(oct), 0);
+            if (cidrRegex.test(trimmedRange)) { }
+            else if (rangeRegex.test(trimmedRange)) {
+                const [startIP, endIP] = trimmedRange.split('-');
+                const startParts = startIP.split('.').map(Number);
+                const endParts = endIP.split('.').map(Number);
+                if (startParts[3] < 2 || endParts[3] > 254 || ipToNumber(startIP) > ipToNumber(endIP)) {
+                    return res.status(400).json({ success: false, message: "Invalid range. Start ≥ 2, end ≤ 254, and start ≤ end" });
+                }
+            } else {
+                return res.status(400).json({ success: false, message: "Invalid format. Use CIDR (e.g. 10.10.20.0/24) or range (e.g. 10.10.20.2-10.10.22.254)" });
+            }
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            if (!auth.admin.platformID) return res.status(400).json({ success: false, message: "Missing platformID" });
+            const connection = await this.config.createSingleMikrotikClient(auth.admin.platformID, poolData.station);
+            if (!connection) return res.status(400).json({ success: false, message: "Failed to create MikroTik client" });
+            const { channel } = connection;
+            try {
+                const existingPools = await this.mikrotik.listPools(channel);
+                const newBounds = Utils.getRangeBounds(poolData.ranges);
+                if (!newBounds) return res.status(400).json({ success: false, message: "Invalid IP range format" });
+                for (const pool of existingPools) {
+                    if (poolData.name && pool.name === poolData.name) continue;
+                    if (pool.ranges) {
+                        const poolBounds = Utils.getRangeBounds(pool.ranges);
+                        if (poolBounds && Utils.rangesOverlap(newBounds, poolBounds)) {
+                            return res.status(400).json({ success: false, message: `Range ${poolData.ranges} overlaps with pool '${pool.name}' (${pool.ranges})` });
+                        }
+                    }
+                }
+                if (poolData.name) {
+                    const existingPool = existingPools.find(p => p.name === poolData.name);
+                    if (!existingPool) return res.status(404).json({ success: false, message: `Pool '${poolData.name}' not found.` });
+                    const duplicateNewName = existingPools.find(p => p.name === poolData.newName);
+                    if (duplicateNewName && duplicateNewName['.id'] !== existingPool['.id']) return res.status(400).json({ success: false, message: `Pool name '${poolData.newName}' already exists.` });
+                    await this.mikrotik.updatePool(channel, existingPool['.id'], { name: poolData.newName, ranges: poolData.ranges, comment: poolData.comment || '' });
+                    return res.status(200).json({ success: true, message: `Pool '${poolData.name}' updated successfully${poolData.name !== poolData.newName ? ` to '${poolData.newName}'` : ''}.` });
+                }
+                const duplicateNewName = existingPools.find(p => p.name === poolData.newName);
+                if (duplicateNewName) return res.status(400).json({ success: false, message: `Pool '${poolData.newName}' already exists.` });
+                await this.mikrotik.addPool(channel, { name: poolData.newName, ranges: poolData.ranges, comment: poolData.comment || '' });
+                return res.status(200).json({ success: true, message: `Pool '${poolData.newName}' added successfully` });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+        }
+    }
+
+    async deleteAddressPool(req, res) {
+        try {
+            const { token, poolData } = req.body;
+            if (!token || !poolData) return res.status(400).json({ success: false, message: "Missing required parameters are required" });
+            const poolName = poolData.name;
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            if (!auth.admin.platformID) return res.status(400).json({ success: false, message: "Missing platformID in authentication data" });
+            const connection = await this.config.createSingleMikrotikClient(auth.admin.platformID, poolData.station);
+            if (!connection) return res.status(400).json({ success: false, message: "Failed to create MikroTik client" });
+            const channel = connection.channel;
+            try {
+                const existingPools = await this.mikrotik.listPools(channel);
+                const existingPool = existingPools.find(pool => pool.name === poolData.name);
+                if (!existingPool) return { success: true, message: `Pool '${poolName}' not found` };
+                await this.mikrotik.deletePool(channel, existingPool['.id']);
+                return res.status(200).json({ success: true, message: `Pool '${poolName}' deleted successfully` });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+        }
+    }
+
+    async togglePPPoEStatus(req, res) {
+        const { token, id } = req.body;
+        if (!token || !id) return res.status(400).json({ success: false, message: "Missing required parameters" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platform ID" });
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+            const { channel } = connection;
+            try {
+                const pppoe = await this.mikrotik.getPPPoEById(channel, id);
+                if (!pppoe) return res.status(404).json({ success: false, message: "PPPoE not found" });
+                const newStatus = pppoe.status === "active" ? "inactive" : "active";
+                await this.mikrotik.updatePPPoE(channel, id, { status: newStatus });
+                return res.status(200).json({ success: true, message: `PPPoE ${newStatus} successfully` });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+        }
+    }
+
+    async updateMikrotikPPPoE(req, res) {
+        const {
+            station,
+            clientname,
+            clientpassword,
+            profile,
+            interface: interfaceName,
+            name,
+            pool,
+            price,
+            maxsessions,
+            servicename,
+            period,
+            id,
+            token,
+            localaddress,
+            DNSserver,
+            speed,
+            email,
+            status,
+            paymentLink,
+            phone,
+            customFields
+        } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: "Missing authentication token" });
+        if (!station || !clientname || !clientpassword || !servicename || !name) {
+            return res.status(400).json({ success: false, message: "Missing required fields" });
+        }
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platform ID" });
+            const client = id ? await this.db.getPPPoEById(id) : null;
+            if (id && !client) {
+                return res.status(404).json({ success: false, message: "PPPoE client not found" });
+            }
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+            const { channel } = connection;
+            const rateLimit = speed ? `${speed}M/${speed}M` : '';
+            let pppoe_link = "";
+            if (!paymentLink) pppoe_link = Math.random().toString(36).substring(2, 15);
+            let thisprofile = profile && profile.trim() ? profile.trim() : name.trim();
+            try {
+                const matchedProfile = (await this.mikrotik.listPPPProfiles(channel)).find(p => p.name === thisprofile);
+                if (matchedProfile && id) {
+                    const updates = { name: thisprofile };
+                    if (localaddress) updates["local-address"] = localaddress;
+                    if (pool) updates["remote-address"] = pool;
+                    if (DNSserver) updates["dns-server"] = DNSserver;
+                    if (rateLimit) updates["rate-limit"] = rateLimit;
+                    await this.mikrotik.updatePPPProfile(channel, matchedProfile[".id"], updates);
+                } else if (!matchedProfile) {
+                    await this.mikrotik.addPPPProfile(channel, { name: thisprofile, localAddress: localaddress, remoteAddress: pool, dnsServer: DNSserver, rateLimit: rateLimit });
+                }
+                const existingServers = await this.mikrotik.listPPPServers(channel);
+                const existingServer = existingServers.find(s => s['service-name'] === servicename);
+                let servername = servicename;
+                if (!existingServer) {
+                    const newServer = { "service-name": servername, "interface": interfaceName, "authentication": "pap,chap,mschap1,mschap2", "max-sessions": maxsessions, "disabled": "no" };
+                    await this.mikrotik.addPPPServer(channel, newServer);
+                } else {
+                    if (id) {
+                        const updates = {};
+                        if (existingServer['service-name'] !== servername) updates['service-name'] = servername;
+                        if (existingServer['interface'] !== interfaceName) updates['interface'] = interfaceName;
+                        if (existingServer['disabled'] !== 'no') updates['disabled'] = 'no';
+                        if (Object.keys(updates).length > 0) await this.mikrotik.updatePPPServer(channel, existingServer['.id'], updates);
+                    }
+                }
+                const existingSecrets = await this.mikrotik.listSecrets(channel);
+                const lookupName = client?.clientname || clientname;
+                const existingSecret = existingSecrets.find(s => s.name === lookupName) || existingSecrets.find(s => s.name === clientname);
+                const isdisabled = status === "active" ? "no" : "yes";
+                if (existingSecret) {
+                    if (!id) {
+                        return res.status(500).json({ success: false, message: "PPPoE user already exists, create a new one!" });
+                    } else {
+                        const updates = { name: clientname, password: clientpassword, service: 'pppoe', profile: thisprofile, disabled: isdisabled };
+                        await this.mikrotik.updateSecret(channel, existingSecret['.id'], updates);
+                    }
+                } else {
+                    const newSecret = { name: clientname, password: clientpassword, service: 'pppoe', profile: thisprofile, disabled: isdisabled };
+                    await this.mikrotik.addSecret(channel, newSecret);
+                }
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+            let expireAt = null;
+            if (period) {
+                const match = period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+                if (match) {
+                    const value = parseInt(match[1]);
+                    const unit = match[2].toLowerCase();
+                    const now = new Date();
+                    if (!id) {
+                        if (status === "active") {
+                            expireAt = Utils.addPeriod(now, value, unit);
+                        }
+                    } else if (client) {
+                        const wasActive = client.status === "active";
+                        const isActive = status === "active";
+                        if (!wasActive && isActive) {
+                            expireAt = Utils.addPeriod(now, value, unit);
+                        } else if (client.expiresAt) {
+                            expireAt = new Date(client.expiresAt);
+                        } else {
+                            expireAt = null;
+                        }
+                    }
+                }
+            } else if (client?.expiresAt) {
+                expireAt = new Date(client.expiresAt);
+            }
+            let newamount = "0";
+            if (!id) {
+                if (status === "active") newamount = "0";
+                else newamount = Number(price).toString();
+            } else {
+                const existing = client.amount ? Number(client.amount) : 0;
+                const oldPrice = client.price ? Number(client.price) : 0;
+                const newPrice = Number(price);
+                if (status === "active") newamount = "0";
+                else {
+                    if (existing === 0) newamount = newPrice.toString();
+                    else {
+                        if (newPrice !== oldPrice) {
+                            const diff = newPrice - oldPrice;
+                            const adjusted = existing + diff;
+                            newamount = adjusted > 0 ? adjusted.toString() : "0";
+                        } else {
+                            newamount = existing.toString();
+                        }
+                    }
+                }
+            }
+            let accountNumber = "";
+            const config = await this.db.getPlatformConfig(platformID);
+            if (config) {
+                if (config.mpesaShortCodeType && (config.mpesaShortCodeType).toLowerCase() === "paybill") {
+                    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+                    accountNumber = Array.from({ length: 3 }, () => characters.charAt(Math.floor(Math.random() * characters.length))).join('');
+                }
+            }
+            const pppoeData = {
+                name,
+                profile: thisprofile,
+                servicename,
+                station: station,
+                pool,
+                platformID,
+                devices: "100",
+                price,
+                period,
+                clientname,
+                clientpassword,
+                interface: interfaceName,
+                maxsessions,
+                status,
+                amount: newamount,
+                paymentLink: paymentLink ? paymentLink : client?.paymentLink || pppoe_link,
+                email,
+                expiresAt: expireAt ? expireAt : null,
+                phone,
+                accountNumber,
+                customFields: customFields ? customFields : {},
+            };
+            const dbOperation = id ? this.db.updatePPPoE(id, pppoeData) : this.db.createPPPoE(pppoeData);
+            const result = await dbOperation;
+            const platform = await this.db.getPlatform(platformID);
+            const actualPaymentLink = paymentLink ? paymentLink : pppoe_link;
+            if (email && !id) {
+                const template = await this.db.getPlatformEmailTemplate(platformID);
+                let message = '';
+                const subject = `PPPoE Credentials from ${platform.name}!`;
+                if (status === "active") {
+                    template?.pppoeRegisterTemplate ? message = Utils.formatMessage(template?.pppoeRegisterTemplate, {
+                        name: clientname,
+                        password: clientpassword,
+                        email: email,
+                        company: platform.name,
+                        package: name,
+                        price: price,
+                        amount: newamount,
+                        expiry: expireAt ? expireAt : null,
+                        paymentLink: `<a href="https://${platform.url}/pppoe?info=${actualPaymentLink}">https://${platform.url}/pppoe?info=${actualPaymentLink}</a>`,
+                    }) : message = `<p>Your PPPoE credentials have been created by <strong>${platform.name}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${clientpassword}</p><p>For more status and information about this service, visit:<br /><a href="https://${platform.url}/pppoe?info=${actualPaymentLink}">https://${platform.url}/pppoe?info=${actualPaymentLink}</a></p>`;
+                } else if (status === "inactive") {
+                    template?.pppoeInactiveTemplate ? message = Utils.formatMessage(template?.pppoeInactiveTemplate, {
+                        name: clientname,
+                        password: clientpassword,
+                        email: email,
+                        company: platform.name,
+                        package: name,
+                        price: price,
+                        amount: newamount,
+                        expiry: expireAt ? expireAt : null,
+                        paymentLink: `<a href="https://${platform.url}/pppoe?info=${actualPaymentLink}">https://${platform.url}/pppoe?info=${actualPaymentLink}</a>`,
+                    }) : message = `<p>Your PPPoE account is currently inactive.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${clientpassword}</p><p>To activate your credentials, please pay KSH ${newamount} for your ${name} plan.<br />Visit <a href="https://${platform.url}/pppoe?info=${actualPaymentLink}">https://${platform.url}/pppoe?info=${actualPaymentLink}</a> to complete payment.</p>`;
+                }
+                const data = { name: email, type: "accounts", email: email, subject: subject, message: message, company: platform.name };
+                const sendpppoeemail = await this.mailer.EmailTemplate(data);
+                if (!sendpppoeemail.success) {
+                    return res.status(200).json({ success: true, message: `PPPoE created successfully. ${sendpppoeemail.message}`, pppoe: result });
+                }
+            }
+            if (phone && !id) {
+                const platformConfig = await this.db.getPlatformConfig(platformID);
+                if (platformConfig?.sms === true) {
+                    const sms = await this.db.getPlatformSMS(platformID);
+                    if (!sms) return { success: false, message: "SMS not found!" };
+                    if (sms && sms.sentPPPoE === false) return { success: false, message: "PPPoE SMS sending is disabled!" };
+                    if (Number(sms.balance) < Number(sms.costPerSMS)) return { success: false, message: "Insufficient SMS Balance!" };
+                    const platform = await this.db.getPlatform(platformID);
+                    if (!platform) return { success: false, message: "Platform not found!" };
+                    let sms_message = ``;
+                    if (status === "active") {
+                        sms_message = Utils.formatMessage(sms.pppoeRegisterSMS, {
+                            company: platform.name,
+                            username: name,
+                            period: period,
+                            amount: newamount,
+                            package: profile,
+                            expiry: expireAt,
+                            paymentLink: `https://${platform.url}/pppoe?info=${actualPaymentLink}`,
+                        });
+                    } else if (status === "inactive") {
+                        sms_message = Utils.formatMessage(sms.pppoeInactiveSMS, {
+                            company: platform.name,
+                            username: name,
+                            period: period,
+                            amount: newamount,
+                            package: profile,
+                            expiry: expireAt,
+                            paymentLink: `https://${platform.url}/pppoe?info=${actualPaymentLink}`,
+                        });
+                    }
+                    const is_send = await this.sms.sendSMS(phone, sms_message, sms);
+                    if (is_send.success && sms?.default === true) {
+                        const newSMSBalance = Number(sms.balance) - Number(sms.costPerSMS);
+                        const newSMS = Math.floor(Number(sms.remainingSMS)) - 1;
+                        await this.db.updatePlatformSMS(platformID, { balance: newSMSBalance.toString(), remainingSMS: newSMS.toString() });
+                    }
+                }
+            }
+            return res.json({ success: true, message: id ? "PPPoE updated successfully" : "PPPoE created successfully", pppoe: result });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "An error occured, try again!" });
+        }
+    }
+
+    async deletePppoE(req, res) {
+        const { id, token } = req.body;
+        if (!token || !id) return res.status(400).json({ success: false, message: "Missing authentication token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platform ID" });
+            const platform = await this.db.getPlatform(platformID);
+            if (!platform) return res.status(400).json({ success: false, message: "Platform does not exist!" });
+            const client = await this.db.getPPPoEById(id);
+            if (!client) return res.status(400).json({ success: false, message: "PPPoE does not exist!" });
+            await this.db.deletePPPoE(id);
+            const connection = await this.config.createSingleMikrotikClient(platformID, client.station);
+            if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
+            const { channel } = connection;
+            const servername = client.servicename;
+            const clientname = client.clientname;
+            try {
+                const secrets = await this.mikrotik.listSecrets(channel);
+                const secret = secrets.find(s => s.name === clientname);
+                if (secret) await this.mikrotik.deleteSecret(channel, secret['.id']);
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+            const email = client.email;
+            const subject = `PPPoE Credentials deleted from ${platform.name}!`;
+            const message = `<p>Your PPPoE credentials have been deleted by <strong>${platform.name}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${client.clientpassword}</p><p>For more status and information about this service, visit:<br /><a href="https://${platform.url}/pppoe?info=${client.paymentLink}">https://${platform.url}/pppoe?info=${client.paymentLink}</a></p>`;
+            const data = { name: email, type: "accounts", email: email, subject: subject, message: message, company: platform.name };
+            const sendpppoeemail = await this.mailer.EmailTemplate(data);
+            return res.status(200).json({ success: true, message: `PPPoE deleted successfully${sendpppoeemail.success ? "" : `. ${sendpppoeemail.message}`}` });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "An error occurred, try again!" });
+        }
+    }
+
+    async getHotspotDNSName(platformID, host) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: "No valid MikroTik connection" };
+            const { channel } = connection;
+            try {
+                const servers = await this.mikrotik.listHotspotServers(channel);
+                if (!servers || servers.length === 0) return { success: false, message: "No hotspot servers found in your router!" };
+                const profiles = await this.mikrotik.getHotspotProfiles(channel);
+                if (!profiles || profiles.length === 0) return { success: false, message: "No hotspot profiles found in your router!" };
+                let selectedProfileName;
+                if (servers.length === 1) selectedProfileName = servers[0].profile;
+                else {
+                    const bridgeServer = servers.find(s => s.interface && s.interface.toLowerCase().includes("bridge"));
+                    if (!bridgeServer) return { success: false, message: "No hotspot servers with bridge interface found in your router!" };
+                    selectedProfileName = bridgeServer.profile;
+                }
+                const matchedProfile = profiles.find(p => p.name === selectedProfileName);
+                if (!matchedProfile) return { success: false, message: "Profile not found for the hotspot server!" };
+                return { success: true, message: "DNS name found", dns_name: matchedProfile["dns-name"] || null };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return { success: false, message: "An error occurred, try again!" };
+        }
+    }
+
+    formatMikrotikTime(mikrotikTime) {
+        return mikrotikTime.replace(/d/, " days ").replace(/h/, " hours ").replace(/m/, " minutes ").replace(/s/, " seconds ");
+    }
+
+    generateCode(length = 6) {
+        return crypto.randomBytes(length).toString("hex").slice(0, length).toUpperCase();
+    }
+
+    async mikrotikConnections(req, res) {
+        const { token } = req.body;
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const result = await this.config.createMikrotikClient(token);
+            return res.json({ success: true, message: "Connections found!", result });
+        } catch (error) {
+            return res.json({ success: false, message: "Failed to connect to MikroTik routers!" });
+        }
+    }
+
+    async debugMikrotikConnections(req, res) {
+        const { token, stationId } = req.body || {};
+        if (!token) {
+            return res.status(400).json({ success: false, message: "Missing token" });
+        }
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            const stations = await this.db.getMikrotikPlatformConfig(platformID);
+            const targetStations = stationId
+                ? stations.filter((s) => s.id === stationId)
+                : stations;
+
+            const hostCounts = new Map();
+            targetStations.forEach((s) => {
+                if (!s.mikrotikHost) return;
+                hostCounts.set(s.mikrotikHost, (hostCounts.get(s.mikrotikHost) || 0) + 1);
+            });
+
+            const results = await Promise.all(
+                targetStations.map(async (station) => {
+                    const issues = [];
+                    const fixes = [];
+                    const warnings = [];
+                    const { id, mikrotikHost, mikrotikUser, mikrotikPassword } = station;
+
+                    if (!mikrotikHost || !mikrotikUser || !mikrotikPassword) {
+                        issues.push("missing_credentials");
+                        return { id, host: mikrotikHost, status: "Failed", message: "Missing credentials", issues, fixes, warnings };
+                    }
+
+                    if ((hostCounts.get(mikrotikHost) || 0) > 1) {
+                        warnings.push("ip_conflict");
+                    }
+
+                    const connection = await this.config.createSingleMikrotikClient(platformID, mikrotikHost);
+                    if (!connection?.channel) {
+                        issues.push("connection_failed");
+                        return { id, host: mikrotikHost, status: "Offline", message: "Link down or connection failed", issues, fixes, warnings };
+                    }
+
+                    const { channel } = connection;
+                    try {
+                        const ensureResult = await this.ensureRouterBasics(channel, mikrotikHost);
+                        issues.push(...ensureResult.issues);
+                        fixes.push(...ensureResult.fixes);
+
+                        const pingOk = await this.pingInternal(channel);
+                        if (!pingOk) {
+                            issues.push("link_down");
+                            return { id, host: mikrotikHost, status: "Offline", message: "Link down", issues, fixes, warnings };
+                        }
+
+                        return { id, host: mikrotikHost, status: "Connected", message: "OK", issues, fixes, warnings };
+                    } catch (err) {
+                        issues.push("debug_failed");
+                        return { id, host: mikrotikHost, status: "Failed", message: err.message || "Debug failed", issues, fixes, warnings };
+                    } finally {
+                        await this.safeCloseChannel(channel);
+                    }
+                })
+            );
+
+            return res.json({ success: true, message: "Debug complete", result: results });
+        } catch (error) {
+            return res.json({ success: false, message: "Failed to debug routers" });
+        }
+    }
+
+    async ensureRouterBasics(channel, mikrotikHost) {
+        const issues = [];
+        const fixes = [];
+        try {
+            const wireguards = await channel.write("/interface/wireguard/print", []);
+            let wg = wireguards.find((w) => w.name === "wireguard") || wireguards[0];
+            if (!wg) {
+                await channel.write("/interface/wireguard/add", [
+                    "=listen-port=13231",
+                    "=mtu=1420",
+                    "=name=wireguard",
+                ]);
+                fixes.push("wireguard_added");
+                const updated = await channel.write("/interface/wireguard/print", []);
+                wg = updated.find((w) => w.name === "wireguard") || updated[0];
+            }
+
+            if (wg?.name) {
+                const addresses = await channel.write("/ip/address/print", []);
+                const hasAddress = addresses.some((a) => String(a.address || "").startsWith(`${mikrotikHost}/`));
+                if (!hasAddress) {
+                    await channel.write("/ip/address/add", [
+                        `=address=${mikrotikHost}/24`,
+                        `=interface=${wg.name}`,
+                    ]);
+                    fixes.push("wireguard_address_added");
+                }
+
+                const peers = await channel.write("/interface/wireguard/peers/print", []);
+                const peerExists = peers.some(
+                    (p) =>
+                        p["endpoint-address"] === "77.37.97.244:443" ||
+                        p["public-key"] === "xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo="
+                );
+                if (!peerExists) {
+                    await channel.write("/interface/wireguard/peers/add", [
+                        `=interface=${wg.name}`,
+                        `=name=novapeer`,
+                        `=public-key=xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=`,
+                        `=endpoint-address=77.37.97.244:443`,
+                        `=endpoint-port=51820`,
+                        `=allowed-address=10.10.10.1/32`,
+                        `=persistent-keepalive=10`,
+                    ]);
+                    fixes.push("wireguard_peer_added");
+                }
+            }
+
+            const services = await channel.write("/ip/service/print", ["?name=api"]);
+            const apiService = services?.[0];
+            if (apiService) {
+                const address = String(apiService.address || "");
+                if (!address.includes("10.10.10.0/24")) {
+                    await channel.write("/ip/service/set", [
+                        `=.id=${apiService[".id"]}`,
+                        "=address=10.10.10.0/24",
+                    ]);
+                    fixes.push("api_allowed");
+                }
+            }
+
+            const firewall = await channel.write("/ip/firewall/filter/print", []);
+            const hasApiRule = firewall.some(
+                (r) =>
+                    r.chain === "input" &&
+                    r["src-address"] === "10.10.10.0/24" &&
+                    r.protocol === "tcp" &&
+                    String(r["dst-port"] || "").includes("8728")
+            );
+            if (!hasApiRule) {
+                await channel.write("/ip/firewall/filter/add", [
+                    "=chain=input",
+                    "=src-address=10.10.10.0/24",
+                    "=protocol=tcp",
+                    "=dst-port=8728",
+                    "=action=accept",
+                    `=comment=Allow API from WireGuard`,
+                ]);
+                fixes.push("firewall_api_rule_added");
+            }
+
+            const hasUdpRule = firewall.some(
+                (r) =>
+                    r.chain === "input" &&
+                    r.protocol === "udp" &&
+                    String(r["dst-port"] || "").includes("13231")
+            );
+            if (!hasUdpRule) {
+                await channel.write("/ip/firewall/filter/add", [
+                    "=chain=input",
+                    "=protocol=udp",
+                    "=dst-port=13231",
+                    "=action=accept",
+                ]);
+                fixes.push("firewall_udp_rule_added");
+            }
+
+            const hasSubnetRule = firewall.some(
+                (r) => r.chain === "input" && r["src-address"] === "10.10.10.0/24"
+            );
+            if (!hasSubnetRule) {
+                await channel.write("/ip/firewall/filter/add", [
+                    "=chain=input",
+                    "=src-address=10.10.10.0/24",
+                    "=action=accept",
+                ]);
+                fixes.push("firewall_subnet_rule_added");
+            }
+
+            const wgGarden = await channel.write("/ip/hotspot/walled-garden/print", []);
+            const hasNova = wgGarden.some((g) => g["dst-host"] === "novawifi.online");
+            const hasWildcard = wgGarden.some((g) => g["dst-host"] === "*.novawifi.online");
+            const hasIpify = wgGarden.some((g) => g["dst-host"] === "api64.ipify.org");
+            if (!hasNova) {
+                await channel.write("/ip/hotspot/walled-garden/add", [
+                    "=dst-host=novawifi.online",
+                    "=action=allow",
+                ]);
+                fixes.push("walled_garden_nova_added");
+            }
+            if (!hasWildcard) {
+                await channel.write("/ip/hotspot/walled-garden/add", [
+                    "=dst-host=*.novawifi.online",
+                    "=action=allow",
+                ]);
+                fixes.push("walled_garden_wildcard_added");
+            }
+            if (!hasIpify) {
+                await channel.write("/ip/hotspot/walled-garden/add", [
+                    "=dst-host=api64.ipify.org",
+                    "=action=allow",
+                ]);
+                fixes.push("walled_garden_ipify_added");
+            }
+
+            const dns = await channel.write("/ip/dns/print", []);
+            const dnsRow = dns?.[0];
+            if (dnsRow) {
+                const servers = String(dnsRow.servers || "");
+                if (!servers || servers.trim().length === 0) {
+                    await channel.write("/ip/dns/set", [
+                        `=.id=${dnsRow[".id"]}`,
+                        "=servers=8.8.8.8,1.1.1.1",
+                        "=allow-remote-requests=yes",
+                    ]);
+                    fixes.push("dns_servers_set");
+                }
+            }
+        } catch (err) {
+            issues.push("config_check_failed");
+        }
+
+        return { issues, fixes };
+    }
+
+    async pingInternal(channel) {
+        try {
+            const result = await channel.write("/ping", [
+                "=address=10.10.10.1",
+                "=count=2",
+            ]);
+            return Array.isArray(result) && result.length > 0;
+        } catch {
+            return false;
+        }
+    }
+
+    async checkHotspotUserStatus(platformID, host) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: "No valid MikroTik connection" };
+            const { channel } = connection;
+            try {
+                const activeUsers = await this.mikrotik.listHotspotActiveUsers(channel);
+                return { success: true, users: activeUsers || [] };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return { success: false, reason: err.message, users: [] };
+        }
+    }
+
+    async checkPPPUserStatus(platformID, host) {
+        try {
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: "No valid MikroTik connection" };
+            const { channel } = connection;
+            try {
+                const activeUsers = await this.mikrotik.listPPPActiveUsers(channel);
+                return { success: true, users: activeUsers || [] };
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return { success: false, reason: err.message, users: [] };
+        }
+    }
+
+    async updateMikrotikUser(req, res) {
+        const { token, userData } = req.body;
+        const { id, new_username, username, phone, profile, packageID, status } = userData || {};
+        if (!token || !userData || !id || !packageID || !profile) return res.json({ success: false, message: "Token, userData, ID, packageID, and profile are required" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            const pkg = await this.db.getPackage(packageID);
+            const host = pkg.routerHost;
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return { success: false, message: "No valid MikroTik connection" };
+            const { channel } = connection;
+            try {
+                const profiles = await this.mikrotik.listHotspotProfiles(channel);
+                const existingProfiles = profiles.filter(p => p.name === profile);
+                if (existingProfiles.length === 0) return res.json({ success: false, message: `Profile '${profile}' not found` });
+                const users = await this.mikrotik.listHotspotUsers(channel);
+                let existingUser = users.find(u => u.name === username);
+                if (!existingUser && status?.toLowerCase() === "active") {
+                    const newuser = { platformID, action: "add", profileName: profile, host, username, code: username };
+                    const isadded = await this.manageMikrotikUser(newuser);
+                    if (!isadded.success) return res.json({ success: false, message: isadded.message });
+                } else {
+                    await this.mikrotik.updateHotspotUser(channel, existingUser[".id"], { name: new_username || username, profile: profile });
+                    const activeUsers = await this.mikrotik.listHotspotActiveUsers(channel);
+                    const activeUser = activeUsers.find(u => u.name === username);
+                    if (activeUser && activeUser[".id"]) await this.mikrotik.deleteHotspotActiveUser(channel, activeUser[".id"]);
+                }
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+            const user = await this.db.getUserByUsername(username);
+            if (!user) return res.json({ success: false, message: `User '${username}' not found in database` });
+            await this.db.updateUser(user.id, { username: new_username, password: new_username, code: new_username, phone: phone, status });
+            return res.json({ success: true, message: "User updated successfully" });
+        } catch (error) {
+            return res.json({ success: false, message: "An error occurred, try again!", error });
+        }
+    }
+
+    async autoConfigurePPPoE(req, res) {
+        const { station, token } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: "Missing authentication token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success || auth.admin.role !== "superuser") return res.status(401).json({ success: false, message: "Unauthorized!" });
+            const platformID = auth.admin.platformID;
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
+            const { channel } = connection;
+            try {
+                const interfaces = await this.mikrotik.listInterfaces(channel);
+                let bridgeInterface = interfaces.find(i => i.type === "bridge")?.name;
+                if (!bridgeInterface && interfaces.length > 0) bridgeInterface = interfaces[0].name;
+                let poolName = "PPPoE_Pool";
+                const pools = await this.mikrotik.listPools(channel);
+                if (pools.find(p => p.name === poolName)) {
+                    let i = 1;
+                    while (pools.find(p => p.name === `${poolName}_${i}`)) i++;
+                    poolName = `${poolName}_${i}`;
+                }
+                await this.mikrotik.addIPAddress(channel, { address: "41.41.0.1/16", network: "41.41.0.0", interface: bridgeInterface, comment: "PPPoE Auto Configuration Gateway" });
+                await this.mikrotik.addPool(channel, { name: poolName, ranges: "41.41.0.2-41.41.255.254", comment: "PPPoE Auto Configuration Pool" });
+                const profiles = await this.mikrotik.listPPPProfiles(channel);
+                const speeds = [5, 8, 10, 15, 20];
+                for (let speed of speeds) {
+                    const profileName = `${speed}MBPS`;
+                    if (!profiles.find(p => p.name === profileName)) {
+                        await this.mikrotik.addPPPProfile(channel, { name: profileName, localAddress: "41.41.0.1", remoteAddress: poolName, dnsServer: "1.1.1.1", rateLimit: `${speed}M/${speed}M` });
+                    }
+                }
+                const existingServers = await this.mikrotik.listPPPServers(channel);
+                let servername = "PPPoE_Server";
+                let counter = 1;
+                while (existingServers.find(s => s['service-name'] === servername)) {
+                    servername = `${"PPPoE_Server"}_${counter}`;
+                    counter++;
+                }
+                const newServer = { "service-name": servername, "interface": bridgeInterface, "authentication": "pap,chap,mschap1,mschap2", "disabled": "no" };
+                await this.mikrotik.addPPPServer(channel, newServer);
+                await this.mikrotik.addFirewallNatRule(channel, { chain: "srcnat", action: "masquerade", srcAddress: "41.41.0.0/16", comment: "Masquerade pppoe network", outInterface: "" });
+                return res.json({ success: true, message: "PPPoE Auto Configuration completed successfully", pool: poolName, profiles: speeds.map(s => `${s}MBPS`), server: "PPPoE_Server" });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "An error occurred during PPPoE auto configuration" });
+        }
+    }
+
+    async isPPPoEAutoConfigured(req, res) {
+        const { station, token } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: "Missing authentication token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success || auth.admin.role !== "superuser") return res.status(401).json({ success: false, message: "Unauthorized!" });
+            const platformID = auth.admin.platformID;
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
+            const { channel } = connection;
+            try {
+                let poolBaseName = "PPPoE_Pool";
+                const pools = await this.mikrotik.listPools(channel);
+                let poolName = null;
+                if (pools.find(p => p.name === poolBaseName)) poolName = poolBaseName;
+                else {
+                    let i = 1;
+                    while (pools.find(p => p.name === `${poolBaseName}_${i}`)) {
+                        poolName = `${poolBaseName}_${i}`;
+                        i++;
+                    }
+                }
+                if (!poolName) return res.json({ autoconfigured: false, message: "No valid PPPoE Pool found" });
+                const matchedPool = pools.find(p => p.name === poolName);
+                if (matchedPool["ranges"] !== "41.41.0.2-41.41.255.254") return res.json({ autoconfigured: false, message: "Pool address configuration mismatch" });
+                const speeds = [5, 8, 10, 15, 20];
+                const profiles = await this.mikrotik.listPPPProfiles(channel);
+                for (let speed of speeds) {
+                    const profileName = `${speed}MBPS`;
+                    const profile = profiles.find(p => p.name === profileName);
+                    if (!profile) return res.json({ autoconfigured: false, message: `Profile ${profileName} not found` });
+                    if (profile["remote-address"] !== poolName) return res.json({ autoconfigured: false, message: `Profile ${profileName} not linked to ${poolName}` });
+                }
+                const servers = await this.mikrotik.listPPPServers(channel);
+                let serverName = null;
+                if (servers.find(s => s["service-name"] === "PPPoE_Server")) serverName = "PPPoE_Server";
+                else {
+                    let i = 1;
+                    while (servers.find(s => s["service-name"] === `PPPoE_Server_${i}`)) {
+                        serverName = `PPPoE_Server_${i}`;
+                        i++;
+                    }
+                }
+                if (!serverName) return res.json({ autoconfigured: false, message: "No PPPoE Server found" });
+                const matchedServer = servers.find(s => s["service-name"] === serverName);
+                if (!matchedServer) return res.json({ autoconfigured: false, message: "PPPoE Server configuration mismatch" });
+                return res.json({ autoconfigured: true, message: "PPPoE auto configuration verified successfully", pool: poolName, server: serverName, profiles: speeds.map(s => `${s}MBPS`) });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return res.json({ autoconfigured: false, message: "Error checking PPPoE auto configuration" });
+        }
+    }
+
+    async autoConfigureHotspot(req, res) {
+        const { station, token } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: "Missing authentication token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success || auth.admin.role !== "superuser") return res.status(401).json({ success: false, message: "Unauthorized!" });
+            const platformID = auth.admin.platformID;
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
+            const { channel } = connection;
+            try {
+                const sessionTimeout = "1d";
+                const loginBy = "http-chap,http-pap,mac-cookie";
+                let poolName = "Hotspot_Pool";
+                const pools = await this.mikrotik.listPools(channel);
+                if (pools.find(p => p.name === poolName)) {
+                    let i = 1;
+                    while (pools.find(p => p.name === `${poolName}_${i}`)) i++;
+                    poolName = `${poolName}_${i}`;
+                }
+                await this.mikrotik.addPool(channel, { name: poolName, ranges: "41.42.0.2-41.42.255.254", comment: "Hotspot Auto Configuration Pool" });
+                const interfaces = await this.mikrotik.listInterfaces(channel);
+                let bridgeInterface = interfaces.find(i => i.type === "bridge")?.name;
+                if (!bridgeInterface && interfaces.length > 0) bridgeInterface = interfaces[0].name;
+                await this.mikrotik.addIPAddress(channel, { address: "41.42.0.1/16", network: "41.42.0.0", comment: "Hotspot Network", intf: bridgeInterface });
+                await this.mikrotik.addFirewallNatRule(channel, { chain: "srcnat", action: "masquerade", srcAddress: "41.42.0.0/16", comment: "Masquerade Hotspot network", outInterface: "" });
+                const profiles = await this.mikrotik.getHotspotProfiles(channel);
+                let profileName = "hotspotprofile1";
+                const existingProfile = profiles.find(p => p.name === profileName);
+                if (!existingProfile) {
+                    await this.mikrotik.addHotspotServerProfile(channel, {
+                        name: profileName,
+                        hotspotAddress: "41.42.0.1",
+                        dnsName: "local.wifi",
+                        smtpServer: "0.0.0.0",
+                        folder: "hotspot",
+                        loginBy,
+                        macCookieTimeout: sessionTimeout,
+                        macCookie: "yes",
+                    });
+                } else {
+                    await this.mikrotik.updateHotspotServerProfile(channel, existingProfile[".id"], {
+                        "login-by": loginBy,
+                        "mac-cookie-timeout": sessionTimeout,
+                        "mac-cookie": "yes",
+                    });
+                }
+                const servers = await this.mikrotik.listHotspotServers(channel);
+                let serverName = "Hotspot_Server";
+                let counter = 1;
+                while (servers.find(s => s.name === serverName)) {
+                    serverName = `Hotspot_Server_${counter}`;
+                    counter++;
+                }
+                await this.mikrotik.addHotspotServer(channel, { name: serverName, intf: bridgeInterface, profile: profileName, addressPool: poolName });
+
+                let uploadError = null;
+                try {
+                    const platform = await this.db.getPlatform(platformID);
+                    const platformUrl = platform?.url ? `https://${platform.url}` : "https://netfundi.novawifi.online";
+                    const loginHtml = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+<meta http-equiv="pragma" content="no-cache" />
+<meta http-equiv="expires" content="-1" />
+<meta name="viewport" content="width=device-width; initial-scale=1.0; maximum-scale=1.0;"/>
+<title>Logging in...</title>
+</head>
+
+<body onload="autoLogin()">
+<script type="text/javascript" src="/md5.js"></script>
+<script type="text/javascript">
+    function autoLogin() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const username = urlParams.get('username');
+        const password = urlParams.get('password');
+
+        if (username && password) {
+            const form = document.createElement('form');
+            form.action = "$(link-login-only)";
+            form.method = 'post';
+
+            const inputUsername = document.createElement('input');
+            inputUsername.type = 'hidden';
+            inputUsername.name = 'username';
+            inputUsername.value = username;
+            form.appendChild(inputUsername);
+
+            const inputPassword = document.createElement('input');
+            inputPassword.type = 'hidden';
+            inputPassword.name = 'password';
+            inputPassword.value = hexMD5('$(chap-id)' + password + '$(chap-challenge)');
+            form.appendChild(inputPassword);
+
+            const inputDst = document.createElement('input');
+            inputDst.type = 'hidden';
+            inputDst.name = 'dst';
+            inputDst.value = "$(link-orig)";
+            form.appendChild(inputDst);
+
+            const inputPopup = document.createElement('input');
+            inputPopup.type = 'hidden';
+            inputPopup.name = 'popup';
+            inputPopup.value = 'true';
+            form.appendChild(inputPopup);
+
+            document.body.appendChild(form);
+            form.submit();
+        } else {
+            window.location.href = "${platformUrl}/login?hash=Aw==&mac=$(mac)";
+        }
+    }
+</script>
+
+</body>
+</html>
+                    `;
+                    const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, station);
+                    if (!apiConnection?.api) {
+                        uploadError = "Failed to open low-level API connection";
+                    } else {
+                        let rawChannel = null;
+                        try {
+                            await apiConnection.api.connect();
+                            const rawApi = apiConnection.api.api().rosApi;
+                            rawChannel = await rawApi.openChannel();
+                            const existingFiles = await rawChannel.write(["/file/print", `?name=hotspot/login.html`]);
+                            if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+                                await rawChannel.write([
+                                    "/file/set",
+                                    `=.id=${existingFiles[0][".id"]}`,
+                                    `=contents=${loginHtml}`,
+                                ]);
+                            } else {
+                                await rawChannel.write([
+                                    "/file/add",
+                                    "=name=hotspot/login.html",
+                                    `=contents=${loginHtml}`,
+                                ]);
+                            }
+                        } finally {
+                            try { await rawChannel?.close(); } catch (err) { }
+                            try { await apiConnection.api.close(); } catch (err) { }
+                        }
+                    }
+                } catch (error) {
+                    uploadError = error?.message || "Failed to upload login.html";
+                }
+
+                return res.json({
+                    success: true,
+                    message: uploadError
+                        ? `Hotspot Auto Configuration completed, but login.html upload failed: ${uploadError}`
+                        : "Hotspot Auto Configuration completed successfully.",
+                    pool: poolName,
+                    profile: profileName,
+                    server: serverName
+                });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "An error occurred during Hotspot auto configuration" });
+        }
+    }
+
+    async isHotspotAutoConfigured(req, res) {
+        const { station, token } = req.body;
+        if (!token) return res.status(400).json({ isConfigured: false, message: "Missing authentication token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success || auth.admin.role !== "superuser") return res.status(401).json({ isConfigured: false, message: "Unauthorized!" });
+            const platformID = auth.admin.platformID;
+            const connection = await this.config.createSingleMikrotikClient(platformID, station);
+            if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
+            const { channel } = connection;
+            try {
+                const servers = await this.mikrotik.listHotspotServers(channel);
+                const isConfigured = servers.length > 0;
+                return res.json({ isConfigured, servers: servers.map(s => s.name) });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "An error occurred while checking Hotspot configuration" });
+        }
+    }
+
+    async startAutoRouter(req, res) {
+        const { token, name } = req.body || {};
+        if (!token) return res.status(400).json({ success: false, message: "Missing token" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.status(403).json({ success: false, message: "Unauthorised!" });
+            const sessionToken = crypto.randomBytes(16).toString("hex");
+            this.routerAutoSessions.set(sessionToken, {
+                platformID: auth.admin.platformID,
+                adminID: auth.admin.adminID,
+                name: typeof name === "string" ? name.trim() : "",
+                createdAt: Date.now(),
+            });
+            return res.json({ success: true, token: sessionToken });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Failed to start auto router session" });
+        }
+    }
+
+    async getAutoRouterScript(req, res) {
+        const token = req.query.token;
+        const serverUrl = (req.query.server || "").toString().replace(/\/+$/, "");
+        if (!token) return res.status(400).send("Missing token");
+        const session = this.routerAutoSessions.get(token);
+        if (!session) return res.status(404).send("Invalid session");
+        const platformID = session.platformID;
+
+        try {
+            const stations = await this.db.getStations(platformID);
+            const usedHosts = (stations || []).map((s) => s.mikrotikHost);
+            const internalIp = this.getNextAutoRouterIp(usedHosts);
+            if (!internalIp) {
+                return res.status(400).send("No available IPs in 10.10.10.0/24");
+            }
+
+            const apiUser = session.apiUser || `nova-${crypto.randomBytes(3).toString("hex")}`;
+            const apiPass = session.apiPass || crypto.randomBytes(6).toString("hex");
+            session.apiUser = apiUser;
+            session.apiPass = apiPass;
+            session.mikrotikHost = internalIp;
+            this.routerAutoSessions.set(token, session);
+
+            const baseUrl = serverUrl || `${req.protocol}://${req.get("host")}`;
+            const routerosBaseUrl = process.env.ROUTEROS_BASE_URL || `${baseUrl}/routeros`;
+            const logBase = `${baseUrl}/mkt/auto-router/log?token=${token}&msg=`;
+            const completeUrl = `${baseUrl}/mkt/auto-router/complete?token=${token}`;
+            const scriptUrl = `${baseUrl}/mkt/auto-router/script?token=${token}&server=${encodeURIComponent(baseUrl)}`;
+            const routerName = (session.name || "").toString().replace(/"/g, "");
+
+            const script = [
+                `:local token "${token}"`,
+                `:local logBase "${logBase}"`,
+                `:local completeUrl "${completeUrl}"`,
+                `:local scriptUrl "${scriptUrl}"`,
+                `:local routerosBase "${routerosBaseUrl}"`,
+                `:local routerName "${routerName}"`,
+                `:local internalIp "${internalIp}"`,
+                `:local apiUser "${apiUser}"`,
+                `:local apiPass "${apiPass}"`,
+                `:local ensureReconnect do={`,
+                `:local schedId [/system/scheduler/find name="nova-reconnect"]`,
+                `:if ([:len $schedId] = 0) do={`,
+                `/system/scheduler add name="nova-reconnect" start-time=startup on-event=":delay 5s; /tool fetch url=($logBase . \\\"router-rebooted\\\") keep-result=no; /tool fetch url=($scriptUrl) dst-path=\\\"nova-auto.rsc\\\" keep-result=no; /import file-name=\\\"nova-auto.rsc\\\"; /file/remove nova-auto.rsc; /system/scheduler remove [find name=\\\"nova-reconnect\\\"]"`,
+                `}`,
+                `}`,
+                `:do {`,
+                `:local mode [/system/device-mode/get mode]`,
+                `:if ($mode != "advanced") do={`,
+                `/tool fetch url=($logBase . "device-mode-updating") keep-result=no`,
+                `/system/device-mode/update mode=advanced`,
+                `$ensureReconnect`,
+                `/tool fetch url=($logBase . "device-mode-reboot") keep-result=no`,
+                `/system/reboot`,
+                `}`,
+                `} on-error={ /tool fetch url=($logBase . "device-mode-check-failed") keep-result=no }`,
+                `:local rosVer [/system/resource/get version]`,
+                `:local arch [/system/resource/get architecture-name]`,
+                `:if ([:pick $rosVer 0 2] = "6.") do={`,
+                `/tool fetch url=($logBase . "routeros-v6-detected") keep-result=no`,
+                `:local pkgBase ($routerosBase . "/" . $arch)`,
+                `/tool fetch url=($pkgBase . "/routeros.npk") dst-path="routeros.npk" keep-result=yes`,
+                `/tool fetch url=($pkgBase . "/wireless.npk") dst-path="wireless.npk" keep-result=yes`,
+                `:do { /tool fetch url=($pkgBase . "/hotspot.npk") dst-path="hotspot.npk" keep-result=yes } on-error={ /tool fetch url=($logBase . "hotspot-package-missing") keep-result=no }`,
+                `/tool fetch url=($logBase . "routeros-packages-downloaded") keep-result=no`,
+                `$ensureReconnect`,
+                `/tool fetch url=($logBase . "rebooting-for-upgrade") keep-result=no`,
+                `/system/reboot`,
+                `}`,
+                `/tool fetch url=($logBase . "start") keep-result=no`,
+                `/interface wireguard add listen-port=13231 mtu=1420 name=wireguard`,
+                `/tool fetch url=($logBase . "wireguard-interface-added") keep-result=no`,
+                `/ip address add address=($internalIp . "/24") interface=wireguard`,
+                `/tool fetch url=($logBase . "wireguard-ip-assigned") keep-result=no`,
+                `/interface wireguard peers add interface=wireguard name=novapeer public-key="xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=" endpoint-address=${process.env.SERVER_IP || "77.37.97.244:443"} endpoint-port=51820 allowed-address=10.10.10.1/32 persistent-keepalive=10`,
+                `/tool fetch url=($logBase . "wireguard-peer-added") keep-result=no`,
+                `/ip service set api address=10.10.10.0/24`,
+                `/tool fetch url=($logBase . "api-access-enabled") keep-result=no`,
+                `/ip firewall filter add chain=input src-address=10.10.10.0/24 protocol=tcp dst-port=8728 action=accept comment="Allow API from WireGuard"`,
+                `/interface list member add list=LAN interface=wireguard`,
+                `/ip firewall filter add action=accept chain=input dst-port=13231 protocol=udp`,
+                `/ip firewall filter add action=accept chain=input src-address=10.10.10.0/24`,
+                `/ip dns set servers=8.8.8.8,1.1.1.1 allow-remote-requests=yes`,
+                `/ip firewall mangle add chain=postrouting out-interface=bridge action=change-ttl new-ttl=set:1`,
+                `/tool fetch url=($logBase . "firewall-rules-set") keep-result=no`,
+                `:local userId [/user/find name=$apiUser]`,
+                `:if ([:len $userId] = 0) do={ /user/add name=$apiUser password=$apiPass group=full } else={ /user/set $userId password=$apiPass }`,
+                `/tool fetch url=($logBase . "api-user-ready") keep-result=no`,
+                `/ip cloud set ddns-enabled=yes`,
+                `:delay 5s`,
+                `:local ddns [/ip/cloud/get dns-name]`,
+                `:local publicIp [/ip/cloud/get public-address]`,
+                `:local pubkey [/interface wireguard/get [find name=wireguard] public-key]`,
+                `:local pingOk [/ping 10.10.10.1 count=3]`,
+                `:if ($pingOk > 0) do={ /tool fetch url=($logBase . "ping-ok") keep-result=no } else={ /tool fetch url=($logBase . "ping-failed") keep-result=no }`,
+                `/tool fetch url=($completeUrl . "&publicKey=" . $pubkey . "&ddns=" . $ddns . "&publicIp=" . $publicIp . "&user=" . $apiUser . "&pass=" . $apiPass . "&host=" . $internalIp . "&name=" . $routerName) keep-result=no`,
+            ].join("\n");
+
+            res.setHeader("Content-Type", "text/plain");
+            return res.status(200).send(script);
+        } catch (error) {
+            return res.status(500).send("Failed to generate script");
+        }
+    }
+
+    async autoRouterLog(req, res) {
+        const token = req.query.token;
+        const message = (req.query.msg || "").toString();
+        if (!token) return res.status(400).json({ success: false, message: "Missing token" });
+        if (!this.routerAutoSessions.has(token)) {
+            return res.status(404).json({ success: false, message: "Invalid session" });
+        }
+        socketManager.emitToRoom(`router-auto-${token}`, "router-auto:log", {
+            token,
+            message,
+            timestamp: Date.now(),
+        });
+        return res.json({ success: true });
+    }
+
+    async autoRouterComplete(req, res) {
+        const token = req.query.token;
+        if (!token) return res.status(400).json({ success: false, message: "Missing token" });
+        const session = this.routerAutoSessions.get(token);
+        if (!session) return res.status(404).json({ success: false, message: "Invalid session" });
+
+        const normalize = (value) => (value ? value.toString().replace(/ /g, "+") : "");
+
+        const payload = {
+            token,
+            publicKey: normalize(req.query.publicKey),
+            ddns: normalize(req.query.ddns),
+            publicIp: normalize(req.query.publicIp),
+            mikrotikUser: normalize(req.query.user) || session.apiUser || "",
+            mikrotikPassword: normalize(req.query.pass) || session.apiPass || "",
+            mikrotikHost: normalize(req.query.host) || session.mikrotikHost || "",
+            name: normalize(req.query.name) || session.name || "",
+            timestamp: Date.now(),
+        };
+        const saveResult = await this.saveAutoStation(session, payload);
+        const finalPayload = {
+            ...payload,
+            saved: saveResult.success,
+            station: saveResult.station || null,
+            saveMessage: saveResult.message || "",
+        };
+
+        socketManager.emitToRoom(`router-auto-${token}`, "router-auto:complete", finalPayload);
+        if (saveResult.station) {
+            socketManager.emitToRoom(`router-auto-${token}`, "router-auto:saved", {
+                station: saveResult.station,
+                message: saveResult.message || "Station saved",
+            });
+        }
+        return res.json({ success: true, saved: saveResult.success, message: saveResult.message });
+    }
+
+    sanitizeDomain(domain) {
+        if (!domain || typeof domain !== "string") return null;
+        const safe = domain.trim().toLowerCase();
+        if (!safe || safe.includes("..") || safe.includes("/") || safe.includes(" ")) return null;
+        return safe;
+    }
+
+    buildNginxConfig(domain, targetUrl) {
+        return [
+            "server {",
+            "    listen 80;",
+            `    server_name ${domain};`,
+            "",
+            "    location / {",
+            `        proxy_pass ${targetUrl};`,
+            "        proxy_http_version 1.1;",
+            "",
+            "        proxy_set_header Host $host;",
+            "        proxy_set_header X-Real-IP $remote_addr;",
+            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+            "        proxy_set_header X-Forwarded-Proto $scheme;",
+            "",
+            "        proxy_set_header Upgrade $http_upgrade;",
+            "        proxy_set_header Connection \"upgrade\";",
+            "    }",
+            "}",
+            "",
+        ].join("\n");
+    }
+
+    async addReverseProxySite(domain, targetUrl) {
+        const safeDomain = this.sanitizeDomain(domain);
+        if (!safeDomain) {
+            return { success: false, message: "Invalid domain provided." };
+        }
+
+        const config = this.buildNginxConfig(safeDomain, targetUrl);
+        const tmpPath = `/tmp/nginx-${safeDomain}.conf`;
+        const availablePath = `/etc/nginx/sites-available/${safeDomain}`;
+        const enabledPath = `/etc/nginx/sites-enabled/${safeDomain}`;
+
+        try {
+            await fsp.writeFile(tmpPath, config, "utf8");
+        } catch (err) {
+            return { success: false, message: "Failed to write nginx config", error: err.message };
+        }
+
+        const run = (cmd, args = []) =>
+            new Promise((resolve, reject) => {
+                execFile(cmd, args, (err, stdout, stderr) => {
+                    if (err) return reject(stderr || err.message);
+                    resolve(stdout);
+                });
+            });
+
+        try {
+            await run("sudo", ["-n", "mv", tmpPath, availablePath]);
+            await run("sudo", ["-n", "ln", "-sf", availablePath, enabledPath]);
+            await run("sudo", ["-n", "/usr/sbin/nginx", "-t"]);
+            await run("sudo", ["-n", "/usr/bin/systemctl", "reload", "nginx"]);
+
+            return {
+                success: true,
+                message: `Nginx reverse proxy configured for ${safeDomain}`,
+            };
+        } catch (error) {
+            return {
+                success: false,
+                message: `Failed to configure nginx for ${safeDomain}`,
+                error,
+            };
+        }
+    }
+
+    async installLetsEncryptCert(domain) {
+        const safeDomain = this.sanitizeDomain(domain);
+        if (!safeDomain) {
+            return { success: false, message: "Invalid domain provided." };
+        }
+
+        return new Promise((resolve) => {
+            execFile(
+                "sudo",
+                ["-n", "certbot", "--nginx", "-d", safeDomain, "--non-interactive", "--agree-tos", "-m", "admin@novawifi.co.ke"],
+                (err, stdout, stderr) => {
+                    if (err) {
+                        return resolve({
+                            success: false,
+                            message: `SSL installation failed for ${safeDomain}`,
+                            error: stderr || err.message,
+                        });
+                    }
+
+                    resolve({
+                        success: true,
+                        message: `SSL installed for ${safeDomain}`,
+                        output: stdout?.trim(),
+                    });
+                }
+            );
+        });
+    }
+
+    async resolveMikrotikHost(mikrotikPublicHost) {
+        const endpointHost = mikrotikPublicHost;
+        if (!endpointHost) return { success: false, message: 'Public router host is required.' };
+        if (Utils.isValidIP && Utils.isValidIP(endpointHost)) return { success: true, host: endpointHost, addresses: [endpointHost] };
+        if (Utils.validateDdnsHost && Utils.validateDdnsHost(endpointHost)) {
+            try {
+                const addresses = await dns.resolve4(endpointHost);
+                return { success: true, host: endpointHost, addresses };
+            } catch (err) {
+                return { success: false, message: `Failed to resolve '${endpointHost}'. Make sure it points to a valid Public IP Address` };
+            }
+        }
+        return { success: false, message: 'Invalid host: must be a valid IP or hostname.' };
+    }
+
+    async updateWireguardConfig({ mikrotikHost, mikrotikPublicKey, endpointHost }) {
+        if (!mikrotikHost || !mikrotikPublicKey || !endpointHost) {
+            return { success: false, message: "Missing WireGuard peer data." };
+        }
+        const peerBlock = `
+    [Peer]
+    PublicKey = ${mikrotikPublicKey}
+    Endpoint = ${endpointHost}:13231
+    AllowedIPs = ${mikrotikHost}/32
+    PersistentKeepalive = 10
+    `.trim();
+
+        const wgConfPath = "/etc/wireguard/wg0.conf";
+
+        try {
+            const fileData = await fsp.readFile(wgConfPath, "utf8");
+            await fsp.copyFile(wgConfPath, `${wgConfPath}.bak-${Date.now()}`);
+
+            const blocks = fileData.split(/\n(?=\[Peer\])/);
+            const seenIPs = new Set();
+            const seenKeys = new Set();
+
+            const cleaned = blocks.reverse().filter(block => {
+                const ipMatch = block.match(/AllowedIPs\s*=\s*(10\.10\.10\.\d+)\/32/);
+                const keyMatch = block.match(/PublicKey\s*=\s*(.+)/);
+
+                const internalIP = ipMatch?.[1];
+                const publicKey = keyMatch?.[1];
+
+                if (internalIP && seenIPs.has(internalIP)) return false;
+                if (internalIP) seenIPs.add(internalIP);
+
+                if (publicKey && seenKeys.has(publicKey)) return false;
+                if (publicKey) seenKeys.add(publicKey);
+
+                return true;
+            }).reverse();
+
+            cleaned.push(peerBlock);
+
+            const newConfig = cleaned
+                .map(b => b.trim())
+                .join("\n\n") + "\n";
+
+            await fsp.writeFile(wgConfPath, newConfig, "utf8");
+
+            await new Promise((resolve) => exec("sudo sed -i '/^[[:space:]]*$/d' /etc/wireguard/wg0.conf", () => resolve(true)));
+            await new Promise((resolve) => exec("sudo awk 'NF{print} END{print \"\"}' /etc/wireguard/wg0.conf > /tmp/wg.tmp && sudo mv /tmp/wg.tmp /etc/wireguard/wg0.conf", () => resolve(true)));
+            await new Promise((resolve) => exec("sudo wg-quick down wg0", () => resolve(true)));
+            await new Promise((resolve, reject) => exec("sudo wg-quick up wg0", (err) => err ? reject(err) : resolve(true)));
+
+            return { success: true, message: "WireGuard updated." };
+        } catch (error) {
+            return { success: false, message: "WireGuard update failed." };
+        }
+    }
+
+    async saveAutoStation(session, payload) {
+        try {
+            const platformID = session.platformID;
+            const adminID = session.adminID;
+            const platform = await this.db.getPlatform(platformID);
+            if (!platform) return { success: false, message: "Platform doesn't exist." };
+
+            const stations = await this.db.getStations(platformID);
+            const name = payload.name?.trim() || `Mikrotik ${payload.mikrotikHost?.split(".").pop() || ""}`;
+            const endpointHost = payload.ddns || payload.publicIp;
+            if (!endpointHost) return { success: false, message: "Public router host is required." };
+
+            const existingHost = stations.find(s => s.mikrotikHost?.trim() === payload.mikrotikHost?.trim());
+            const existingKey = stations.find(s => s.mikrotikPublicKey?.trim() === payload.publicKey?.trim());
+            const existing = existingHost || existingKey;
+
+            if (!existing) {
+                if (payload.ddns) {
+                    const existingDnsName = stations.find(s => s.mikrotikDDNS?.trim() === payload.ddns?.trim());
+                    if (existingDnsName) {
+                        return { success: false, message: "DDNS name is already being used by another router." };
+                    }
+                }
+            }
+
+            const resolveResult = await this.resolveMikrotikHost(endpointHost);
+            if (!resolveResult.success) {
+                return { success: false, message: resolveResult.message };
+            }
+
+            const rawPassword = payload.mikrotikPassword || "";
+            const isEncryptedPassword =
+                typeof rawPassword === "string" &&
+                rawPassword.includes(":") &&
+                rawPassword.split(":")[0]?.length === 32;
+            const encryptedPassword = rawPassword && !isEncryptedPassword
+                ? Utils.encryptPassword(rawPassword)
+                : rawPassword;
+
+            let stationResult;
+            if (!existing) {
+                const sanitizeSubdomain = (value) => {
+                    return value
+                        .toLowerCase()
+                        .trim()
+                        .replace(/\s+/g, '-')
+                        .replace(/[^a-z0-9-]/g, '')
+                        .replace(/-+/g, '-')
+                        .replace(/^-+|-+$/g, '');
+                };
+                const randomness = Math.random().toString(36).substring(2, 8);
+                const mikrotikWebfigHost = `${sanitizeSubdomain(name)}${randomness}-webfig.novawifi.online`;
+
+                stationResult = await this.db.createStation({
+                    name,
+                    mikrotikHost: payload.mikrotikHost,
+                    mikrotikPublicKey: payload.publicKey,
+                    mikrotikUser: payload.mikrotikUser,
+                    mikrotikPassword: encryptedPassword,
+                    mikrotikDDNS: payload.ddns || "",
+                    mikrotikPublicHost: payload.ddns ? "" : payload.publicIp,
+                    mikrotikWebfigHost,
+                    platformID,
+                    adminID,
+                    systemBasis: "API",
+                });
+
+                const proxy = await this.addReverseProxySite(mikrotikWebfigHost, `http://${payload.mikrotikHost}`);
+                if (!proxy.success) {
+                    return { success: false, message: proxy.message, station: stationResult };
+                }
+                const ssl = await this.installLetsEncryptCert(mikrotikWebfigHost);
+                if (!ssl.success) {
+                    return { success: false, message: ssl.message, station: stationResult };
+                }
+            } else {
+                stationResult = await this.db.updateStation(existing.id, {
+                    name,
+                    mikrotikHost: payload.mikrotikHost,
+                    mikrotikPublicKey: payload.publicKey,
+                    mikrotikUser: payload.mikrotikUser,
+                    mikrotikPassword: encryptedPassword,
+                    mikrotikDDNS: payload.ddns || "",
+                    mikrotikPublicHost: payload.ddns ? "" : payload.publicIp,
+                });
+            }
+
+            const wgResult = await this.updateWireguardConfig({
+                mikrotikHost: payload.mikrotikHost,
+                mikrotikPublicKey: payload.publicKey,
+                endpointHost,
+            });
+            if (!wgResult.success) {
+                return { success: false, message: wgResult.message, station: stationResult };
+            }
+
+            return { success: true, message: "Station saved", station: stationResult };
+        } catch (error) {
+            return { success: false, message: "Failed to save station" };
+        }
+    }
+
+    async fetchActivePPPoEConnections(platformID) {
+        try {
+            const stations = await this.db.getStations(platformID);
+            let totalActive = 0;
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) continue;
+                const { channel } = connection;
+                try {
+                    const active = await this.mikrotik.listPPPActiveUsers(channel);
+                    totalActive += (active && active.length) ? active.length : 0;
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            }
+            return totalActive;
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    async calculateBandwidthUsage(platformID) {
+        const stations = await this.db.getStations(platformID);
+        const results = [];
+        for (const station of stations) {
+            try {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) continue;
+                const { channel } = connection;
+                try {
+                    let hotspotTx = 0, hotspotRx = 0;
+                    const hotspotUsers = await this.mikrotik.listHotspotActiveUsers(channel);
+                    for (const user of hotspotUsers) { hotspotTx += Number(user["bytes-out"] || 0); hotspotRx += Number(user["bytes-in"] || 0); }
+                    let pppoeTx = 0, pppoeRx = 0;
+                    const pppoeUsers = await this.mikrotik.listPPPActiveUsers(channel);
+                    for (const user of pppoeUsers) { pppoeTx += Number(user["bytes-out"] || 0); pppoeRx += Number(user["bytes-in"] || 0); }
+                    results.push({ id: station.id, service: "hotspot", tx: hotspotTx, rx: hotspotRx }, { id: station.id, service: "pppoe", tx: pppoeTx, rx: pppoeRx });
+                } finally {
+                    await this.safeCloseChannel(channel);
+                }
+            } catch (err) { }
+        }
+        return results;
+    }
+
+    async fetchPPPoEInfo(req, res) {
+        const { token } = req.body;
+        if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+        try {
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            if (!platformID) return res.status(400).json({ success: false, message: "Missing platformID." });
+            const stations = await this.db.getStations(platformID);
+            const results = [];
+            for (const station of stations) {
+                const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+                if (!connection?.channel) {
+                    results.push({ id: station.id, station: station.name || station.mikrotikHost, host: station.mikrotikHost, status: "error", message: "Failed to connect to router", data: null });
+                    continue;
+                }
+                const { channel } = connection;
+                try {
+                    const poolsRes = await this.mikrotik.listPools(channel);
+                    const pools = poolsRes.map(p => ({ name: p.name, ranges: p.ranges, comment: p.comment || "" }));
+                    const profilesRes = await this.mikrotik.listPPPProfiles(channel);
+                    const profiles = profilesRes.map(p => ({ name: p?.name || "", localAddress: p["local-address"] || "", remoteAddress: p["remote-address"] || "", rateLimit: p["rate-limit"] || "", dnsServer: p["dns-server"] || "" }));
+                    const serversRes = await this.mikrotik.listPPPServers(channel);
+                    const servers = serversRes.map(s => ({ serviceName: s["service-name"] || "", interface: s["interface"] || "", authentication: s["authentication"] || "", maxSessions: s["max-sessions"] || "", defaultProfile: s["default-profile"] || "", disabled: s["disabled"] || "no", id: s[".id"] || "" }));
+                    results.push({ id: station.id, station: station.name || station.mikrotikHost, host: station.mikrotikHost, status: "success", data: { pools, profiles, servers } });
+                } catch (error) {
+                    results.push({ id: station.id, station: station.name || station.mikrotikHost, host: station.mikrotikHost, status: "error", message: error.message, data: null });
+                } finally {
+                    await channel.close();
+                }
+            }
+            return res.status(200).json({ success: true, message: "PPPoE info fetched successfully", results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: "Error fetching PPPoE info." });
+        }
+    }
+
+    async addMikrotikManualCode(data) {
+        if (!data) return { success: false, message: "Missing credentials required!" };
+        const { phone, packageID, platformID, username, password } = data;
+        try {
+            const pkg = await this.db.getPackagesByID(packageID);
+            if (!pkg) return { success: false, message: "Failed to add user to MikroTik, Package not found!" };
+            const profileName = pkg.name;
+            const hostdata = await this.db.getStations(platformID);
+            if (!hostdata) return { success: false, message: "Failed to add user to MikroTik, Router not found!" };
+            let expireAt = null;
+            if (pkg?.period) {
+                const now = new Date();
+                const period = pkg.period.toLowerCase();
+                const match = period.match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+                if (match) {
+                    const value = parseInt(match[1]);
+                    const unit = match[2].toLowerCase();
+                    switch (unit) {
+                        case 'minute': expireAt = new Date(now.getTime() + value * 60000); break;
+                        case 'hour': expireAt = new Date(now.getTime() + value * 3600000); break;
+                        case 'day': expireAt = new Date(now.getTime() + value * 86400000); break;
+                        case 'month': expireAt = new Date(now.setMonth(now.getMonth() + value)); break;
+                        case 'year': expireAt = new Date(now.setFullYear(now.getFullYear() + value)); break;
+                    }
+                }
+            }
+            const addedcode = await this.db.createUser({ status: "active", code: username, platformID: platformID, phone: phone, username: username, password: password, packageID: packageID, expireAt: expireAt });
+            return { success: true, message: "Code added successfully", code: addedcode };
+        } catch (error) {
+            return { success: false, message: "An error occurred while adding the user" };
+        }
+    }
+
+    async importUsers(req, res) {
+        try {
+            const { token, host } = req.body;
+            if (!token || !host) return res.status(400).json({ success: false, message: "Missing token or host" });
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const platformID = auth.admin.platformID;
+            const connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) return res.status(500).json({ success: false, message: "Failed to connect to MikroTik" });
+            const { channel } = connection;
+            try {
+                const mikrotikUsers = await this.mikrotik.listHotspotUsers(channel);
+                if (!mikrotikUsers || mikrotikUsers.length === 0) return res.status(404).json({ success: false, message: "No users found in MikroTik" });
+                const packages = await this.db.getPackagesByPlatformID(platformID);
+                if (!packages || packages.length === 0) return res.status(404).json({ success: false, message: "No packages found for platform" });
+                const createdUsers = [];
+                for (const mUser of mikrotikUsers) {
+                    const username = mUser.name;
+                    const password = mUser.password;
+                    const profile = mUser.profile;
+                    if (!username || username === "default-trial") continue;
+                    const pkg = packages.find((p) => p.name.toLowerCase().trim() === profile.toLowerCase().trim());
+                    if (!pkg) continue;
+                    const existingUser = await this.db.getUserByUsername(username);
+                    if (existingUser) continue;
+                    const data = { phone: "null", packageID: pkg.id, platformID: platformID, username: username, password: password };
+                    const addcodetorouter = await this.addMikrotikManualCode(data);
+                    if (!addcodetorouter.success) return res.status(400).json({ success: false, message: `An error occured: ${addcodetorouter.message}` });
+                    createdUsers.push({ ...addcodetorouter.code, active: "Offline" });
+                }
+                return res.status(200).json({ success: true, message: `Imported ${createdUsers.length} users successfully`, users: createdUsers });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return res.status(500).json({ success: false, message: "Failed to import users" });
+        }
+    }
+
+    async rebootRouter(req, res) {
+        try {
+            const { token, id } = req.body;
+            if (!token || !id) return res.status(400).json({ success: false, message: "Missing token or id" });
+            const auth = await this.auth.AuthenticateRequest(token);
+            if (!auth.success) return res.json({ success: false, message: auth.message });
+            if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+            const station = await this.db.getStation(id);
+            if (!station) return res.status(404).json({ success: false, message: "Station not found" });
+            const connection = await this.config.createSingleMikrotikClient(station.platformID, station.mikrotikHost);
+            if (!connection?.channel) return res.status(500).json({ success: false, message: "Failed to connect to MikroTik" });
+            const { channel } = connection;
+            try {
+                await this.mikrotik.reboot(channel);
+                return res.status(200).json({ success: true, message: "Router rebooted successfully" });
+            } finally {
+                await this.safeCloseChannel(channel);
+            }
+        } catch (err) {
+            return res.status(500).json({ success: false, message: "Failed to reboot mikrotik router" });
+        }
+    }
+
+    async addManualCode(data) {
+        if (!data) {
+            return {
+                success: false,
+                message: "Missing credentials required!",
+            }
+        }
+
+        const { phone, packageID, platformID, code, mac, token } = data;
+
+        try {
+            if (code && platformID) {
+                const existing = await this.db.getUserByCodeAndPlatform(code, platformID);
+                if (existing) {
+                    return {
+                        success: true,
+                        message: "Code already exists",
+                        code: existing,
+                    };
+                }
+            }
+
+            const pkg = await getPackagesByID(packageID);
+            if (!pkg) {
+                return {
+                    success: false,
+                    message: "Failed to add user to MikroTik, Package not found!",
+                };
+            }
+            const profileName = pkg.name;
+            const hostdata = await getStations(platformID);
+            if (!hostdata) {
+                return {
+                    success: false,
+                    message: "Failed to add user to MikroTik, Router not found!",
+                };
+            }
+            const host = pkg.routerHost;
+            const isMoreThanOneDevice = Number(pkg.devices) > 1;
+            const isData = pkg.category === "Data";
+            const baseCode = code;
+            const loginIdentifier =
+                isMoreThanOneDevice || isData
+                    ? baseCode
+                    : (mac && mac !== "null"
+                        ? mac
+                        : baseCode);
+            const mikrotikData = {
+                platformID,
+                action: "add",
+                profileName,
+                host,
+                code: loginIdentifier
+            };
+            const addUserToMikrotik = await manageMikrotikUser(mikrotikData)
+            if (!addUserToMikrotik) {
+                return {
+                    success: false,
+                    message: "Failed to add user to MikroTik",
+                };
+            }
+
+            if (addUserToMikrotik.success) {
+                let expireAt = null;
+                if (pkg?.period) {
+                    const now = new Date();
+                    const period = pkg.period.toLowerCase();
+
+                    const match = period.match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+
+                    if (match) {
+                        const value = parseInt(match[1]);
+                        const unit = match[2].toLowerCase();
+
+                        switch (unit) {
+                            case 'minute':
+                                expireAt = new Date(now.getTime() + value * 60000);
+                                break;
+                            case 'hour':
+                                expireAt = new Date(now.getTime() + value * 3600000);
+                                break;
+                            case 'day':
+                                expireAt = new Date(now.getTime() + value * 86400000);
+                                break;
+                            case 'month':
+                                expireAt = new Date(now.setMonth(now.getMonth() + value));
+                                break;
+                            case 'year':
+                                expireAt = new Date(now.setFullYear(now.getFullYear() + value));
+                                break;
+                        }
+                    }
+                }
+
+                const addedcode = await createUser({
+                    status: "active",
+                    code: code,
+                    platformID: platformID,
+                    phone: phone,
+                    username: addUserToMikrotik.username,
+                    password: addUserToMikrotik.password,
+                    packageID: packageID,
+                    expireAt: expireAt,
+                    token: token,
+                    mac: mac
+                });
+
+                return {
+                    success: true,
+                    message: "Code added successfully",
+                    code: addedcode,
+                };
+            } else {
+                return {
+                    success: false,
+                    message: `Failed to add user to MikroTik, ${addUserToMikrotik.message}`,
+                };
+            }
+
+        } catch (error) {
+            console.log("An error occurred", error);
+            return {
+                success: false,
+                message: "An error occurred while adding the user",
+            };
+        }
+    };
+}
+
+module.exports = { Mikrotikcontroller };
