@@ -1,0 +1,50 @@
+{
+  "name": "nova-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test tests",
+    "start": "nodemon index.js",
+    "seed": "node seed.js",
+    "seed:dashboard": "node scripts/seed-dashboard-stats.js",
+    "seed:update-platform-urls": "node scripts/seed-update-platform-urls.js",
+    "seed:notify-upgrade-complete": "node scripts/seed-notify-upgrade-complete.js",
+    "seed:update-station-ddns": "node scripts/seed-update-station-ddns.js",
+    "seed:provision-nginx-sites": "node scripts/seed-provision-nginx-sites.js",
+    "seed:redirect-online-to-co-ke": "node scripts/seed-redirect-online-to-co-ke.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fibercom/routeros-api": "^1.1.1",
+    "@prisma/client": "^6.4.1",
+    "app-root-path": "^3.1.0",
+    "axios": "^1.9.0",
+    "bcrypt": "^5.1.1",
+    "compression": "^1.8.1",
+    "date-fns": "^4.1.0",
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^8.0.1",
+    "http-proxy": "^1.18.1",
+    "http-proxy-middleware": "^3.0.5",
+    "intasend-node": "^1.1.2",
+    "jsonwebtoken": "^9.0.2",
+    "moment": "^2.30.1",
+    "node-cron": "^3.0.3",
+    "node-ssh": "^13.2.1",
+    "nodemailer": "^6.10.1",
+    "nodemon": "^3.1.9",
+    "qrcode": "^1.5.4",
+    "routeros-client": "^1.1.1",
+    "socket.io": "^4.8.1",
+    "speakeasy": "^2.0.0"
+  },
+  "description": "",
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "prisma": "^6.14.0"
+  }
+}

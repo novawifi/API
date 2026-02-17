@@ -1,0 +1,766 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String    @unique @default(uuid())
+  phone      String
+  username   String?
+  password   String?
+  status     String    @default("inactive")
+  code       String    @default("null")
+  token      String?   @default("null")
+  platformID String
+  packageID  String?
+  mac        String?   @default("null")
+  expireAt   DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  package    Package?  @relation(fields: [packageID], references: [id])
+}
+
+model Mpesa {
+  id            String   @unique @default(uuid())
+  code          String   @unique
+  reqcode       String?
+  phone         String
+  till          String?
+  paybill       String?
+  account       String?
+  status        String
+  amount        String
+  platformID    String
+  type          String?
+  paymentMethod String?  @default("unknown")
+  service       String?  @default("hotspot")
+  reason        String?
+  referenceID   String?  @default("")
+  failed_reason String?  @default("null")
+  reversed      Boolean?
+  verified      Boolean?
+  mac           String?  @default("null")
+  charges       String?  @default("0.00")
+  FirstName     String?  @default("N/A")
+  MiddleName    String?  @default("N/A")
+  LastName      String?  @default("N/A")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  package Package? @relation(fields: [reason], references: [id])
+}
+
+model C2BTransferPool {
+  id                     String   @unique @default(uuid())
+  platformID             String   @unique
+  destinationType        String
+  destinationShortCode   String
+  destinationAccount     String?  @default("null")
+  amount                String   @default("0")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model MpesaPullState {
+  id             String   @unique @default(uuid())
+  platformID     String   @unique
+  pullRegistered Boolean  @default(false)
+  lastPulledAt   DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model MpesaPullTransaction {
+  id               String   @unique @default(uuid())
+  platformID       String
+  shortCode        String
+  transactionId    String
+  trxDate          DateTime?
+  msisdn           String?
+  transactiontype  String?
+  billreference    String?
+  amount           String?
+  organizationname String?
+  raw              Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([platformID, transactionId])
+  @@index([platformID])
+  @@index([shortCode])
+}
+
+model Admin {
+  id         String   @unique @default(uuid())
+  name       String?
+  email      String   @unique
+  phone      String?
+  adminID    String
+  platformID String
+  role       String   @default("admin")
+  level      String?  @default("1")
+  token      String   @unique
+  password   String   @default("null")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Package {
+  id         String   @unique @default(uuid())
+  name       String
+  period     String
+  price      String
+  speed      String
+  devices    String
+  usage      String
+  category   Category
+  adminID    String
+  platformID String
+  routerHost String
+  routerName String?
+  pool       String?  @default("")
+  status     String?  @default("live")
+  social     String?  @default("N/A")
+  accountNumber String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  users      User[]
+  mpesas     Mpesa[]
+  homeFibreLeads HomeFibreLead[]
+
+}
+
+model SuperUser {
+  id        String   @unique @default(uuid())
+  name      String?
+  email     String   @unique
+  phone     String?
+  token     String   @unique
+  password  String   @default("null")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Platform {
+  id          String   @unique @default(uuid())
+  name        String
+  phone       String?  @default("N/A")
+  url         String   @unique
+  domain      String?  @default("")
+  platformID  String   @unique
+  adminID     String   @unique
+  status      String   @default("active")
+  logo        String?  @default("null")
+  description String?  @default("null")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PlatformSetting {
+  id                            String   @unique @default(uuid())
+  platformID                    String   @unique
+  platformIP                    String?
+  supportPhone                  String?  @default("")
+  brandingImage                 String?  @default("")
+  adminID                       String
+  IsC2B                         Boolean? @default(false)
+  IsAPI                         Boolean? @default(false)
+  IsB2B                         Boolean? @default(true)
+  mpesaConsumerKey              String?
+  mpesaConsumerSecret           String?
+  mpesaShortCode                String?
+  mpesaShortCodeType            String?
+  mpesaAccountNumber            String?
+  mpesaC2BShortCode             String?
+  mpesaC2BShortCodeType         String?
+  mpesaC2BAccountNumber         String?
+  mpesaAccountInitiator         String?  @default("")
+  mpesaAccountInitiatorPassword String?  @default("")
+  mpesaPassKey                  String?
+  mpesaPhone                    String?
+  mpesaSubAccountCode           String?
+  mpesaSubAccountID             String?
+  template                      String?  @default("Default")
+  sms                           Boolean? @default(false)
+  email                         Boolean? @default(true)
+  offlinePayments               Boolean  @default(true)
+  registeredURL                 Boolean  @default(false)
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+}
+
+model Station {
+  id                 String   @unique @default(uuid())
+  name               String
+  platformID         String
+  adminID            String
+  mikrotikHost       String?
+  mikrotikPublicHost String?
+  mikrotikUser       String?
+  mikrotikPassword   String?
+  mikrotikPublicKey  String?
+  mikrotikDDNS       String?
+  mikrotikWebfigHost String?
+  systemBasis        String?  @default("API")
+  radiusClientName   String?
+  radiusClientSecret String?
+  radiusClientIp     String?
+  radiusServerIp     String?
+  reminderSent       Boolean? @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model Funds {
+  id               String   @unique @default(uuid())
+  balance          String
+  withdrawals      String?
+  deposits         String?
+  shortCodeBalance String?  @default("0.00")
+  shortIdentifier  String?  @default("null")
+  platformID       String   @unique
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model ddns {
+  id         String   @unique @default(uuid())
+  url        String   @unique
+  publicIP   String?
+  platformID String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Pppoe {
+  id             String    @unique @default(uuid())
+  name           String
+  profile        String
+  servicename    String
+  station        String
+  pool           String
+  platformID     String
+  planId         String?
+  devices        String
+  price          String?
+  usage          String?
+  period         String?
+  amount         String?   @default("0")
+  status         String
+  clientname     String
+  clientpassword String
+  interface      String
+  maxsessions    String
+  email          String?
+  phone          String?   @default("null")
+  paymentLink    String?
+  reminderSent   Boolean   @default(false)
+  accountNumber  String?
+  expiresAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  customFields Json? @default("{}")
+  plan         PPPoEPlan? @relation(fields: [planId], references: [id])
+}
+
+model Template {
+  id        String   @unique @default(uuid())
+  name      String
+  url       String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BackUp {
+  id         String   @unique @default(uuid())
+  status     String
+  path       String
+  platformID String
+  host       String
+  filename   String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model TwoFa {
+  id         String   @id @default(uuid())
+  adminID    String   @unique
+  platformID String
+  secret     String
+  qrCode     String?
+  enabled    Boolean  @default(false)
+  verified   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Session {
+  id         String   @id @default(uuid())
+  token      String   @unique
+  adminID    String
+  platformID String
+  device     String?  @default("null")
+  ip         String?  @default("null")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Bill {
+  id          String    @id @default(uuid())
+  name        String?
+  platformID  String
+  amount      String    @default("500.00")
+  price       String    @default("500.00")
+  period      String?   @default("30 days")
+  currency    String?
+  status      String?
+  dueDate     DateTime?
+  paidAt      DateTime?
+  description String?
+  meta        Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model NetworkUsage {
+  id         String   @id @default(uuid())
+  platformID String
+  station    String
+  service    String
+  tx         BigInt   @default(0)
+  rx         BigInt   @default(0)
+  period     String   @default("monthly")
+  date       DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
+}
+
+model DashboardStats {
+  id           String   @id @default(uuid())
+  platformID   String   @unique
+  stats        Json
+  funds        Json
+  networkUsage Json
+  isB2B        Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model StationDashboardStats {
+  id           String   @id @default(uuid())
+  platformID   String
+  stationId    String
+  stats        Json
+  funds        Json
+  networkUsage Json
+  isB2B        Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([platformID, stationId])
+  @@index([platformID])
+  @@index([stationId])
+}
+
+model PPPoEPlan {
+  id         String   @id @default(uuid())
+  name       String
+  platformID String
+  station    String
+  profile    String
+  servicename String
+  pool       String
+  price      String
+  period     String
+  status     String   @default("active")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  pppoes     Pppoe[]
+}
+
+model Sms {
+  id               String  @id @default(cuid())
+  platformID       String  @unique
+  senderID         String  @default("TextSMS")
+  provider         String  @default("TextSMS")
+  apiKey           String  @default("null")
+  patnerID         String  @default("null")
+  balance          String  @default("0.0")
+  costPerSMS       String  @default("0.35")
+  default          Boolean @default(true)
+  sentHotspot      Boolean @default(true)
+  sentPPPoE        Boolean @default(true)
+  remainingSMS     String  @default("0")
+  pppoeTemplate    String  @default("Hello {username}, your PPPoE account details are ready.")
+  hotspotTemplate  String  @default("Your Login voucher code for {company} is {username}. Valid for {period}.")
+  // Registration (active account)
+  pppoeRegisterSMS String  @default("Hello {username}, your PPPoE account has been created by {company}. Check status: {paymentLink}")
+
+  // Inactive (needs payment to activate)
+  pppoeInactiveSMS String @default("Hello {username}, your PPPoE account is inactive. Pay {amount} KSH for your {package} plan to activate. Pay here: {paymentLink}")
+
+  // Reminder (expires in 1 day)
+  pppoeReminderSMS String @default("Reminder: Your PPPoE plan ({package}) with {company} expires in 1 day. Amount: KSH {amount}. Renew at: {paymentLink}")
+
+  // Expired (service disabled until payment is made)
+  pppoeExpiredSMS String @default("Your PPPoE account has been disabled due to unpaid KSH {amount}. Reactivate by paying here: {paymentLink}")
+
+  customTemplates Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ScheduledSms {
+  id           String   @id @default(cuid())
+  platformID   String
+  message      String
+  phoneNumbers Json
+  status       String   @default("scheduled")
+  scheduledAt  DateTime
+  sentAt       DateTime?
+  summary      Json?
+  failedNumbers Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([platformID])
+  @@index([scheduledAt])
+}
+
+model ScheduledInternalSms {
+  id            String   @id @default(cuid())
+  message       String
+  phoneNumbers  Json
+  status        String   @default("scheduled")
+  scheduledAt   DateTime
+  sentAt        DateTime?
+  summary       Json?
+  failedNumbers Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([scheduledAt])
+}
+
+model ScheduledInternalEmail {
+  id           String   @id @default(cuid())
+  subject      String
+  message      String
+  emails       Json
+  status       String   @default("scheduled")
+  scheduledAt  DateTime
+  sentAt       DateTime?
+  summary      Json?
+  failedEmails Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([scheduledAt])
+}
+
+model Email {
+  id              String @id @default(cuid())
+  platformID      String @unique
+  hotspotTemplate String @default("Your Login voucher code for {company} is {username}. Valid for {period}.")
+
+  // Registration (active account)
+  pppoeRegisterTemplate String @default("<p>Your PPPoE credentials have been created by <strong>{company}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: {name}<br />Password: {password}</p><p>For more status and information about this service, visit:<br />{paymentLink}</p>")
+
+  // Inactive (needs payment to activate)
+  pppoeInactiveTemplate String @default("<p>Your PPPoE account is currently inactive.<p><strong>-- PPPoE Credentials --</strong><br />Name: {name}<br />Password: {password}</p> To activate your credentials, please pay {amount} KSH for your {package} plan.</p><p>Visit {paymentLink} to complete payment.</p>")
+
+  // Reminder (expires in 1 day)
+  pppoeReminderTemplate String @default("<p>Reminder: Your PPPoE plan with <strong>{company}</strong> will expire in 1 day.<br />Package: {package}<br />Price: KSH {price}</p><p>To avoid service interruption, renew now at:<br />{paymentLink}</p>")
+
+  // Expired (service disabled until payment is made)
+  pppoeExpiredTemplate String @default("<p>Your WiFi PPPoE credentials have been disabled by <strong>{company}</strong> due to late payments of KSH {amount}.</p><p>To reactivate, please pay at:<br />{paymentLink}</p>")
+
+  customTemplates Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Setting {
+  id                String   @id @default(cuid())
+  name              String?  @default("NovaWiFi")
+  description       String?
+  domain            String?  @default("novawifi.co.ke")
+  logo              String?
+  ip                String?  @default("")
+  location          String?
+  founder           String?
+  version           String?
+  billingFee        String   @default("500.00")
+  systemBasis       String   @default("API")
+  underMaintenance  Boolean  @default(false)
+  maintenanceReason String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Config {
+  id          String   @id @default(cuid())
+  filename    String   @unique
+  title       String
+  description String
+  content     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model BlockedUser {
+  id         String   @id @default(uuid())
+  phone      String   @unique
+  reason     String?  @default("Violation of terms")
+  platformID String
+  blockedBy  String?
+  status     String   @default("blocked")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model SupportThread {
+  id         String           @id @default(uuid())
+  platformID String
+  adminID    String?
+  managerID  String?
+  type       String           @default("ticket")
+  status     String           @default("open")
+  priority   String?
+  subject    String?
+  channel    String?          @default("web")
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+  messages   SupportMessage[]
+}
+
+model SupportMessage {
+  id          String        @id @default(uuid())
+  threadID    String
+  senderRole  String
+  senderID    String?
+  body        String
+  attachments Json?
+  createdAt   DateTime      @default(now())
+  thread      SupportThread @relation(fields: [threadID], references: [id], onDelete: Cascade)
+}
+
+model SystemService {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  name        String
+  price       String
+  currency    String
+  period      String
+  description String
+  isPlugin    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PlatformPlugin {
+  id         String   @id @default(uuid())
+  platformID String
+  serviceKey String
+  status     String   @default("active")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([platformID, serviceKey])
+  @@index([platformID])
+}
+
+model PlatformTerms {
+  id         String   @id @default(uuid())
+  platformID String   @unique
+  title      String
+  content    String
+  updatedAt  DateTime @updatedAt
+  createdAt  DateTime @default(now())
+}
+
+model PlatformSidebarLink {
+  id         String   @id @default(uuid())
+  platformID String
+  adminId    String?
+  linkKey    String?
+  archived   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([platformID, adminId, linkKey])
+  @@index([platformID])
+  @@index([adminId])
+}
+
+enum Category {
+  Daily
+  Weekly
+  Monthly
+  Data
+  Social
+  HomeFibre
+}
+
+model HomeFibreLead {
+  id          String   @id @default(uuid())
+  platformID  String
+  packageID   String?
+  packageName String?
+  price       String?
+  speed       String?
+  phone       String
+  status      String   @default("new")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  package Package? @relation(fields: [packageID], references: [id])
+}
+
+model nas {
+  id          Int     @id @default(autoincrement())
+  nasname     String  @db.VarChar(128)
+  shortname   String? @db.VarChar(32)
+  type        String? @default("other") @db.VarChar(30)
+  ports       Int?
+  secret      String  @default("secret") @db.VarChar(60)
+  server      String? @db.VarChar(64)
+  community   String? @db.VarChar(50)
+  description String? @default("RADIUS Client") @db.VarChar(200)
+
+  @@index([nasname], map: "nas_nasname_idx")
+  @@map("nas")
+}
+
+model nasreload {
+  nasipaddress String   @id @db.VarChar(15)
+  reloadtime   DateTime @db.Timestamp(0)
+
+  @@map("nasreload")
+}
+
+model radacct {
+  radacctid           BigInt    @id @default(autoincrement()) @db.BigInt
+  acctsessionid       String    @default("") @db.VarChar(64)
+  acctuniqueid        String    @unique(map: "acctuniqueid") @default("") @db.VarChar(32)
+  username            String    @default("") @db.VarChar(64)
+  realm               String?   @default("") @db.VarChar(64)
+  nasipaddress        String    @default("") @db.VarChar(15)
+  nasportid           String?   @db.VarChar(32)
+  nasporttype         String?   @db.VarChar(32)
+  acctstarttime       DateTime? @db.Timestamp(0)
+  acctupdatetime      DateTime? @db.Timestamp(0)
+  acctstoptime        DateTime? @db.Timestamp(0)
+  acctinterval        Int?
+  acctsessiontime     Int?
+  acctauthentic       String?   @db.VarChar(32)
+  connectinfo_start   String?   @db.VarChar(128)
+  connectinfo_stop    String?   @db.VarChar(128)
+  acctinputoctets     BigInt?   @db.BigInt
+  acctoutputoctets    BigInt?   @db.BigInt
+  calledstationid     String    @default("") @db.VarChar(50)
+  callingstationid    String    @default("") @db.VarChar(50)
+  acctterminatecause  String    @default("") @db.VarChar(32)
+  servicetype         String?   @db.VarChar(32)
+  framedprotocol      String?   @db.VarChar(32)
+  framedipaddress     String    @default("") @db.VarChar(15)
+  framedipv6address   String    @default("") @db.VarChar(45)
+  framedipv6prefix    String    @default("") @db.VarChar(45)
+  framedinterfaceid   String    @default("") @db.VarChar(44)
+  delegatedipv6prefix String    @default("") @db.VarChar(45)
+  class               String?   @db.VarChar(64)
+
+  @@index([username], map: "radacct_username_idx")
+  @@index([framedipaddress], map: "radacct_framedipaddress_idx")
+  @@index([framedipv6address], map: "radacct_framedipv6address_idx")
+  @@index([framedipv6prefix], map: "radacct_framedipv6prefix_idx")
+  @@index([framedinterfaceid], map: "radacct_framedinterfaceid_idx")
+  @@index([delegatedipv6prefix], map: "radacct_delegatedipv6prefix_idx")
+  @@index([acctsessionid], map: "radacct_acctsessionid_idx")
+  @@index([acctsessiontime], map: "radacct_acctsessiontime_idx")
+  @@index([acctstarttime], map: "radacct_acctstarttime_idx")
+  @@index([acctinterval], map: "radacct_acctinterval_idx")
+  @@index([acctstoptime], map: "radacct_acctstoptime_idx")
+  @@index([nasipaddress], map: "radacct_nasipaddress_idx")
+  @@index([class], map: "radacct_class_idx")
+  @@map("radacct")
+}
+
+model radcheck {
+  id        Int    @id @default(autoincrement())
+  username  String @default("") @db.VarChar(64)
+  attribute String @default("") @db.VarChar(64)
+  op        String @default("==") @db.Char(2)
+  value     String @default("") @db.VarChar(253)
+
+  @@index([username], map: "radcheck_username_idx")
+  @@map("radcheck")
+}
+
+model radgroupcheck {
+  id        Int    @id @default(autoincrement())
+  groupname String @default("") @db.VarChar(64)
+  attribute String @default("") @db.VarChar(64)
+  op        String @default("==") @db.Char(2)
+  value     String @default("") @db.VarChar(253)
+
+  @@index([groupname], map: "radgroupcheck_groupname_idx")
+  @@map("radgroupcheck")
+}
+
+model radgroupreply {
+  id        Int    @id @default(autoincrement())
+  groupname String @default("") @db.VarChar(64)
+  attribute String @default("") @db.VarChar(64)
+  op        String @default("=") @db.Char(2)
+  value     String @default("") @db.VarChar(253)
+
+  @@index([groupname], map: "radgroupreply_groupname_idx")
+  @@map("radgroupreply")
+}
+
+model radpostauth {
+  id       Int      @id @default(autoincrement())
+  username String   @default("") @db.VarChar(64)
+  pass     String   @default("") @db.VarChar(64)
+  reply    String   @default("") @db.VarChar(32)
+  authdate DateTime @default(now()) @db.Timestamp(6)
+  class    String?  @db.VarChar(64)
+
+  @@index([username], map: "radpostauth_username_idx")
+  @@index([class], map: "radpostauth_class_idx")
+  @@map("radpostauth")
+}
+
+model radreply {
+  id        Int    @id @default(autoincrement())
+  username  String @default("") @db.VarChar(64)
+  attribute String @default("") @db.VarChar(64)
+  op        String @default("=") @db.Char(2)
+  value     String @default("") @db.VarChar(253)
+
+  @@index([username], map: "radreply_username_idx")
+  @@map("radreply")
+}
+
+model radusergroup {
+  id        Int    @id @default(autoincrement())
+  username  String @default("") @db.VarChar(64)
+  groupname String @default("") @db.VarChar(64)
+  priority  Int    @default(1)
+
+  @@index([username], map: "radusergroup_username_idx")
+  @@map("radusergroup")
+}
