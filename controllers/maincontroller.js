@@ -2730,10 +2730,16 @@ class Controller {
       supportPhone,
       brandingImage,
     } = data;
-    try {
-      const existingConfig = await this.db.getPlatformConfig(platformID);
-      if (IsC2B === true) {
-        if (!mpesaC2BShortCode || !mpesaC2BShortCodeType || !adminID) {
+	    try {
+	      const existingConfig = await this.db.getPlatformConfig(platformID);
+	      const b2bShortCodeType = ["till", "paybill"].includes(String(mpesaShortCodeType || "").toLowerCase())
+	        ? mpesaShortCodeType
+	        : "Till";
+	      const c2bShortCodeType = ["till", "paybill"].includes(String(mpesaC2BShortCodeType || "").toLowerCase())
+	        ? mpesaC2BShortCodeType
+	        : "Till";
+	      if (IsC2B === true) {
+	        if (!mpesaC2BShortCode || !mpesaC2BShortCodeType || !adminID) {
           return res.json({
             success: false,
             message: "All MPESA fields must be filled out!",
@@ -2757,11 +2763,16 @@ class Controller {
           return res.json({
             success: false,
             message: "All MPESA fields must be filled out!",
-          });
-        }
-      }
-      if (!existingConfig) {
-        const add = await this.db.createPlatformConfig(platformID, data);
+	          });
+	        }
+	      }
+	      const payload = {
+	        ...data,
+	        mpesaShortCodeType: b2bShortCodeType,
+	        mpesaC2BShortCodeType: c2bShortCodeType,
+	      };
+	      if (!existingConfig) {
+	        const add = await this.db.createPlatformConfig(platformID, payload);
         await this.refreshDashboardStats(platformID, { role: auth.admin.role });
         this.cache.del(`main:settings:${platformID}`);
         return res.json({
@@ -2770,7 +2781,7 @@ class Controller {
         });
       }
 
-      const updatedConfig = await this.db.updatePlatformConfig(platformID, data);
+	      const updatedConfig = await this.db.updatePlatformConfig(platformID, payload);
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
       this.cache.del(`main:settings:${platformID}`);
       return res.json({

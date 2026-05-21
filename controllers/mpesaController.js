@@ -520,6 +520,12 @@ class MpesaController {
         if (String(destType).toLowerCase() === "paybill" && !destAccount) {
             throw new Error("Destination Paybill account number missing.");
         }
+        if (!["till", "paybill"].includes(String(destType).toLowerCase())) {
+            throw new Error("Destination type must be Till or Paybill.");
+        }
+        if (!["till", "paybill"].includes(String(destType).toLowerCase())) {
+            throw new Error("Destination type must be Till or Paybill.");
+        }
 
         if (!this.mpesa.MPESA_B2B_URL) {
             throw new Error("MPESA_B2B_URL not set.");
@@ -540,6 +546,11 @@ class MpesaController {
         const receiverIdentifierType = isPaybill ? "4" : "2";
         const senderIdentifierType = "4";
         const referenceText = reference || mpesaCode?.code || mpesaCode?.reqcode || "C2B Payout";
+        const charge = this.getMpesaB2BCharge(amount);
+        const transferAmount = Number(amount) - charge;
+        if (transferAmount <= 0) {
+            throw new Error("Transfer amount is too small after M-PESA charges.");
+        }
 
 	        const payload = {
 	            Initiator: c2bEnv.initiatorName,
@@ -547,7 +558,7 @@ class MpesaController {
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
 	            ReceiverIdentifierType: receiverIdentifierType,
-	            Amount: Number(amount),
+	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
 	            AccountReference: isPaybill ? destAccount : "",
@@ -588,6 +599,7 @@ class MpesaController {
             paybill: isPaybill ? String(destShortCode) : "null",
             account: isPaybill ? String(destAccount) : "null",
             paymentMethod: "Mpesa C2B",
+            charges: charge.toFixed(2),
         });
 
         return result;
@@ -611,6 +623,9 @@ class MpesaController {
         if (String(destType).toLowerCase() === "paybill" && !destAccount) {
             throw new Error("Destination Paybill account number missing.");
         }
+        if (!["till", "paybill"].includes(String(destType).toLowerCase())) {
+            throw new Error("Destination type must be Till or Paybill.");
+        }
 
         if (!this.mpesa.MPESA_B2B_URL) {
             throw new Error("MPESA_B2B_URL not set.");
@@ -631,6 +646,11 @@ class MpesaController {
         const receiverIdentifierType = isPaybill ? "4" : "2";
         const senderIdentifierType = "4";
         const referenceText = reference || mpesaCode?.code || mpesaCode?.reqcode || "Payout";
+        const charge = this.getMpesaB2BCharge(amount);
+        const transferAmount = Number(amount) - charge;
+        if (transferAmount <= 0) {
+            throw new Error("Transfer amount is too small after M-PESA charges.");
+        }
 
 	        const payload = {
 	            Initiator: c2bEnv.initiatorName,
@@ -638,7 +658,7 @@ class MpesaController {
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
 	            ReceiverIdentifierType: receiverIdentifierType,
-	            Amount: Number(amount),
+	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
 	            AccountReference: isPaybill ? destAccount : "",
@@ -675,6 +695,7 @@ class MpesaController {
             paybill: isPaybill ? String(destShortCode) : "null",
             account: isPaybill ? String(destAccount) : "null",
             paymentMethod: String(mpesaCode?.paymentMethod || "Mpesa C2B"),
+            charges: charge.toFixed(2),
         });
 
         return result;
@@ -718,6 +739,11 @@ class MpesaController {
         const receiverIdentifierType = isPaybill ? "4" : "2";
         const senderIdentifierType = "4";
         const referenceText = reference || `${platformID}-${Date.now()}`;
+        const charge = this.getMpesaB2BCharge(amount);
+        const transferAmount = Number(amount) - charge;
+        if (transferAmount <= 0) {
+            throw new Error("Transfer amount is too small after M-PESA charges.");
+        }
 
 	        const payload = {
 	            Initiator: c2bEnv.initiatorName,
@@ -725,7 +751,7 @@ class MpesaController {
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
 	            ReceiverIdentifierType: receiverIdentifierType,
-	            Amount: Number(amount),
+	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
 	            AccountReference: isPaybill ? destAccount : "",
@@ -854,13 +880,12 @@ class MpesaController {
             const typeLower = String(destinationType || "").toLowerCase();
             const isPaybill = typeLower === "paybill";
             const isTill = typeLower === "till";
-            const isPochi = typeLower === "pochi" || typeLower === "phone";
             const poolRow = {
                 platformID,
                 amount: nextAmount.toFixed(2),
                 code: poolCode,
                 reqcode: poolCode,
-                phone: isPochi ? String(destinationShortCode || "null") : "null",
+                phone: "null",
                 status: "PENDING",
                 type: "c2b pool",
                 service: "Mpesa C2B Pool",
@@ -902,25 +927,15 @@ class MpesaController {
 
         try {
             const destLower = String(destinationType).toLowerCase();
-            if (destLower === "pochi" || destLower === "phone") {
-                const response = await this.initiateC2BB2PochiTransfer({
-                    platformID,
-                    amount: amountValue,
-                    phone: destinationShortCode,
-                    reference: `C2BPO-${Date.now()}`,
-                });
-                const originatorId = response?.OriginatorConversationID || response?.originatorConversationID;
-                if (originatorId) {
-                    this.storeDarajaRequest(originatorId, platformID, "c2b-pochi");
-                }
-            } else {
-                await this.initiateC2BB2BTransfer({
-                    platformID,
-                    amount: amountValue,
-                    mpesaCode: { code: `C2BPOOL-${Date.now()}` },
-                    reference: `C2BPOOL-${Date.now()}`,
-                });
+            if (!["till", "paybill"].includes(destLower)) {
+                throw new Error("Destination type must be Till or Paybill.");
             }
+            await this.initiateC2BB2BTransfer({
+                platformID,
+                amount: amountValue,
+                mpesaCode: { code: `C2BPOOL-${Date.now()}` },
+                reference: `C2BPOOL-${Date.now()}`,
+            });
 
             await this.db.upsertC2BTransferPool(platformID, {
                 destinationType,
@@ -1074,6 +1089,12 @@ class MpesaController {
                         message: "Configure MPESA C2B destination details in Settings.",
                     });
                 }
+                if (!["till", "paybill"].includes(String(platform.mpesaC2BShortCodeType || "").toLowerCase())) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Configure MPESA C2B destination as Till or Paybill.",
+                    });
+                }
                 checkoutRequestId = await this.initiateC2BStkPush({
                     platformID,
                     phone,
@@ -1083,7 +1104,6 @@ class MpesaController {
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
-                const isPochi = c2bType === "pochi" || c2bType === "phone";
                 const mpesaCode = {
                     platformID: platformID,
                     amount: amount,
@@ -1095,7 +1115,7 @@ class MpesaController {
                     type: "deposit",
                     reason: pkg.id,
                     paymentMethod: "Mpesa C2B",
-                    till: !isPaybill && !isPochi ? String(platform.mpesaC2BShortCode) : "null",
+                    till: !isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     paybill: isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     account: isPaybill ? String(platform.mpesaC2BAccountNumber || "") : "null",
                 };
@@ -1315,6 +1335,12 @@ class MpesaController {
                         message: "Configure MPESA C2B destination details in Settings.",
                     });
                 }
+                if (!["till", "paybill"].includes(String(platform.mpesaC2BShortCodeType || "").toLowerCase())) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Configure MPESA C2B destination as Till or Paybill.",
+                    });
+                }
                 checkoutRequestId = await this.initiateC2BStkPush({
                     platformID,
                     phone,
@@ -1324,7 +1350,6 @@ class MpesaController {
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
-                const isPochi = c2bType === "pochi" || c2bType === "phone";
                 const mpesaCode = {
                     platformID: platformID,
                     amount: amount,
@@ -1337,7 +1362,7 @@ class MpesaController {
                     referenceID: paymentLink,
                     type: "deposit",
                     paymentMethod: "Mpesa C2B",
-                    till: !isPaybill && !isPochi ? String(platform.mpesaC2BShortCode) : "null",
+                    till: !isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     paybill: isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     account: isPaybill ? String(platform.mpesaC2BAccountNumber || "") : "null",
                 };
@@ -1770,30 +1795,19 @@ class MpesaController {
                                 return;
                             }
 
-                            try {
-                                const lowerDestType = String(destType).toLowerCase();
-                                if (lowerDestType === "pochi" || lowerDestType === "phone") {
-                                    const response = await this.initiateC2BB2PochiTransfer({
-                                        platformID: mpesaSnapshot.platformID,
-                                        amount: amountValue,
-                                        phone: destShortCode,
-                                        reference: referenceReceipt,
-                                    });
-                                    const originatorId = response?.OriginatorConversationID || response?.originatorConversationID;
-                                    if (originatorId) {
-                                        this.storeDarajaRequest(originatorId, mpesaSnapshot.platformID, "c2b-pochi");
-                                    }
-                                    this.logPayment(mpesaSnapshot.platformID, `Pochi transfer queued (ref ${referenceReceipt})`, "success");
-                                } else {
-                                    await this.initiateC2BB2BTransfer({
-                                        platformID: mpesaSnapshot.platformID,
-                                        amount: amountValue,
-                                        mpesaCode: mpesaSnapshot,
-                                        reference: referenceReceipt,
-                                    });
-                                    this.logPayment(mpesaSnapshot.platformID, `C2B B2B transfer queued (ref ${referenceReceipt})`, "success");
-                                }
-                            } catch (error) {
+	                            try {
+	                                const lowerDestType = String(destType).toLowerCase();
+	                                if (!["till", "paybill"].includes(lowerDestType)) {
+	                                    throw new Error("Destination type must be Till or Paybill.");
+	                                }
+	                                await this.initiateC2BB2BTransfer({
+	                                    platformID: mpesaSnapshot.platformID,
+	                                    amount: amountValue,
+	                                    mpesaCode: mpesaSnapshot,
+	                                    reference: referenceReceipt,
+	                                });
+	                                this.logPayment(mpesaSnapshot.platformID, `C2B B2B transfer queued (ref ${referenceReceipt})`, "success");
+	                            } catch (error) {
                                 const errMsg =
                                     error?.response?.data?.errorMessage ||
                                     error?.response?.data?.ResponseDescription ||
