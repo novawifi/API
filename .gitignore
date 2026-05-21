@@ -8,6 +8,7 @@ scripts/seed-dashboard-stats.js
 seed.js
 backups
 files
+d.sh
 
 # Testing
 /coverage

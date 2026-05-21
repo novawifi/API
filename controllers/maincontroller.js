@@ -6758,18 +6758,23 @@ class Controller {
   }
 
   async addPlatform(req, res) {
-    const { token, name, url, platformID, adminID, email, password, role, phone, adminName } = req.body;
+    const { token, name, url, platformID, adminID, email, password, role, phone, adminName, subscriptionPlan } = req.body;
     if (!token || !name || !url || !platformID || !adminID || !email || !password || !role) {
       return res.json({
         success: false,
         message: "Missing credentials are required!",
       });
     }
+    const plan = this.normalizePlatformPlan(subscriptionPlan);
+    const createdAt = new Date();
+    const trialEndsAt = this.isTrialLimitedPlan(plan) ? this.addDays(createdAt, 3) : null;
     const data = {
       name: name,
       url: url,
       platformID: platformID,
       adminID: adminID,
+      subscriptionPlan: plan,
+      trialEndsAt,
     };
     try {
       const session = await this.authManagerSession(token);
@@ -6833,7 +6838,6 @@ class Controller {
         hotspotTemplate: "Default",
       })
 
-      const createdAt = new Date();
       let dueDate = null;
       let totalAmount = 0;
       const serviceKey = "billing";
@@ -6860,6 +6864,10 @@ class Controller {
           totalAmount = periodsPast * Number(service.price);
         }
       }
+      if (this.isTrialLimitedPlan(plan)) {
+        dueDate = trialEndsAt;
+        totalAmount = Number(service.price);
+      }
 
       const subdata = {
         name: service?.name,
@@ -6872,9 +6880,15 @@ class Controller {
         description: service?.description,
       };
 
-      const newBilling = await this.db.createPlatformBilling(subdata);
+      await this.db.createPlatformBilling(subdata);
 
       const add = await this.db.createPlatform(data);
+      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
+        message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
+        status: "info",
+        actionLabel: "Pay Bill",
+        actionUrl: "/admin/bills",
+      });
       await this.refreshDashboardStats(platformID);
       const saltRounds = 10;
       const hashedPassword = await bcrypt.hash(password, saltRounds);
@@ -6955,7 +6969,7 @@ class Controller {
   };
 
   async registerPlatform(req, res) {
-    const { name, email, password, phone, url, platformID, adminID } = req.body;
+    const { name, email, password, phone, url, platformID, adminID, subscriptionPlan } = req.body;
     if (!name || !url || !email || !password || !platformID || !adminID) {
       return res.status(400).json({
         success: false,
@@ -7023,7 +7037,9 @@ class Controller {
         hotspotTemplate: "Default",
       })
 
+      const plan = this.normalizePlatformPlan(subscriptionPlan);
       const createdAt = new Date();
+      const trialEndsAt = this.isTrialLimitedPlan(plan) ? this.addDays(createdAt, 3) : null;
       let dueDate = null;
       let totalAmount = 0;
       const serviceKey = "billing";
@@ -7050,6 +7066,10 @@ class Controller {
           totalAmount = periodsPast * Number(service.price);
         }
       }
+      if (this.isTrialLimitedPlan(plan)) {
+        dueDate = trialEndsAt;
+        totalAmount = Number(service.price);
+      }
 
       const billingdata = {
         name: service?.name,
@@ -7067,7 +7087,15 @@ class Controller {
         name,
         url: url,
         platformID,
-        adminID
+        adminID,
+        subscriptionPlan: plan,
+        trialEndsAt,
+      });
+      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
+        message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
+        status: "info",
+        actionLabel: "Pay Bill",
+        actionUrl: "/admin/bills",
       });
       await this.refreshDashboardStats(platformID);
 
