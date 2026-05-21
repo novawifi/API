@@ -4345,6 +4345,22 @@ class DataBase {
         }
     }
 
+    async getUnpaidPlatformBilling(platformID) {
+        if (!platformID) return [];
+        try {
+            return prisma.bill.findMany({
+                where: {
+                    platformID,
+                    status: { not: "Paid" },
+                },
+                orderBy: { dueDate: "asc" },
+            });
+        } catch (error) {
+            console.error("Error getting unpaid bills:", error);
+            throw error;
+        }
+    }
+
     async getPlatformBillingByID(id) {
         if (!id) return null;
         try {
@@ -4399,6 +4415,78 @@ class DataBase {
             return bill;
         } catch (error) {
             console.error("Error deleting bill:", error);
+            throw error;
+        }
+    }
+
+    async getPlatformNotifications(platformID, includeDismissed = false) {
+        if (!platformID) return [];
+        try {
+            return prisma.platformNotification.findMany({
+                where: {
+                    platformID,
+                    ...(includeDismissed ? {} : { dismissedAt: null }),
+                    OR: [
+                        { expiresAt: null },
+                        { expiresAt: { gt: new Date() } },
+                    ],
+                },
+                orderBy: { createdAt: "desc" },
+            });
+        } catch (error) {
+            console.error("Error getting platform notifications:", error);
+            throw error;
+        }
+    }
+
+    async createPlatformNotification(data) {
+        if (!data?.platformID || !data?.title || !data?.message) return null;
+        try {
+            return prisma.platformNotification.create({ data });
+        } catch (error) {
+            console.error("Error creating platform notification:", error);
+            throw error;
+        }
+    }
+
+    async upsertPlatformNotification(platformID, title, data) {
+        if (!platformID || !title || !data?.message) return null;
+        try {
+            const existing = await prisma.platformNotification.findFirst({
+                where: { platformID, title, dismissedAt: null },
+                orderBy: { createdAt: "desc" },
+            });
+            if (existing) {
+                return prisma.platformNotification.update({
+                    where: { id: existing.id },
+                    data: {
+                        ...data,
+                        dismissedAt: null,
+                    },
+                });
+            }
+            return prisma.platformNotification.create({
+                data: {
+                    ...data,
+                    platformID,
+                    title,
+                },
+            });
+        } catch (error) {
+            console.error("Error upserting platform notification:", error);
+            throw error;
+        }
+    }
+
+    async dismissPlatformNotification(id, platformID) {
+        if (!id || !platformID) return null;
+        try {
+            return prisma.platformNotification.updateMany({
+                where: { id, platformID },
+                data: { dismissedAt: new Date() },
+            });
+        } catch (error) {
+            console.error("Error dismissing platform notification:", error);
             throw error;
         }
     }

@@ -154,10 +154,31 @@ model Platform {
   platformID  String   @unique
   adminID     String   @unique
   status      String   @default("active")
+  subscriptionPlan String @default("basic")
+  trialEndsAt  DateTime?
+  lastPaymentAt DateTime?
   logo        String?  @default("null")
   description String?  @default("null")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+model PlatformNotification {
+  id          String    @id @default(uuid())
+  platformID  String
+  title       String
+  message     String
+  status      String    @default("info")
+  actionLabel String?
+  actionUrl   String?
+  dismissedAt DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([platformID])
+  @@index([status])
+  @@index([dismissedAt])
 }
 
 model PlatformSetting {

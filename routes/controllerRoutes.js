@@ -112,6 +112,8 @@ router.post("/publicBlog", use("fetchPublicBlogBySlug"));
 router.post("/fetchAdmins", use("fetchAdmins"));
 router.post("/fetchPlatformSettings", use("fetchPlatformSettings"))
 router.post("/fetchPlatform", use("fetchPlatform"))
+router.post("/notifications", use("fetchPlatformNotifications"));
+router.post("/notifications/dismiss", use("dismissPlatformNotification"));
 router.post("/updatePlatformSettings", use("updateManagerSettings"))
 router.post("/updateAdmin", use("updateAdmin"));
 router.post("/deleteAdmin", use("deleteAdmin"));

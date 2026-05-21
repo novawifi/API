@@ -74,6 +74,63 @@ class Controller {
     };
   }
 
+  normalizePlatformPlan(plan) {
+    const normalized = String(plan || "basic").trim().toLowerCase();
+    if (normalized === "stater") return "starter";
+    if (["basic", "starter", "professional"].includes(normalized)) return normalized;
+    return "basic";
+  }
+
+  isTrialLimitedPlan(plan) {
+    return ["basic", "starter"].includes(this.normalizePlatformPlan(plan));
+  }
+
+  addDays(date, days) {
+    const next = new Date(date || Date.now());
+    next.setDate(next.getDate() + days);
+    return next;
+  }
+
+  async enforcePlatformSubscription(platformID) {
+    if (!platformID) return null;
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return null;
+
+    const plan = this.normalizePlatformPlan(platform.subscriptionPlan);
+    const trialEndsAt = platform.trialEndsAt || this.addDays(platform.createdAt, 3);
+    const unpaidBills = await this.db.getUnpaidPlatformBilling(platformID);
+    const hasUnpaidAmount = unpaidBills.some((bill) => Number(bill?.amount || 0) > 0);
+    const shouldDisable =
+      this.isTrialLimitedPlan(plan) &&
+      hasUnpaidAmount &&
+      new Date(trialEndsAt).getTime() < Date.now();
+
+    if (shouldDisable && String(platform.status || "").toLowerCase() !== "inactive") {
+      await this.db.updatePlatform(platformID, { status: "inactive" });
+      platform.status = "inactive";
+    }
+
+    const unpaidBill = unpaidBills.find((bill) => Number(bill?.amount || 0) > 0);
+    if (shouldDisable && unpaidBill) {
+      await this.db.upsertPlatformNotification(platformID, "Platform disabled: payment required", {
+        message: `Your ${plan} plan trial ended and KES ${unpaidBill.amount} is unpaid. Pay now to reactivate your platform.`,
+        status: "error",
+        actionLabel: "Pay Now",
+        actionUrl: "/admin/bills",
+      });
+    } else if (this.isTrialLimitedPlan(plan) && hasUnpaidAmount && unpaidBill) {
+      const daysLeft = Math.max(0, Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000)));
+      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
+        message: `Your ${plan} plan has ${daysLeft} day(s) left before it is disabled. Amount due: KES ${unpaidBill.amount}.`,
+        status: "info",
+        actionLabel: "Pay Bill",
+        actionUrl: "/admin/bills",
+      });
+    }
+
+    return { ...platform, subscriptionPlan: plan, trialEndsAt };
+  }
+
   async refreshDashboardStats(platformID, options = {}) {
     if (!platformID) return null;
     let onlineHotspotUsers;
@@ -718,10 +775,7 @@ class Controller {
     }
     try {
       const cacheKey = `main:platform:${auth.admin.platformID}`;
-      const cached = this.cache.get(cacheKey);
-      if (cached) {
-        return res.json(cached);
-      }
+      await this.enforcePlatformSubscription(auth.admin.platformID);
       const platform = await this.db.getPlatform(auth.admin.platformID);
       if (!platform) {
         return res.json({
@@ -738,6 +792,44 @@ class Controller {
     } catch (error) {
       console.log("An error occurred", error);
       return res.json({ success: false, message: "An error occurred" });
+    }
+  }
+
+  async fetchPlatformNotifications(req, res) {
+    const { token } = req.body || {};
+    if (!token) {
+      return res.json({ success: false, message: "Missing credentials required!" });
+    }
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) {
+        return res.json({ success: false, message: auth.message });
+      }
+      const platformID = auth.admin.platformID;
+      await this.enforcePlatformSubscription(platformID);
+      const notifications = await this.db.getPlatformNotifications(platformID);
+      return res.json({ success: true, notifications });
+    } catch (error) {
+      console.error("Error fetching platform notifications:", error);
+      return res.json({ success: false, message: "Failed to fetch notifications." });
+    }
+  }
+
+  async dismissPlatformNotification(req, res) {
+    const { token, id } = req.body || {};
+    if (!token || !id) {
+      return res.json({ success: false, message: "Missing credentials required!" });
+    }
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) {
+        return res.json({ success: false, message: auth.message });
+      }
+      await this.db.dismissPlatformNotification(id, auth.admin.platformID);
+      return res.json({ success: true, message: "Notification dismissed." });
+    } catch (error) {
+      console.error("Error dismissing platform notification:", error);
+      return res.json({ success: false, message: "Failed to dismiss notification." });
     }
   }
 
@@ -760,6 +852,7 @@ class Controller {
       }
       const admin = await this.db.getAdminByID(session.adminID);
       if (admin) {
+        await this.enforcePlatformSubscription(admin.platformID);
         return res.json({
           success: true,
           message: "Authentication successful",
@@ -775,6 +868,7 @@ class Controller {
         });
       }
 
+      await this.enforcePlatformSubscription(session.platformID);
       return res.json({
         success: true,
         message: "Authentication successful",
