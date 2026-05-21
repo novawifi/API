@@ -1003,8 +1003,23 @@ Price: KSH ${service.price}</p>
         let billing = await this.db.getPlatformBillingByName(service.name, platformID);
 
         if (String(platform.status || "").toLowerCase() === "premium") {
+            const premiumBill = {
+                period: service.period,
+                platformID,
+                name: service.name,
+                price: String(service.price || "500"),
+                amount: "0",
+                currency: service.currency || "KES",
+                dueDate: null,
+                paidAt: billing?.paidAt || now,
+                status: "Paid",
+                description: service.description,
+                meta: { serviceKey, plan: "basic", premium: true },
+            };
             if (billing) {
-                await this.db.deletePlatformBilling(billing.id);
+                await this.db.updatePlatformBilling(billing.id, premiumBill);
+            } else {
+                await this.db.createPlatformBilling(premiumBill);
             }
             return;
         }

@@ -7,6 +7,7 @@ const fs = require("fs");
 const fsp = require("fs").promises;
 const { exec, execSync, execFile } = require("child_process");
 const path = require("path");
+const os = require("os");
 const moment = require("moment");
 const dns = require("dns").promises;
 const jwt = require("jsonwebtoken");
@@ -94,6 +95,10 @@ class Controller {
     return plans[this.normalizePlatformPlan(plan)] || plans.basic;
   }
 
+  isPremiumPlatform(platform) {
+    return String(platform?.status || "").trim().toLowerCase() === "premium";
+  }
+
   addDays(date, days) {
     const next = new Date(date || Date.now());
     next.setDate(next.getDate() + days);
@@ -129,23 +134,32 @@ class Controller {
     if (!service) return null;
 
     const plan = this.getAccountPlan(platform.subscriptionPlan);
+    const isPremium = this.isPremiumPlatform(platform);
     const amount = String(plan.price);
     const dueDate = this.getBillingDueDate(platform, service, plan.id);
     const existing = await this.db.getPlatformBillingByName(service.name, platformID);
     const data = {
       name: service.name,
       platformID,
-      amount,
+      amount: isPremium ? "0" : amount,
       price: amount,
       currency: service.currency,
       period: service.period,
-      dueDate,
+      dueDate: isPremium ? null : dueDate,
       description: service.description,
-      meta: { serviceKey: "billing", plan: plan.id },
+      meta: { serviceKey: "billing", plan: plan.id, premium: isPremium },
     };
 
     if (!existing) {
-      return this.db.createPlatformBilling({ ...data, status: "Unpaid" });
+      return this.db.createPlatformBilling({ ...data, status: isPremium ? "Paid" : "Unpaid" });
+    }
+
+    if (isPremium) {
+      return this.db.updatePlatformBilling(existing.id, {
+        ...data,
+        status: "Paid",
+        paidAt: existing.paidAt || new Date(),
+      });
     }
 
     if (String(existing.status || "").toLowerCase() === "paid") {
@@ -160,6 +174,9 @@ class Controller {
     await this.ensurePlatformBillingService(platformID);
     const platform = await this.db.getPlatformByplatformID(platformID);
     if (!platform) return null;
+    if (this.isPremiumPlatform(platform)) {
+      return { ...platform, subscriptionPlan: this.normalizePlatformPlan(platform.subscriptionPlan) };
+    }
 
     const plan = this.normalizePlatformPlan(platform.subscriptionPlan);
     const trialEndsAt = platform.trialEndsAt || this.addDays(platform.createdAt, 3);
@@ -7063,12 +7080,16 @@ class Controller {
       }
 
       const plan = this.normalizePlatformPlan(subscriptionPlan);
+      const requestedPlan = String(subscriptionPlan || "").trim().toLowerCase();
+      if (requestedPlan !== "stater" && requestedPlan !== plan) {
+        return res.json({ success: false, message: "Invalid account plan!" });
+      }
       const data = { subscriptionPlan: plan };
       if (this.isTrialLimitedPlan(plan) && !existing.trialEndsAt) {
         data.trialEndsAt = this.addDays(existing.createdAt, 3);
       }
 
-      const platform = await this.db.updatePlatform(platformID, data);
+      await this.db.updatePlatform(platformID, data);
       const bill = await this.ensurePlatformBillingService(platformID);
       await this.db.upsertPlatformNotification(platformID, "Account plan updated", {
         message: `Your account is now on the ${this.getAccountPlan(plan).name} plan.`,
@@ -7077,6 +7098,7 @@ class Controller {
         actionUrl: "/admin/bills",
       });
       await this.enforcePlatformSubscription(platformID);
+      const platform = await this.db.getPlatformByplatformID(platformID);
 
       return res.json({
         success: true,
@@ -7741,6 +7763,182 @@ class Controller {
       });
     }
   };
+
+  runHealthCommand(command) {
+    return new Promise((resolve) => {
+      exec(command, { timeout: 2500 }, (error, stdout) => {
+        if (error) return resolve("unknown");
+        resolve(String(stdout || "").trim() || "unknown");
+      });
+    });
+  }
+
+  async runFirstHealthCommand(commands) {
+    for (const command of commands) {
+      const status = await this.runHealthCommand(command);
+      if (status !== "unknown") return status;
+    }
+    return "unknown";
+  }
+
+  getRestartableServerServices() {
+    return {
+      nginx: {
+        label: "Nginx",
+        candidates: [process.env.NGINX_SERVICE_NAME || "nginx"],
+      },
+      radius: {
+        label: "Radius",
+        candidates: [process.env.RADIUS_SERVICE_NAME || "freeradius", "radiusd"],
+      },
+      postgres: {
+        label: "Postgres",
+        candidates: [process.env.POSTGRES_SERVICE_NAME || "postgresql", "postgres"],
+      },
+    };
+  }
+
+  runSystemctl(action, service) {
+    return new Promise((resolve) => {
+      if (!/^[a-zA-Z0-9@_.-]+$/.test(service)) {
+        resolve({ success: false, message: "Invalid service name" });
+        return;
+      }
+      execFile("systemctl", [action, service], { timeout: 15000 }, (error, stdout, stderr) => {
+        if (error) {
+          resolve({
+            success: false,
+            message: String(stderr || stdout || error.message || "Command failed").trim(),
+          });
+          return;
+        }
+        resolve({ success: true, message: String(stdout || "").trim() });
+      });
+    });
+  }
+
+  async buildPortalHealth() {
+    const [nginxStatus, radiusStatus, postgresStatus] = await Promise.all([
+      this.runFirstHealthCommand(["systemctl is-active nginx"]),
+      this.runFirstHealthCommand(["systemctl is-active freeradius", "systemctl is-active radiusd"]),
+      this.runFirstHealthCommand(["systemctl is-active postgresql", "systemctl is-active postgres"]),
+    ]);
+    const load = os.loadavg();
+    const totalMemory = os.totalmem();
+    const freeMemory = os.freemem();
+    const usedMemory = totalMemory - freeMemory;
+    return {
+      portal: "online",
+      api: "online",
+      database: this.db ? "online" : "unknown",
+      nginx: nginxStatus,
+      radius: radiusStatus,
+      postgres: postgresStatus,
+      uptimeSeconds: Math.floor(process.uptime()),
+      serverUptimeSeconds: Math.floor(os.uptime()),
+      cpuLoad: load.map((value) => Number(value.toFixed(2))),
+      memory: {
+        total: totalMemory,
+        used: usedMemory,
+        free: freeMemory,
+        usedPercent: totalMemory ? Number(((usedMemory / totalMemory) * 100).toFixed(1)) : 0,
+      },
+      node: process.version,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  sanitizeServerDate(value) {
+    if (!value) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  async fetchDedicatedServer(req, res) {
+    const { token } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const platformID = auth.admin.platformID;
+      const [platform, server, health] = await Promise.all([
+        this.db.getPlatformByplatformID(platformID),
+        this.db.getPlatformServer(platformID),
+        this.buildPortalHealth(),
+      ]);
+
+      return res.json({
+        success: true,
+        platform,
+        server,
+        health,
+      });
+    } catch (error) {
+      console.error("Dedicated server fetch error:", error);
+      return res.json({ success: false, message: "Failed to fetch server details" });
+    }
+  }
+
+  async updateDedicatedServer(req, res) {
+    const { token, data } = req.body;
+    if (!token || !data) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const payload = {
+        notes: String(data.notes || ""),
+      };
+
+      const server = await this.db.upsertPlatformServer(auth.admin.platformID, payload);
+      return res.json({ success: true, message: "Server details saved", server });
+    } catch (error) {
+      console.error("Dedicated server update error:", error);
+      return res.json({ success: false, message: "Failed to save server details" });
+    }
+  }
+
+  async restartDedicatedServerService(req, res) {
+    const { token, service } = req.body;
+    if (!token || !service) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const platform = await this.db.getPlatformByplatformID(auth.admin.platformID);
+      if (String(platform?.subscriptionPlan || "").toLowerCase() !== "professional") {
+        return res.json({ success: false, message: "Dedicated server plan not active" });
+      }
+
+      const services = this.getRestartableServerServices();
+      const selected = services[String(service).toLowerCase()];
+      if (!selected) return res.json({ success: false, message: "Unsupported service" });
+
+      let lastMessage = "";
+      for (const candidate of selected.candidates) {
+        const restarted = await this.runSystemctl("restart", candidate);
+        if (restarted.success) {
+          const status = await this.runSystemctl("is-active", candidate);
+          return res.json({
+            success: true,
+            message: `${selected.label} restarted`,
+            service: String(service).toLowerCase(),
+            status: status.success ? status.message || "active" : "unknown",
+          });
+        }
+        lastMessage = restarted.message;
+      }
+
+      return res.json({ success: false, message: lastMessage || `Failed to restart ${selected.label}` });
+    } catch (error) {
+      console.error("Dedicated server service restart error:", error);
+      return res.json({ success: false, message: "Failed to restart service" });
+    }
+  }
 
   async fetchFunds(req, res) {
     const { token } = req.body;

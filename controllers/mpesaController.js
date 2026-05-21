@@ -70,6 +70,33 @@ class MpesaController {
         return null;
     }
 
+    getMpesaB2BCharge(amount) {
+        const value = Number(amount);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        const bands = [
+            [1, 49, 2],
+            [50, 100, 3],
+            [101, 500, 8],
+            [501, 1000, 13],
+            [1001, 1500, 18],
+            [1501, 2500, 25],
+            [2501, 3500, 30],
+            [3501, 5000, 39],
+            [5001, 7500, 48],
+            [7501, 10000, 54],
+            [10001, 15000, 63],
+            [15001, 20000, 68],
+            [20001, 25000, 74],
+            [25001, 30000, 79],
+            [30001, 35000, 90],
+            [35001, 40000, 106],
+            [40001, 45000, 110],
+            [45001, 50000000, 115],
+        ];
+        const band = bands.find(([min, max]) => value >= min && value <= max);
+        return band ? band[2] : 115;
+    }
+
     buildDashboardResponse(payload, role = "superuser") {
         if (!payload) return null;
         const IsB2B = role === "superuser" ? payload.IsB2B : false;
@@ -2167,47 +2194,14 @@ class MpesaController {
             const paymentType = platformCredentials.mpesaShortCodeType;
             const shortCode = platformCredentials.mpesaShortCode;
             const accountReference = platformCredentials.mpesaAccountNumber;
-
-            let fee = 0;
-
-            if (paymentType === "Phone") {
-                if (amount <= 100) {
-                    fee = 10;
-                } else if (amount <= 1000) {
-                    fee = 20;
-                } else if (amount <= 150000) {
-                    fee = 100;
-                }
-            } else if (paymentType === "Till" || paymentType === "Paybill") {
-                if (amount <= 100) {
-                    fee = 10;
-                } else if (amount <= 1500) {
-                    fee = 30;
-                } else if (amount <= 2500) {
-                    fee = 50;
-                } else if (amount <= 3500) {
-                    fee = 60;
-                } else if (amount <= 10000) {
-                    fee = 80;
-                } else if (amount <= 20000) {
-                    fee = 100;
-                } else if (amount <= 30000) {
-                    fee = 120;
-                } else if (amount <= 35000) {
-                    fee = 130;
-                } else if (amount <= 40000) {
-                    fee = 140;
-                } else if (amount <= 150000) {
-                    fee = 150;
-                } else if (amount <= 250000) {
-                    fee = 200;
-                } else if (amount <= 500000) {
-                    fee = 500;
-                } else {
-                    fee = 500;
-                }
+            if (!["Till", "Paybill"].includes(String(paymentType))) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Configure withdrawal destination as Till or Paybill.",
+                });
             }
 
+            const fee = this.getMpesaB2BCharge(amount);
             const netAmount = Number(amount) - fee;
 
             if (netAmount <= 0) {
@@ -2217,71 +2211,16 @@ class MpesaController {
                 });
             }
 
-            const IsPhone = paymentType === "Phone";
             const IsTill = paymentType === "Till";
             const IsPaybill = paymentType === "Paybill";
             let phone = "null";
             let till = "null";
             let PayBill = "null";
 
-            if (paymentType === "Phone") {
-                phone = shortCode;
-            } else if (paymentType === "Till") {
+            if (paymentType === "Till") {
                 till = shortCode;
             } else if (paymentType === "Paybill") {
                 PayBill = shortCode;
-            }
-            if (IsPhone) {
-                const payouts = this.intasend.payouts();
-                const resp = await payouts.mpesa({
-                    currency: "KES",
-                    requires_approval: "NO",
-                    transactions: [
-                        {
-                            name: "Nova Client",
-                            account: Utils.formatPhoneNumber(phone),
-                            amount: netAmount,
-                            narrative: "Nova WiFi Withdrawal",
-                        },
-                    ],
-                });
-
-                const response = this.decodeBuffer(resp);
-                const fileID = response?.file_id || response?.fileId || null;
-                const trackingId = response?.tracking_id || response?.trackingId || null;
-                const referenceKey = fileID || trackingId;
-                if (referenceKey) {
-                    const mpesaCode = await this.db.addMpesaCode({
-                        platformID,
-                        code: String(referenceKey),
-                        reqcode: String(referenceKey),
-                        phone: phone,
-                        amount: amount.toString(),
-                        type: "withdrawal",
-                        status: "PENDING",
-                        till,
-                        paybill: PayBill,
-                        account: accountReference,
-                        service: "IntaSend Withdrawal",
-                        paymentMethod: "IntaSend",
-                    });
-                    return res.status(200).json({
-                        success: true,
-                        message: "Withdrawal initiated successfully!",
-                        mpesaCode,
-                        intasend: {
-                            file_id: fileID,
-                            tracking_id: trackingId,
-                        },
-                    });
-                }
-
-                this.logPayment(platformID, "Withdrawal failed: IntaSend error (no file_id/tracking_id).", "error");
-                return res.status(400).json({
-                    success: false,
-                    message: "Withdrawal failed! Intasend error.",
-                    error: "Unknown error",
-                });
             }
 
             // Till/Paybill withdrawals: use Daraja B2B transfer (Nova credentials)
@@ -2319,6 +2258,7 @@ class MpesaController {
                 paybill: PayBill,
                 account: accountReference,
                 service: "Mpesa B2B",
+                charges: fee.toFixed(2),
             });
 
             return res.status(200).json({
@@ -3845,9 +3785,8 @@ class MpesaController {
         const destType = String(destinationType || "").toLowerCase();
         const isPaybill = destType === "paybill";
         const isTill = destType === "till";
-        const isPochi = destType === "pochi";
-        if (!isPaybill && !isTill && !isPochi) {
-            return res.status(400).json({ success: false, message: "Destination type must be Till, Paybill, or Pochi." });
+        if (!isPaybill && !isTill) {
+            return res.status(400).json({ success: false, message: "Destination type must be Till or Paybill." });
         }
         if (!destinationShortCode) {
             return res.status(400).json({ success: false, message: "Destination shortcode is required." });
@@ -3859,86 +3798,43 @@ class MpesaController {
         try {
             const accessToken = await this.getAccessToken(config);
             const securityCredential = this.generateSecurityCredential(config.mpesaAccountInitiatorPassword);
-            let response;
-
-            if (isPochi) {
-                if (!this.mpesa.MPESA_B2POCHI_URL) {
-                    return res.status(500).json({ success: false, message: "MPESA_B2POCHI_URL not set." });
-                }
-                const payload = {
-                    OriginatorConversationID: `B2POCHI-${Date.now()}`,
-                    InitiatorName: config.mpesaAccountInitiator,
-                    SecurityCredential: securityCredential,
-                    CommandID: "BusinessPayToPochi",
-                    Amount: String(amt),
-                    PartyA: config.mpesaShortCode,
-                    PartyB: Utils.formatPhoneNumber(destinationShortCode),
-                    Remarks: remarks || "Business transfer",
-                    QueueTimeOutURL: `${process.env.BASE_URL}/mpesa/timeout`,
-                    ResultURL: `${process.env.BASE_URL}/mpesa/result`,
-                    Occassion: "Business transfer",
-                };
-                console.log("B2Pochi request", {
-                    url: this.mpesa.MPESA_B2POCHI_URL,
-                    payload: {
-                        OriginatorConversationID: payload.OriginatorConversationID,
-                        InitiatorName: payload.InitiatorName,
-                        CommandID: payload.CommandID,
-                        Amount: payload.Amount,
-                        PartyA: payload.PartyA,
-                        PartyB: payload.PartyB,
-                        Remarks: payload.Remarks,
-                        QueueTimeOutURL: payload.QueueTimeOutURL,
-                        ResultURL: payload.ResultURL,
-                        Occassion: payload.Occassion,
-                    },
-                });
-                const http = this.getDarajaAxios();
-                response = await http.post(
-                    this.mpesa.MPESA_B2POCHI_URL,
-                    payload,
-                    {
-                        headers: {
-                            Authorization: `Bearer ${accessToken}`,
-                            "Content-Type": "application/json",
-                        },
-                    }
-                );
-                console.log("B2Pochi response", response?.data);
-            } else {
-                const commandId = isPaybill ? "BusinessPayBill" : "BusinessBuyGoods";
-                const receiverIdentifierType = isPaybill ? "4" : "2";
-                const senderIdentifierType = "4";
-	                const payload = {
-	                    Initiator: config.mpesaAccountInitiator,
-	                    SecurityCredential: securityCredential,
-	                    CommandID: commandId,
-	                    SenderIdentifierType: senderIdentifierType,
-	                    ReceiverIdentifierType: receiverIdentifierType,
-	                    Amount: amt,
-	                    PartyA: config.mpesaShortCode,
-	                    PartyB: String(destinationShortCode),
-	                    AccountReference: isPaybill ? String(destinationAccount) : "",
-	                    Remarks: remarks || "Business transfer",
-                    QueueTimeOutURL: `${process.env.BASE_URL}/mpesa/timeout`,
-                    ResultURL: `${process.env.BASE_URL}/mpesa/result`,
-                };
-                const http = this.getDarajaAxios();
-                response = await http.post(
-                    this.mpesa.MPESA_B2B_URL,
-                    payload,
-                    {
-                        headers: {
-                            Authorization: `Bearer ${accessToken}`,
-                            "Content-Type": "application/json",
-                        },
-                    }
-                );
+            const charge = this.getMpesaB2BCharge(amt);
+            const transferAmount = amt - charge;
+            if (transferAmount <= 0) {
+                return res.status(400).json({ success: false, message: "Transfer amount is too small after M-PESA charges." });
             }
+            const commandId = isPaybill ? "BusinessPayBill" : "BusinessBuyGoods";
+            const receiverIdentifierType = isPaybill ? "4" : "2";
+            const senderIdentifierType = "4";
+	            const payload = {
+	                Initiator: config.mpesaAccountInitiator,
+	                SecurityCredential: securityCredential,
+	                CommandID: commandId,
+	                SenderIdentifierType: senderIdentifierType,
+	                ReceiverIdentifierType: receiverIdentifierType,
+	                Amount: transferAmount,
+	                PartyA: config.mpesaShortCode,
+	                PartyB: String(destinationShortCode),
+	                AccountReference: isPaybill ? String(destinationAccount) : "",
+	                Remarks: remarks || "Business transfer",
+                QueueTimeOutURL: `${process.env.BASE_URL}/mpesa/timeout`,
+                ResultURL: `${process.env.BASE_URL}/mpesa/result`,
+            };
+            const http = this.getDarajaAxios();
+            const response = await http.post(
+                this.mpesa.MPESA_B2B_URL,
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                        "Content-Type": "application/json",
+                    },
+                }
+            );
 
             const originatorId = response?.data?.OriginatorConversationID || response?.data?.originatorConversationID;
             if (originatorId) {
-                this.storeDarajaRequest(originatorId, platformID, isPochi ? "b2pochi-transfer" : "b2b-transfer");
+                this.storeDarajaRequest(originatorId, platformID, "b2b-transfer");
             }
 
             const conversationId =
@@ -3954,21 +3850,22 @@ class MpesaController {
                 phone: String(destinationShortCode),
                 status: "PENDING",
                 reqcode: conversationId,
-                type: isPochi ? "b2pochi transfer" : "b2b transfer",
-                service: isPochi ? "Mpesa B2Pochi" : "Mpesa B2B",
+                type: "b2b transfer",
+                service: "Mpesa B2B",
                 till: isTill ? String(destinationShortCode) : "null",
                 paybill: isPaybill ? String(destinationShortCode) : "null",
                 account: isPaybill ? String(destinationAccount) : "null",
                 paymentMethod: "Mpesa API",
+                charges: charge.toFixed(2),
             });
 
             return res.status(200).json({
                 success: true,
-                message: "Transfer request sent successfully",
+                message: `Transfer request sent successfully. KSH ${charge} M-PESA charge deducted.`,
                 data: response.data,
             });
         } catch (error) {
-            console.error("B2Pochi/B2B transfer error", {
+            console.error("B2B transfer error", {
                 status: error?.response?.status,
                 data: error?.response?.data,
                 message: error?.message,

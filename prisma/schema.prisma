@@ -181,6 +181,26 @@ model PlatformNotification {
   @@index([dismissedAt])
 }
 
+model PlatformServer {
+  id             String    @id @default(uuid())
+  platformID     String    @unique
+  rootUser       String?   @default("")
+  ipAddress      String?   @default("")
+  databaseName   String?   @default("")
+  sshPassword    String?   @default("")
+  nginxStatus    String?   @default("")
+  sshPort        String?   @default("22")
+  sshStatus      String?   @default("")
+  notes          String?   @default("")
+  expiresAt      DateTime?
+  renewsAt       DateTime?
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([platformID])
+}
+
 model PlatformSetting {
   id                            String   @unique @default(uuid())
   platformID                    String   @unique

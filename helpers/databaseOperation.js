@@ -4419,6 +4419,35 @@ class DataBase {
         }
     }
 
+    async getPlatformServer(platformID) {
+        if (!platformID) return null;
+        try {
+            return prisma.platformServer.findUnique({
+                where: { platformID },
+            });
+        } catch (error) {
+            console.error("Error getting platform server:", error);
+            throw error;
+        }
+    }
+
+    async upsertPlatformServer(platformID, data) {
+        if (!platformID || !data) return null;
+        try {
+            return prisma.platformServer.upsert({
+                where: { platformID },
+                update: data,
+                create: {
+                    platformID,
+                    ...data,
+                },
+            });
+        } catch (error) {
+            console.error("Error upserting platform server:", error);
+            throw error;
+        }
+    }
+
     async getPlatformNotifications(platformID, includeDismissed = false) {
         if (!platformID) return [];
         try {

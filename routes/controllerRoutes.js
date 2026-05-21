@@ -79,6 +79,9 @@ router.post("/filterRevenue", use("filterRevenue"));
 router.post("/fetchBackUp", use("fetchBackUp"));
 router.post("/logoutAdmin", use("logoutAdmin"));
 router.post("/bills", use("fetchPlatformBills"));
+router.post("/serverInfo", use("fetchDedicatedServer"));
+router.post("/updateServerInfo", use("updateDedicatedServer"));
+router.post("/restartServerService", use("restartDedicatedServerService"));
 router.post("/funds", use("fetchFunds"));
 router.post("/sessions", use("fetchSessions"));
 router.post("/deleteSession", use("deleteMySession"))
