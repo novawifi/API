@@ -85,14 +85,79 @@ class Controller {
     return ["basic", "starter"].includes(this.normalizePlatformPlan(plan));
   }
 
+  getAccountPlan(plan) {
+    const plans = {
+      basic: { id: "basic", name: "Basic", price: 500, trialDays: 3 },
+      starter: { id: "starter", name: "Starter", price: 999, trialDays: 3 },
+      professional: { id: "professional", name: "Professional", price: 2499, trialDays: 0 },
+    };
+    return plans[this.normalizePlatformPlan(plan)] || plans.basic;
+  }
+
   addDays(date, days) {
     const next = new Date(date || Date.now());
     next.setDate(next.getDate() + days);
     return next;
   }
 
+  getBillingDueDate(platform, service, plan) {
+    const normalizedPlan = this.normalizePlatformPlan(plan);
+    if (this.isTrialLimitedPlan(normalizedPlan)) {
+      return platform?.trialEndsAt || this.addDays(platform?.createdAt || new Date(), 3);
+    }
+    if (!service?.period) return null;
+
+    const match = service.period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+    if (!match) return null;
+
+    const value = parseInt(match[1]);
+    const unit = match[2].toLowerCase();
+    let dueDate = Utils.addPeriod(platform?.createdAt || new Date(), value, unit);
+    const now = new Date();
+    while (dueDate <= now) {
+      dueDate = Utils.addPeriod(dueDate, value, unit);
+    }
+    return dueDate;
+  }
+
+  async ensurePlatformBillingService(platformID) {
+    if (!platformID) return null;
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return null;
+
+    const service = await this.db.getSystemServiceByKey("billing");
+    if (!service) return null;
+
+    const plan = this.getAccountPlan(platform.subscriptionPlan);
+    const amount = String(plan.price);
+    const dueDate = this.getBillingDueDate(platform, service, plan.id);
+    const existing = await this.db.getPlatformBillingByName(service.name, platformID);
+    const data = {
+      name: service.name,
+      platformID,
+      amount,
+      price: amount,
+      currency: service.currency,
+      period: service.period,
+      dueDate,
+      description: service.description,
+      meta: { serviceKey: "billing", plan: plan.id },
+    };
+
+    if (!existing) {
+      return this.db.createPlatformBilling({ ...data, status: "Unpaid" });
+    }
+
+    if (String(existing.status || "").toLowerCase() === "paid") {
+      return existing;
+    }
+
+    return this.db.updatePlatformBilling(existing.id, data);
+  }
+
   async enforcePlatformSubscription(platformID) {
     if (!platformID) return null;
+    await this.ensurePlatformBillingService(platformID);
     const platform = await this.db.getPlatformByplatformID(platformID);
     if (!platform) return null;
 
@@ -6839,7 +6904,7 @@ class Controller {
       })
 
       let dueDate = null;
-      let totalAmount = 0;
+      let totalAmount = this.getAccountPlan(plan).price;
       const serviceKey = "billing";
       const service = await this.db.getSystemServiceByKey(serviceKey);
       if (!service) {
@@ -6848,6 +6913,7 @@ class Controller {
           message: "System service 'billing' is not configured.",
         });
       }
+      const planPrice = this.getAccountPlan(plan).price;
       if (service?.period) {
         const match = service.period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
         if (match) {
@@ -6861,23 +6927,24 @@ class Controller {
             dueDate = Utils.addPeriod(dueDate, value, unit);
           }
           periodsPast += 1;
-          totalAmount = periodsPast * Number(service.price);
+          totalAmount = periodsPast * planPrice;
         }
       }
       if (this.isTrialLimitedPlan(plan)) {
         dueDate = trialEndsAt;
-        totalAmount = Number(service.price);
+        totalAmount = planPrice;
       }
 
       const subdata = {
         name: service?.name,
         platformID,
         amount: totalAmount.toString(),
-        price: service?.price,
+        price: planPrice.toString(),
         currency: service?.currency,
         dueDate,
         status: "Unpaid",
         description: service?.description,
+        meta: { serviceKey: "billing", plan },
       };
 
       await this.db.createPlatformBilling(subdata);
@@ -6968,6 +7035,61 @@ class Controller {
     }
   };
 
+  async updateAccountPlan(req, res) {
+    const { token, subscriptionPlan } = req.body;
+    if (!token || !subscriptionPlan) {
+      return res.json({
+        success: false,
+        message: "Missing credentials are required!",
+      });
+    }
+
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success) {
+        return res.json({ success: false, message: auth.message });
+      }
+      if (auth.admin.role !== "superuser") {
+        return res.json({ success: false, message: "Unauthorised!" });
+      }
+
+      const platformID = auth.admin.platformID;
+      const existing = await this.db.getPlatformByplatformID(platformID);
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          message: "Platform not found!",
+        });
+      }
+
+      const plan = this.normalizePlatformPlan(subscriptionPlan);
+      const data = { subscriptionPlan: plan };
+      if (this.isTrialLimitedPlan(plan) && !existing.trialEndsAt) {
+        data.trialEndsAt = this.addDays(existing.createdAt, 3);
+      }
+
+      const platform = await this.db.updatePlatform(platformID, data);
+      const bill = await this.ensurePlatformBillingService(platformID);
+      await this.db.upsertPlatformNotification(platformID, "Account plan updated", {
+        message: `Your account is now on the ${this.getAccountPlan(plan).name} plan.`,
+        status: "success",
+        actionLabel: "View Bill",
+        actionUrl: "/admin/bills",
+      });
+      await this.enforcePlatformSubscription(platformID);
+
+      return res.json({
+        success: true,
+        message: "Account plan updated successfully",
+        platform,
+        bill,
+      });
+    } catch (error) {
+      console.log("An error occured", error);
+      return res.json({ success: false, message: "An error occured" });
+    }
+  };
+
   async registerPlatform(req, res) {
     const { name, email, password, phone, url, platformID, adminID, subscriptionPlan } = req.body;
     if (!name || !url || !email || !password || !platformID || !adminID) {
@@ -7041,7 +7163,7 @@ class Controller {
       const createdAt = new Date();
       const trialEndsAt = this.isTrialLimitedPlan(plan) ? this.addDays(createdAt, 3) : null;
       let dueDate = null;
-      let totalAmount = 0;
+      let totalAmount = this.getAccountPlan(plan).price;
       const serviceKey = "billing";
       const service = await this.db.getSystemServiceByKey(serviceKey);
       if (!service) {
@@ -7050,6 +7172,7 @@ class Controller {
           message: "System service 'billing' is not configured.",
         });
       }
+      const planPrice = this.getAccountPlan(plan).price;
       if (service?.period) {
         const match = service.period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
         if (match) {
@@ -7063,23 +7186,24 @@ class Controller {
             dueDate = Utils.addPeriod(dueDate, value, unit);
           }
           periodsPast += 1;
-          totalAmount = periodsPast * Number(service.price);
+          totalAmount = periodsPast * planPrice;
         }
       }
       if (this.isTrialLimitedPlan(plan)) {
         dueDate = trialEndsAt;
-        totalAmount = Number(service.price);
+        totalAmount = planPrice;
       }
 
       const billingdata = {
         name: service?.name,
         platformID,
         amount: totalAmount.toString(),
-        price: service?.price,
+        price: planPrice.toString(),
         currency: service?.currency,
         dueDate,
         status: "Unpaid",
         description: service?.description,
+        meta: { serviceKey: "billing", plan },
       };
 
       await this.db.createPlatformBilling(billingdata);
@@ -7594,11 +7718,6 @@ class Controller {
         });
       }
 
-      const cacheKey = `main:bills:${platformID}`;
-      const cached = this.cache.get(cacheKey);
-      if (cached) {
-        return res.json(cached);
-      }
       const platform = await this.db.getPlatform(platformID);
       if (!platform) {
         return res.json({
@@ -7606,13 +7725,13 @@ class Controller {
           message: "Platform not found!",
         });
       }
+      await this.enforcePlatformSubscription(platformID);
       const bills = await this.db.getPlatformBilling(platformID);
       const response = {
         success: true,
         message: `Bills fetched successfully!`,
         bills,
       };
-      this.cache.set(cacheKey, response, 60000);
       return res.json(response);
     } catch (error) {
       console.error("Billing error:", error);
