@@ -15,6 +15,8 @@ const use = (name) => {
 
 // POST
 router.post("/packages", use("Packages"));
+router.post("/hotspotLoginTemplate", use("hotspotLoginTemplate"));
+router.post("/hotspot/login-template", use("hotspotLoginTemplate"));
 router.post("/authAdmin", use("authAdmin"));
 router.post("/authManager", use("authManager"));
 router.post("/code", use("getCode"));
@@ -162,6 +164,8 @@ router.get("/stations", use("fetchStations"))
 router.get("/backups/remote-hosts/:host/:filename", use("DownloadMikrotikBackUpFile"))
 router.get("/files/:filename", use("DownloadConfigFile"))
 router.get("/backups/login", use("DownloadLoginFile"))
+router.get("/hotspot/login-template", use("hotspotLoginTemplate"));
+router.get("/hotspot/login-template/:platformID", use("hotspotLoginTemplate"));
 router.get("/public/blogs", use("fetchPublicBlogs"));
 router.get("/public/blog/:slug", use("fetchPublicBlogBySlug"));
 

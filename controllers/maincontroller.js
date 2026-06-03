@@ -15,6 +15,7 @@ const bcrypt = require("bcrypt");
 const appRoot = require("app-root-path").path;
 const { DataBase } = require("../helpers/databaseOperation");
 const { Utils } = require("../utils/Functions");
+const { getHotspotHash, renderOfflineBoxLoginTemplate } = require("../utils/hotspotTemplate");
 const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
 const { Auth } = require("./authController");
@@ -2943,16 +2944,17 @@ class Controller {
         }
         const rateLimit = `${speed}M/${speed}M`;
 
-        const profileUpdate = await this.mikrotik.updateMikrotikProfile(
-          platformID,
-          packagename,
-          name,
-          rateLimit,
-          pool,
-          host,
-          devices,
-          period,
-        )
+	        const profileUpdate = await this.mikrotik.updateMikrotikProfile(
+	          platformID,
+	          packagename,
+	          name,
+	          rateLimit,
+	          pool,
+	          host,
+	          devices,
+	          period,
+	          category,
+	        )
         if (!profileUpdate.success) {
           return res.json({
             success: false,
@@ -3810,13 +3812,15 @@ class Controller {
         }
       }
 
-      const peerBlock = `
-    [Peer]
-    PublicKey = ${mikrotikPublicKey}
-    Endpoint = ${endpointHost}:13231
-    AllowedIPs = ${mikrotikHost}/32
-    PersistentKeepalive = 10
-    `.trim();
+	      const targetInternalHost = String(mikrotikHost || "").trim().split("/")[0];
+	      const targetPublicKey = String(mikrotikPublicKey || "").trim();
+	      const peerBlock = [
+	        "[Peer]",
+	        `PublicKey = ${targetPublicKey}`,
+	        `Endpoint = ${endpointHost}:13231`,
+	        `AllowedIPs = ${targetInternalHost}/32`,
+	        "PersistentKeepalive = 10",
+	      ].join("\n");
 
       const wgConfPath = "/etc/wireguard/wg0.conf";
 
@@ -3825,24 +3829,33 @@ class Controller {
 	          return res.json({ success: false, message: "WireGuard config read failed." });
 	        }
 
-	        fs.copyFileSync(wgConfPath, `${wgConfPath}.bak-${Date.now()}`);
+	        try {
+	          fs.writeFileSync(`/tmp/wg0.conf.bak-${Date.now()}`, fileData, "utf8");
+	        } catch (backupErr) {
+	          console.warn("WireGuard backup skipped:", backupErr?.message || backupErr);
+	        }
 
-	        const blocks = fileData.split(/\n(?=\[Peer\])/);
-	        const targetInternalHost = String(mikrotikHost || "").trim().split("/")[0];
-	        const targetPublicKey = String(mikrotikPublicKey || "").trim();
+		        const blocks = fileData.toString().replace(/\r\n/g, "\n").split(/\n(?=\s*\[Peer\])/);
 
-	        const extractInternalHost = (block) => {
-	          const match = String(block || "").match(/AllowedIPs\s*=\s*([0-9.]+)\/32/i);
-	          return match?.[1] ? String(match[1]).trim() : "";
-	        };
-	        const extractPublicKey = (block) => {
-	          const match = String(block || "").match(/PublicKey\s*=\s*(.+)/i);
-	          return match?.[1] ? String(match[1]).trim() : "";
-	        };
-	        const isPeerBlock = (block) => String(block || "").trimStart().startsWith("[Peer]");
+		        const extractInternalHost = (block) => {
+		          const match = String(block || "").match(/AllowedIPs\s*=\s*(10\.10\.10\.\d{1,3})\/32\b/i);
+		          return match?.[1] ? String(match[1]).trim() : "";
+		        };
+		        const extractPublicKey = (block) => {
+		          const match = String(block || "").match(/PublicKey\s*=\s*(.+)/i);
+		          return match?.[1] ? String(match[1]).trim() : "";
+		        };
+		        const isPeerBlock = (block) => String(block || "").trimStart().startsWith("[Peer]");
+		        const normalizeBlock = (block) =>
+		          String(block || "")
+		            .replace(/\r\n/g, "\n")
+		            .split("\n")
+		            .map((line) => line.trim())
+		            .filter(Boolean)
+		            .join("\n");
 
-	        const seenIPs = new Set();
-	        const seenKeys = new Set();
+		        const seenIPs = new Set();
+		        const seenKeys = new Set();
 	        const cleaned = [];
 	        let updatedPeerInserted = false;
 
@@ -3853,41 +3866,39 @@ class Controller {
 	            continue;
 	          }
 
-	          const internalHost = extractInternalHost(block);
-	          const publicKey = extractPublicKey(block);
-	          const isTargetPeer = internalHost && targetInternalHost && internalHost === targetInternalHost;
+		          const internalHost = extractInternalHost(block);
+		          const publicKey = extractPublicKey(block);
+		          const isTargetPeer = internalHost && targetInternalHost && internalHost === targetInternalHost;
 
-	          // Update/replace the existing peer block matched by internal MikroTik host.
-	          if (isTargetPeer) {
-	            if (!updatedPeerInserted) {
-	              cleaned.push(peerBlock.trim());
-	              if (targetInternalHost) seenIPs.add(targetInternalHost);
-	              if (targetPublicKey) seenKeys.add(targetPublicKey);
-	              updatedPeerInserted = true;
-	            }
-	            continue; // Drop any duplicates for this host
-	          }
+		          if (isTargetPeer) {
+		            if (!updatedPeerInserted) {
+		              cleaned.push(peerBlock);
+		              if (targetInternalHost) seenIPs.add(targetInternalHost);
+		              if (targetPublicKey) seenKeys.add(targetPublicKey);
+		              updatedPeerInserted = true;
+		            }
+		            continue;
+		          }
 
-	          // Avoid duplicates at all cost: dedupe by AllowedIPs internal host and PublicKey.
-	          if (internalHost && seenIPs.has(internalHost)) continue;
-	          if (publicKey && seenKeys.has(publicKey)) continue;
+		          if (internalHost && seenIPs.has(internalHost)) continue;
+		          if (publicKey && seenKeys.has(publicKey)) continue;
 
-	          // Also prevent keeping a different peer that already uses the (new) public key.
-	          if (targetPublicKey && publicKey && publicKey === targetPublicKey) continue;
+		          if (targetPublicKey && publicKey && publicKey === targetPublicKey) continue;
 
-	          if (internalHost) seenIPs.add(internalHost);
-	          if (publicKey) seenKeys.add(publicKey);
-	          cleaned.push(block.trim());
-	        }
+		          if (internalHost) seenIPs.add(internalHost);
+		          if (publicKey) seenKeys.add(publicKey);
+		          cleaned.push(normalizeBlock(block));
+		        }
 
-	        // If no peer existed for this internal host, add it once.
-	        if (!updatedPeerInserted) {
-	          cleaned.push(peerBlock.trim());
-	        }
+		        if (!updatedPeerInserted) {
+		          cleaned.push(peerBlock);
+		        }
 
-	        const newConfig = cleaned
-	          .map(b => b.trim())
-	          .join("\n\n") + "\n";
+		        const newConfig = cleaned
+		          .map(b => normalizeBlock(b))
+		          .filter(Boolean)
+		          .join("\n\n")
+		          .trim() + "\n";
 
         const wgTmpPath = `/tmp/wg.${Date.now()}.conf`;
         fs.writeFile(wgTmpPath, newConfig, async (writeErr) => {
@@ -3895,11 +3906,9 @@ class Controller {
             return res.json({ success: false, message: "WireGuard config write failed." });
           }
 
-          exec(`sudo -n /bin/mv ${wgTmpPath} ${wgConfPath}`, () => {
-            exec(`sudo -n /bin/sed -i '/^[[:space:]]*$/d' ${wgConfPath}`, () => {
-              exec(`sudo -n /usr/bin/awk 'NF{print} END{print \"\"}' ${wgConfPath} > /tmp/wg.tmp && sudo -n /bin/mv /tmp/wg.tmp ${wgConfPath}`, () => {
-                exec("sudo -n /usr/bin/wg-quick down wg0", () => {
-                  exec("sudo -n /usr/bin/wg-quick up wg0", async (upErr) => {
+	          exec(`sudo -n /bin/mv ${wgTmpPath} ${wgConfPath}`, () => {
+	            exec("sudo -n /usr/bin/wg-quick down wg0", () => {
+	                  exec("sudo -n /usr/bin/wg-quick up wg0", async (upErr) => {
                     if (upErr) {
                       return res.json({ success: false, message: "WireGuard restart failed." });
                     }
@@ -3930,10 +3939,8 @@ class Controller {
                       message: `${responseMessage} and WireGuard updated.`,
                       station: stationResult,
                       seedScripts,
-                    });
-                  });
-                });
-              });
+	            });
+	          });
             });
           });
         });
@@ -6411,6 +6418,90 @@ class Controller {
       };
     }
   };
+
+  resolveHotspotTemplateHost({ hash, station, config } = {}) {
+    const stationHost = String(station || "").trim();
+    if (Utils.isValidIP(stationHost) && stationHost.startsWith("10.10.10.")) {
+      return stationHost;
+    }
+
+    if (hash) {
+      try {
+        const decoded = Utils.decodeHashedIP(hash);
+        if (Utils.isValidIP(decoded) && decoded.startsWith("10.10.10.")) {
+          return decoded;
+        }
+      } catch (error) { }
+    }
+
+    const configHost = String(config?.mikrotikHost || "").trim();
+    if (Utils.isValidIP(configHost) && configHost.startsWith("10.10.10.")) {
+      return configHost;
+    }
+
+    return "";
+  }
+
+  async buildOfflineBoxLoginHtml(platformID, options = {}) {
+    const platform = await this.db.getPlatform(platformID);
+    const config = await this.db.getPlatformConfig(platformID);
+    if (!platform || !config) {
+      throw new Error("Platform data not found");
+    }
+
+    const host = this.resolveHotspotTemplateHost({
+      hash: options.hash,
+      station: options.station || options.host,
+      config,
+    });
+    let packages = [];
+    if (host) {
+      packages = await this.db.getPackagesByHost(platformID, host);
+    }
+    if (!packages || packages.length === 0) {
+      packages = await this.db.getPackages(platformID);
+    }
+
+    return renderOfflineBoxLoginTemplate({
+      req: options.req,
+      platform,
+      config,
+      packages,
+      platformID,
+      host,
+      hash: options.hash || getHotspotHash(host),
+    });
+  }
+
+  async hotspotLoginTemplate(req, res) {
+    const token = req.body?.token || req.query?.token;
+    let platformID = req.body?.platformID || req.params?.platformID || req.query?.platformID;
+    const station = req.body?.station || req.query?.station || req.body?.host || req.query?.host;
+    const hash = req.body?.hash || req.query?.hash;
+
+    if (token) {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success) {
+        return res.status(401).json({ success: false, message: auth.message });
+      }
+      platformID = platformID || auth.admin?.platformID;
+    }
+
+    if (!platformID) {
+      return res.status(400).json({ success: false, message: "Platform ID is required." });
+    }
+
+    try {
+      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req });
+      return res
+        .status(200)
+        .set("Content-Type", "text/html; charset=utf-8")
+        .send(html);
+    } catch (error) {
+      console.error("Error rendering hotspot login template:", error);
+      return res.status(500).json({ success: false, message: "Failed to render hotspot login template." });
+    }
+  }
 
   async Packages(req, res) {
     const { platformID, hash } = req.body;
@@ -9366,74 +9457,15 @@ class Controller {
       });
     }
 
-    const url = platform.url;
-    const mikrotikHost = config.mikrotikHost;
-    const hash = Utils.hashInternalIP(mikrotikHost);
-
-    const htmlContent = `
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
-   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html>
-<head>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-<meta http-equiv="pragma" content="no-cache" />
-<meta http-equiv="expires" content="-1" />
-<meta name="viewport" content="width=device-width; initial-scale=1.0; maximum-scale=1.0;"/>
-<title>Logging in...</title>
-</head>
-
-<body onload="autoLogin()">
-<script type="text/javascript" src="/md5.js"></script>
-<script type="text/javascript">
-    function autoLogin() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const username = urlParams.get('username');
-        const password = urlParams.get('password');
-
-        if (username && password) {
-            const form = document.createElement('form');
-            form.action = "$(link-login-only)";
-            form.method = 'post';
-
-            const inputUsername = document.createElement('input');
-            inputUsername.type = 'hidden';
-            inputUsername.name = 'username';
-            inputUsername.value = username;
-            form.appendChild(inputUsername);
-
-            const inputPassword = document.createElement('input');
-            inputPassword.type = 'hidden';
-            inputPassword.name = 'password';
-            inputPassword.value = hexMD5('$(chap-id)' + password + '$(chap-challenge)');
-            form.appendChild(inputPassword);
-
-            const inputDst = document.createElement('input');
-            inputDst.type = 'hidden';
-            inputDst.name = 'dst';
-            inputDst.value = "$(link-orig)";
-            form.appendChild(inputDst);
-
-            const inputPopup = document.createElement('input');
-            inputPopup.type = 'hidden';
-            inputPopup.name = 'popup';
-            inputPopup.value = 'true';
-            form.appendChild(inputPopup);
-
-            document.body.appendChild(form);
-            form.submit();
-        } else {
-            window.location.href = "${url}/login?hash=${hash}";
-        }
-    }
-</script>
-
-</body>
-</html>
-    `;
+    const htmlContent = await this.buildOfflineBoxLoginHtml(platformID, {
+      host: config.mikrotikHost,
+      req,
+    });
 
     const basePath = path.join(appRoot, "backups", `login-${platformID}.html`);
     const safePath = path.normalize(basePath);
 
+    fs.mkdirSync(path.dirname(safePath), { recursive: true });
     fs.writeFileSync(safePath, htmlContent, "utf8");
 
     return res.download(safePath, "login.html", (err) => {

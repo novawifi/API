@@ -14,6 +14,7 @@ const { DataBase } = require("../helpers/databaseOperation");
 const { Mikrotik } = require("../helpers/mikrotikOperation");
 const { MikrotikConnection } = require("../configs/mikrotikConfig");
 const { Utils } = require("../utils/Functions");
+const { getHotspotHash, renderOfflineBoxLoginTemplate, resolveApiBaseUrl } = require("../utils/hotspotTemplate");
 const net = require("net");
 const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
@@ -67,6 +68,90 @@ class Mikrotikcontroller {
                 new Promise((_, reject) => setTimeout(() => reject(new Error("Channel close timeout")), 3000)),
             ]);
         } catch (error) { }
+    }
+
+    getHotspotWalledGardenHosts() {
+        const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
+        const hosts = [domain, `*.${domain}`, "api64.ipify.org"];
+        try {
+            const apiHost = new URL(resolveApiBaseUrl()).hostname;
+            if (apiHost) {
+                hosts.push(apiHost);
+                hosts.push(`*.${apiHost}`);
+            }
+        } catch (error) { }
+        return [...new Set(hosts.filter(Boolean))];
+    }
+
+    async ensureHotspotWalledGarden(channel) {
+        const existing = await channel.write("/ip/hotspot/walled-garden/print", []);
+        const existingHosts = new Set(
+            (Array.isArray(existing) ? existing : [])
+                .map((entry) => String(entry["dst-host"] || "").trim())
+                .filter(Boolean)
+        );
+        for (const host of this.getHotspotWalledGardenHosts()) {
+            if (existingHosts.has(host)) continue;
+            await channel.write("/ip/hotspot/walled-garden/add", [
+                `=dst-host=${host}`,
+                "=action=allow",
+            ]);
+            existingHosts.add(host);
+        }
+    }
+
+    async buildOfflineLoginTemplateHtml(platformID, stationHost) {
+        const platform = await this.db.getPlatform(platformID);
+        const config = await this.db.getPlatformConfig(platformID);
+        const host = String(stationHost || config?.mikrotikHost || "").trim();
+        let packages = [];
+        if (host) {
+            packages = await this.db.getPackagesByHost(platformID, host);
+        }
+        if (!packages || packages.length === 0) {
+            packages = await this.db.getPackages(platformID);
+        }
+        return renderOfflineBoxLoginTemplate({
+            platform,
+            config,
+            packages,
+            platformID,
+            host,
+            hash: getHotspotHash(host),
+        });
+    }
+
+    async uploadHotspotLoginTemplate(platformID, stationHost) {
+        const loginHtml = await this.buildOfflineLoginTemplateHtml(platformID, stationHost);
+        const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, stationHost);
+        if (!apiConnection?.api) {
+            return { success: false, message: "Failed to open low-level API connection" };
+        }
+
+        let rawChannel = null;
+        try {
+            await apiConnection.api.connect();
+            const rawApi = apiConnection.api.api().rosApi;
+            rawChannel = await rawApi.openChannel();
+            const existingFiles = await rawChannel.write(["/file/print", "?name=hotspot/login.html"]);
+            if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+                await rawChannel.write([
+                    "/file/set",
+                    `=.id=${existingFiles[0][".id"]}`,
+                    `=contents=${loginHtml}`,
+                ]);
+            } else {
+                await rawChannel.write([
+                    "/file/add",
+                    "=name=hotspot/login.html",
+                    `=contents=${loginHtml}`,
+                ]);
+            }
+            return { success: true };
+        } finally {
+            try { await rawChannel?.close(); } catch (err) { }
+            try { await apiConnection.api.close(); } catch (err) { }
+        }
     }
 
     async writeWithTimeout(channel, command, args = [], timeoutMs = 12000) {
@@ -712,7 +797,7 @@ class Mikrotikcontroller {
         return Math.round(value * unitMap[unit]);
     }
 
-    async updateMikrotikProfile(platformID, currentProfileName, newProfileName, rateLimit, pool, host, sharedUsers, uptimeLimit) {
+    async updateMikrotikProfile(platformID, currentProfileName, newProfileName, rateLimit, pool, host, sharedUsers, uptimeLimit, category) {
         try {
             const connection = await this.config.createSingleMikrotikClient(platformID, host);
             if (!connection?.channel) return { success: false, message: `No valid MikroTik connection` };
@@ -720,7 +805,45 @@ class Mikrotikcontroller {
             try {
                 const profiles = await this.mikrotik.listHotspotProfiles(channel);
                 const existingProfile = profiles.find(p => p.name === currentProfileName);
-                if (!existingProfile) return { success: false, message: "Profile not found" };
+                if (!existingProfile) {
+                    const profileName = newProfileName || currentProfileName;
+                    if (profiles.find(p => p.name === profileName)) return { success: true, message: "Profile already exists" };
+
+                    let sharedUsersValue = sharedUsers;
+                    if (sharedUsers !== undefined && sharedUsers !== null) {
+                        if (String(sharedUsers).toLowerCase() === 'unlimited') sharedUsersValue = 'unlimited';
+                        else {
+                            const numUsers = Number(sharedUsers);
+                            if (isNaN(numUsers) || numUsers < 1) return { success: false, message: "Invalid shared users value. Use a positive number or 'Unlimited'" };
+                            sharedUsersValue = numUsers.toString();
+                        }
+                    }
+
+                    let time = '';
+                    if (uptimeLimit && uptimeLimit.trim() !== "Unlimited" && uptimeLimit.trim() !== "NoExpiry") {
+                        time = this.formatUptime(uptimeLimit);
+                        if (!this.isValidMikrotikTime(time)) return { success: false, message: `Invalid session-timeout format: ${time}. Use format like "1h30m" or "1d"` };
+                    }
+
+                    const isDataPackage = String(category || '').toLowerCase() === 'data';
+                    const addMacCookie = isDataPackage ? "no" : "yes";
+                    const macCookieTimeout = !isDataPackage && time ? time : undefined;
+                    await this.mikrotik.addHotspotProfile(channel, {
+                        name: profileName,
+                        rateLimit,
+                        sharedUsers: sharedUsersValue || 0,
+                        pool,
+                        time,
+                        addMacCookie,
+                        macCookieTimeout,
+                    });
+                    await this.ensureHotspotMacCookie(channel, time);
+                    this.logPlatform(platformID, `Profile created: ${profileName} on ${host}`, {
+                        context: "mikrotik",
+                        level: "success",
+                    });
+                    return { success: true, message: "Profile created successfully" };
+                }
                 const currentProfile = existingProfile;
                 const profileData = {};
                 if (newProfileName && newProfileName !== currentProfileName) {
@@ -2662,6 +2785,7 @@ class Mikrotikcontroller {
                 ]);
                 fixes.push("walled_garden_ipify_added");
             }
+            await this.ensureHotspotWalledGarden(channel);
 
             const dns = await channel.write("/ip/dns/print", []);
             const dnsRow = dns?.[0];
@@ -3234,9 +3358,10 @@ class Mikrotikcontroller {
                     `=address=${hotspotNetwork}`,
                     `=gateway=41.42.0.1`,
                     `=dns-server=8.8.8.8,1.1.1.1`,
-                ]);
-                await this.mikrotik.addFirewallNatRule(channel, { chain: "srcnat", action: "masquerade", srcAddress: "41.42.0.0/16", comment: "Masquerade Hotspot network", outInterface: "" });
-                const profiles = await this.mikrotik.getHotspotProfiles(channel);
+	                ]);
+	                await this.mikrotik.addFirewallNatRule(channel, { chain: "srcnat", action: "masquerade", srcAddress: "41.42.0.0/16", comment: "Masquerade Hotspot network", outInterface: "" });
+	                await this.ensureHotspotWalledGarden(channel);
+	                const profiles = await this.mikrotik.getHotspotProfiles(channel);
                 let profileName = "hotspotprofile1";
                 const existingProfile = profiles.find(p => p.name === profileName);
                 if (!existingProfile) {
@@ -3334,109 +3459,8 @@ class Mikrotikcontroller {
 
                 let uploadError = null;
                 try {
-                    const platform = await this.db.getPlatform(platformID);
-                    const domain = process.env.DOMAIN || "novawifi.co.ke";
-                    const platformUrl = platform?.url ? `https://${platform.url}` : `https://${domain}`;
-                    let hotspotHash = "";
-                    try {
-                        const host = stationRecord?.mikrotikHost || "";
-                        if (Utils.isValidIP(host) && host.startsWith("10.10.10.")) {
-                            hotspotHash = Utils.hashInternalIP(host);
-                        }
-                    } catch (err) {
-                        hotspotHash = "";
-                    }
-                    const hashParam = hotspotHash ? encodeURIComponent(hotspotHash) : "";
-                    const loginRedirect = hotspotHash
-                        ? `${platformUrl}/login?hash=${hashParam}&mac=$(mac)`
-                        : `${platformUrl}/login?mac=$(mac)`;
-                    const loginHtml = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
-   "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html>
-<head>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-<meta http-equiv="pragma" content="no-cache" />
-<meta http-equiv="expires" content="-1" />
-<meta name="viewport" content="width=device-width; initial-scale=1.0; maximum-scale=1.0;"/>
-<title>Logging in...</title>
-</head>
-
-<body onload="autoLogin()">
-<script type="text/javascript" src="/md5.js"></script>
-<script type="text/javascript">
-    function autoLogin() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const username = urlParams.get('username');
-        const password = urlParams.get('password');
-
-        if (username && password) {
-            const form = document.createElement('form');
-            form.action = "$(link-login-only)";
-            form.method = 'post';
-
-            const inputUsername = document.createElement('input');
-            inputUsername.type = 'hidden';
-            inputUsername.name = 'username';
-            inputUsername.value = username;
-            form.appendChild(inputUsername);
-
-            const inputPassword = document.createElement('input');
-            inputPassword.type = 'hidden';
-            inputPassword.name = 'password';
-            inputPassword.value = hexMD5('$(chap-id)' + password + '$(chap-challenge)');
-            form.appendChild(inputPassword);
-
-            const inputDst = document.createElement('input');
-            inputDst.type = 'hidden';
-            inputDst.name = 'dst';
-            inputDst.value = "$(link-orig)";
-            form.appendChild(inputDst);
-
-            const inputPopup = document.createElement('input');
-            inputPopup.type = 'hidden';
-            inputPopup.name = 'popup';
-            inputPopup.value = 'true';
-            form.appendChild(inputPopup);
-
-            document.body.appendChild(form);
-            form.submit();
-        } else {
-            window.location.href = "${loginRedirect}";
-        }
-    }
-</script>
-
-</body>
-</html>
-                    `;
-                    const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, station);
-                    if (!apiConnection?.api) {
-                        uploadError = "Failed to open low-level API connection";
-                    } else {
-                        let rawChannel = null;
-                        try {
-                            await apiConnection.api.connect();
-                            const rawApi = apiConnection.api.api().rosApi;
-                            rawChannel = await rawApi.openChannel();
-                            const existingFiles = await rawChannel.write(["/file/print", `?name=hotspot/login.html`]);
-                            if (Array.isArray(existingFiles) && existingFiles.length > 0) {
-                                await rawChannel.write([
-                                    "/file/set",
-                                    `=.id=${existingFiles[0][".id"]}`,
-                                    `=contents=${loginHtml}`,
-                                ]);
-                            } else {
-                                await rawChannel.write([
-                                    "/file/add",
-                                    "=name=hotspot/login.html",
-                                    `=contents=${loginHtml}`,
-                                ]);
-                            }
-                        } finally {
-                            try { await rawChannel?.close(); } catch (err) { }
-                            try { await apiConnection.api.close(); } catch (err) { }
-                        }
-                    }
+                    const upload = await this.uploadHotspotLoginTemplate(platformID, stationRecord?.mikrotikHost || station);
+                    if (!upload.success) uploadError = upload.message || "Failed to upload login.html";
                 } catch (error) {
                     uploadError = error?.message || "Failed to upload login.html";
                 }
@@ -3734,10 +3758,11 @@ class Mikrotikcontroller {
             const scriptUrl = `${baseUrl}/mkt/auto-router/script/${token}`;
             const endpointAddress = (process.env.SERVER_IP || "77.37.97.244").toString().split(":")[0];
             const endpointPort = (process.env.SERVER_WIREGUARD_PORT || "51820").toString();
-            const serverWgPublicKey = process.env.WIREGUARD_PUBLIC_KEY || "xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=";
-            const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
-            const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
-            if (session.systemBasis === "RADIUS") {
+	            const serverWgPublicKey = process.env.WIREGUARD_PUBLIC_KEY || "xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=";
+	            const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+	            const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
+	            const walledGardenHosts = this.getHotspotWalledGardenHosts();
+	            if (session.systemBasis === "RADIUS") {
                 const stations = await this.db.getStations(platformID);
                 const existingNames = new Set(stations.map(s => s.radiusClientName).filter(Boolean));
                 const generateName = () => {
@@ -3877,9 +3902,9 @@ class Mikrotikcontroller {
                 `/ip firewall filter add action=accept chain=input dst-port=13231 protocol=udp`,
                 `/ip firewall filter add action=accept chain=input src-address=10.10.10.0/24`,
                 `/ip dns set servers=8.8.8.8,1.1.1.1 allow-remote-requests=yes`,
-                `:do { :if ([:len [/ip/hotspot/walled-garden/find dst-host="${domain}"]] = 0) do={ /ip/hotspot/walled-garden/add dst-host="${domain}" action=allow } } on-error={ $safeFetch ($logBase . "hotspot-walled-garden-skip") }`,
-                `:do { :if ([:len [/ip/hotspot/walled-garden/find dst-host="*.${domain}"]] = 0) do={ /ip/hotspot/walled-garden/add dst-host="*.${domain}" action=allow } } on-error={ $safeFetch ($logBase . "hotspot-walled-garden-skip") }`,
-                `:do { :if ([:len [/ip/hotspot/walled-garden/find dst-host="api64.ipify.org"]] = 0) do={ /ip/hotspot/walled-garden/add dst-host="api64.ipify.org" action=allow } } on-error={ $safeFetch ($logBase . "hotspot-walled-garden-skip") }`,
+	                ...walledGardenHosts.map((host) =>
+	                    `:do { :if ([:len [/ip/hotspot/walled-garden/find dst-host="${host}"]] = 0) do={ /ip/hotspot/walled-garden/add dst-host="${host}" action=allow } } on-error={ $safeFetch ($logBase . "hotspot-walled-garden-skip") }`
+	                ),
                 `/ip firewall mangle add chain=postrouting out-interface=$bridgeName action=change-ttl new-ttl=set:1`,
                 `$safeFetch ($logBase . "firewall-rules-set")`,
                 `:local userId [/user/find name=$apiUser]`,
@@ -4202,7 +4227,12 @@ class Mikrotikcontroller {
             const fileData = await runSudo(["/bin/cat", wgConfPath]);
 
             const backupPath = `${wgConfPath}.bak-${Date.now()}`;
-            await runSudo(["/bin/cp", "-a", wgConfPath, backupPath]);
+            try {
+                await runSudo(["/bin/cp", "-a", wgConfPath, backupPath]);
+            } catch (backupErr) {
+                console.warn("[WireGuard] backup skipped", backupErr?.toString?.() || backupErr);
+                await fsp.writeFile(`/tmp/${wgName}.conf.bak-${Date.now()}`, fileData, "utf8").catch(() => { });
+            }
 
             const { interfaceBlock, peerBlocks } = parseConfig(fileData);
 
@@ -4397,17 +4427,26 @@ class Mikrotikcontroller {
                 mikrotikHost: stationResult?.mikrotikHost || payload.mikrotikHost,
                 systemBasis,
             });
-            if (!seedResult.success) {
-                warnings.push(seedResult.message || "Failed to seed station scripts");
-            }
+	            if (!seedResult.success) {
+	                warnings.push(seedResult.message || "Failed to seed station scripts");
+	            }
 
-            const warningMessage = warnings.length > 0 ? ` Warnings: ${warnings.join(" | ")}` : "";
-            return {
-                success: true,
-                message: `Station saved.${warningMessage}`,
-                station: stationResult,
-                seedScripts: seedResult,
-            };
+	            const loginTemplateResult = await this.uploadHotspotLoginTemplate(
+	                platformID,
+	                stationResult?.mikrotikHost || payload.mikrotikHost
+	            ).catch((error) => ({ success: false, message: error?.message || "Failed to upload login.html" }));
+	            if (!loginTemplateResult.success) {
+	                warnings.push(loginTemplateResult.message || "Failed to upload login.html");
+	            }
+
+	            const warningMessage = warnings.length > 0 ? ` Warnings: ${warnings.join(" | ")}` : "";
+	            return {
+	                success: true,
+	                message: `Station saved.${warningMessage}`,
+	                station: stationResult,
+	                seedScripts: seedResult,
+	                loginTemplate: loginTemplateResult,
+	            };
         } catch (error) {
             return { success: false, message: "Failed to save station" };
         }
