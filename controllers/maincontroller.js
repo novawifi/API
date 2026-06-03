@@ -5462,13 +5462,19 @@ class Controller {
         });
       }
       const templates = await this.db.getTemplates();
+      const offlineTemplateName = "OfflineBox";
       const defaulttemplate = config.template;
+      const templateMode = String(defaulttemplate || "").toLowerCase() === offlineTemplateName.toLowerCase()
+        ? "offline"
+        : "online";
 
       const response = {
         success: true,
         message: "Templates fetched succesfully!",
         templates: templates,
-        default: defaulttemplate
+        default: templateMode === "offline" ? "" : defaulttemplate,
+        templateMode,
+        offlineTemplate: offlineTemplateName,
       };
       this.cache.set(cacheKey, response, 60000);
       return res.json(response);
@@ -5485,7 +5491,7 @@ class Controller {
 
   async updateTemplate(req, res) {
 
-    const { token, name } = req.body;
+    const { token, name, mode } = req.body;
     if (!token) {
       return res.json({
         success: false,
@@ -5507,7 +5513,11 @@ class Controller {
         });
       }
       const platformID = auth.admin.platformID;
-      if (!platformID || !name) {
+      const templateMode = String(mode || "online").trim().toLowerCase();
+      const offlineTemplateName = "OfflineBox";
+      const nextTemplate = templateMode === "offline" ? offlineTemplateName : name;
+
+      if (!platformID || !nextTemplate) {
         return res.status(400).json({
           success: false,
           message: "Missing required credentials!",
@@ -5522,12 +5532,15 @@ class Controller {
         });
       }
 
-      const data = { template: name };
+      const data = { template: nextTemplate };
       const upd = await this.db.updatePlatformConfig(platformID, data);
+      this.cache.del(`main:templates:${platformID}`);
 
       return res.status(200).json({
         success: true,
-        message: "Template updated successfully",
+        message: templateMode === "offline" ? "Offline template selected successfully" : "Template updated successfully",
+        template: nextTemplate,
+        templateMode: templateMode === "offline" ? "offline" : "online",
       });
 
     } catch (error) {
