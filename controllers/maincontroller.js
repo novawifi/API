@@ -38,6 +38,7 @@ class Controller {
     this.cache = cache;
     this.webdock = new WebdockService();
 
+    this.ENVIRONMENT = process.env.ENVIRONMENT || process.env.NODE_ENV;
     this.PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
     this.JWT_SECRET = process.env.JWT_SECRET || "";
   }
@@ -226,7 +227,7 @@ class Controller {
 
     const plan = this.normalizePlatformPlan(platform.subscriptionPlan);
     const trialEndsAt = platform.trialEndsAt || this.addDays(platform.createdAt, 3);
-    const unpaidBills = await this.db.getUnpaidPlatformBilling(platformID);
+    const unpaidBills = await this.getUnpaidPlatformBilling(platformID);
     const hasUnpaidAmount = unpaidBills.some((bill) => Number(bill?.amount || 0) > 0);
     const shouldDisable =
       this.isTrialLimitedPlan(plan) &&
@@ -257,6 +258,304 @@ class Controller {
     }
 
     return { ...platform, subscriptionPlan: plan, trialEndsAt };
+  }
+
+  async getUnpaidPlatformBilling(platformID) {
+    if (!platformID) return [];
+    if (typeof this.db.getUnpaidPlatformBilling === "function") {
+      return this.db.getUnpaidPlatformBilling(platformID);
+    }
+
+    const bills = await this.db.getPlatformBilling(platformID);
+    return (Array.isArray(bills) ? bills : [])
+      .filter((bill) => !this.isPaidBillStatus(bill?.status))
+      .sort((a, b) => {
+        const left = a?.dueDate ? new Date(a.dueDate).getTime() : Number.MAX_SAFE_INTEGER;
+        const right = b?.dueDate ? new Date(b.dueDate).getTime() : Number.MAX_SAFE_INTEGER;
+        return left - right;
+      });
+  }
+
+  getIntaSendBaseUrl() {
+    return this.ENVIRONMENT === "production"
+      ? "https://api.intasend.com"
+      : "https://sandbox.intasend.com";
+  }
+
+  getIntaSendSecretKey() {
+    return process.env.INTASEND_SECRET_KEY || "";
+  }
+
+  async intasendRequest(method, resource, data = null) {
+    const secretKey = this.getIntaSendSecretKey();
+    if (!secretKey) {
+      throw new Error("IntaSend secret key is not configured.");
+    }
+    const response = await axios({
+      method,
+      url: `${this.getIntaSendBaseUrl()}${resource}`,
+      data,
+      timeout: 20000,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        Authorization: `Bearer ${secretKey}`,
+      },
+    });
+    return response.data;
+  }
+
+  getBillCardAutopay(bill) {
+    const meta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
+    return meta.cardAutopay && typeof meta.cardAutopay === "object" ? meta.cardAutopay : null;
+  }
+
+  async updateBillCardAutopay(bill, cardAutopay) {
+    const meta = bill?.meta && typeof bill.meta === "object" ? { ...bill.meta } : {};
+    meta.cardAutopay = {
+      ...(meta.cardAutopay || {}),
+      ...cardAutopay,
+      updatedAt: new Date().toISOString(),
+    };
+    return this.db.updatePlatformBilling(bill.id, { meta });
+  }
+
+  splitCustomerName(name, email) {
+    const parts = String(name || email || "Nova Customer").trim().split(/\s+/).filter(Boolean);
+    return {
+      first_name: parts[0] || "Nova",
+      last_name: parts.slice(1).join(" ") || "Customer",
+    };
+  }
+
+  getClientBaseUrl() {
+    return process.env.CLIENT_URL || process.env.NEXT_PUBLIC_CLIENT_URL || "https://novawifi.online";
+  }
+
+  buildCardBillingReference(platformID, billID) {
+    return `nova-card:${platformID}:${billID}`;
+  }
+
+  async fetchCardBilling(req, res) {
+    const { token } = req.body || {};
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const bills = await this.db.getPlatformBilling(auth.admin.platformID);
+      const cards = (Array.isArray(bills) ? bills : [])
+        .map((bill) => ({ billID: bill.id, billName: bill.name, cardAutopay: this.getBillCardAutopay(bill) }))
+        .filter((entry) => entry.cardAutopay);
+      return res.json({ success: true, cards });
+    } catch (error) {
+      console.error("Card billing fetch error:", error);
+      return res.json({ success: false, message: "Failed to fetch card billing." });
+    }
+  }
+
+  async setupCardBilling(req, res) {
+    const { token, billID } = req.body || {};
+    if (!token || !billID) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const platformID = auth.admin.platformID;
+      const [platform, bill] = await Promise.all([
+        this.db.getPlatform(platformID),
+        this.db.getPlatformBillingByID(billID),
+      ]);
+      if (!platform || !bill || bill.platformID !== platformID) {
+        return res.json({ success: false, message: "Bill not found." });
+      }
+
+      const existing = this.getBillCardAutopay(bill);
+      if (existing?.subscriptionID && ["PENDING", "ACTIVE", "PROCESSING"].includes(String(existing.status || "").toUpperCase())) {
+        return res.json({
+          success: true,
+          message: "Card billing setup already exists.",
+          cardAutopay: existing,
+          setupUrl: existing.setupUrl,
+        });
+      }
+
+      const amount = Number(bill.price || bill.amount || 0);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.json({ success: false, message: "Bill amount is invalid." });
+      }
+
+      const reference = this.buildCardBillingReference(platformID, bill.id);
+      const plan = await this.intasendRequest("post", "/api/v1/subscriptions-plans/", {
+        currency: bill.currency || "KES",
+        name: String(bill.name || "Nova Billing").slice(0, 32),
+        frequency: 1,
+        frequency_unit: "M",
+        billing_cycles: Number(process.env.INTASEND_CARD_BILLING_CYCLES || 120),
+        amount: amount.toFixed(2),
+        reference,
+        redirect_url: `${this.getClientBaseUrl()}/admin/bills`,
+      });
+
+      const name = this.splitCustomerName(auth.admin.name || platform.name, auth.admin.email);
+      const customer = await this.intasendRequest("post", "/api/v1/subscriptions-customers/", {
+        email: auth.admin.email || platform.email || `billing-${platformID}@novawifi.local`,
+        ...name,
+        reference: platformID,
+        address: "Nairobi",
+        city: "Nairobi",
+        state: "Nairobi",
+        zipcode: "00100",
+        country: "KE",
+      });
+
+      const startDate = new Date().toISOString().slice(0, 10);
+      const subscription = await this.intasendRequest("post", "/api/v1/subscriptions/", {
+        customer_id: customer.customer_id,
+        plan_id: plan.plan_id,
+        reference,
+        start_date: startDate,
+        redirect_url: `${this.getClientBaseUrl()}/admin/bills`,
+      });
+
+      const cardAutopay = {
+        provider: "intasend",
+        status: subscription.status || "PENDING",
+        reference,
+        planID: plan.plan_id,
+        customerID: customer.customer_id,
+        subscriptionID: subscription.subscription_id,
+        setupUrl: subscription.setup_url,
+        paymentMethod: "CARD-PAYMENT",
+        amount: amount.toFixed(2),
+        currency: bill.currency || "KES",
+        startDate,
+      };
+      await this.updateBillCardAutopay(bill, cardAutopay);
+
+      return res.json({
+        success: true,
+        message: "Card billing setup created.",
+        setupUrl: subscription.setup_url,
+        cardAutopay,
+      });
+    } catch (error) {
+      console.error("Card billing setup error:", error?.response?.data || error);
+      return res.json({ success: false, message: error?.response?.data?.detail || error.message || "Failed to create card billing setup." });
+    }
+  }
+
+  async cancelCardBilling(req, res) {
+    const { token, billID } = req.body || {};
+    if (!token || !billID) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const bill = await this.db.getPlatformBillingByID(billID);
+      if (!bill || bill.platformID !== auth.admin.platformID) {
+        return res.json({ success: false, message: "Bill not found." });
+      }
+      const cardAutopay = this.getBillCardAutopay(bill);
+      if (!cardAutopay?.subscriptionID) {
+        return res.json({ success: false, message: "No card billing subscription found." });
+      }
+
+      await this.intasendRequest("post", `/api/v1/subscriptions/${cardAutopay.subscriptionID}/unsubscribe/`, {});
+      await this.updateBillCardAutopay(bill, {
+        status: "CANCELED",
+        canceledAt: new Date().toISOString(),
+      });
+      return res.json({ success: true, message: "Card billing canceled." });
+    } catch (error) {
+      console.error("Card billing cancel error:", error?.response?.data || error);
+      return res.json({ success: false, message: error?.response?.data?.detail || "Failed to cancel card billing." });
+    }
+  }
+
+  async intasendSubscriptionWebhook(req, res) {
+    try {
+      const payload = req.body || {};
+      const expectedChallenge = process.env.INTASEND_WEBHOOK_CHALLENGE || process.env.INTASEND_SUBSCRIPTION_WEBHOOK_CHALLENGE;
+      if (expectedChallenge && String(payload.challenge || "") !== String(expectedChallenge)) {
+        return res.status(401).json({ success: false, message: "Invalid webhook challenge." });
+      }
+
+      const reference = String(payload.reference || "");
+      const parts = reference.split(":");
+      if (parts.length !== 3 || parts[0] !== "nova-card") {
+        return res.json({ success: true, message: "Ignored unrelated subscription." });
+      }
+
+      const platformID = parts[1];
+      const billID = parts[2];
+      const bill = await this.db.getPlatformBillingByID(billID);
+      if (!bill || bill.platformID !== platformID) {
+        return res.json({ success: false, message: "Bill not found." });
+      }
+
+      const latestPayment = Array.isArray(payload.payments) ? payload.payments[payload.payments.length - 1] : null;
+      const invoice = latestPayment?.invoice || {};
+      const invoiceID = invoice.invoice_id || latestPayment?.transaction_id || payload.subscription_id;
+      const invoiceState = String(invoice.state || payload.status || "").toUpperCase();
+      const status = invoiceState === "COMPLETE" || invoiceState === "ACTIVE" ? "COMPLETE" : invoiceState === "FAILED" ? "FAILED" : "PENDING";
+
+      await this.updateBillCardAutopay(bill, {
+        status: payload.status || status,
+        subscriptionID: payload.subscription_id,
+        setupUrl: payload.setup_url,
+        cardMask: payload.card_mask,
+        cardType: payload.card_type,
+        cardExpiry: payload.card_expiry,
+        paymentMethod: payload.payment_method || "CARD-PAYMENT",
+        nextDate: payload.next_date,
+        completedCycles: payload.completed_cycles,
+        failReason: payload.fail_reason || invoice.failed_reason,
+        lastInvoiceID: invoiceID,
+      });
+
+      if (invoiceID) {
+        const existingPayment = await this.db.getMpesaCode(invoiceID);
+        if (!existingPayment) {
+          const amount = String(invoice.value || payload.plan?.amount || bill.price || bill.amount || "0");
+          const payment = await this.db.addMpesaCode({
+            platformID,
+            amount,
+            code: invoiceID,
+            reqcode: invoiceID,
+            phone: payload.customer?.email || "card",
+            status,
+            service: "bill",
+            paymentMethod: "CARD-PAYMENT",
+            reason: null,
+            referenceID: billID,
+            type: "deposit",
+            charges: String(invoice.charges || "0.00"),
+            failed_reason: invoice.failed_reason || payload.fail_reason || "null",
+          });
+          if (status === "COMPLETE") {
+            await this.mpesa.completePaymentForService(payment);
+          }
+        } else if (existingPayment.status !== status) {
+          const payment = await this.db.updateMpesaCodeByID(existingPayment.id, {
+            status,
+            charges: String(invoice.charges || existingPayment.charges || "0.00"),
+            failed_reason: invoice.failed_reason || payload.fail_reason || existingPayment.failed_reason,
+          });
+          if (status === "COMPLETE") {
+            await this.mpesa.completePaymentForService(payment);
+          }
+        }
+      }
+
+      return res.json({ success: true });
+    } catch (error) {
+      console.error("IntaSend subscription webhook error:", error);
+      return res.status(500).json({ success: false, message: "Webhook processing failed." });
+    }
   }
 
   async refreshDashboardStats(platformID, options = {}) {
@@ -8307,7 +8606,7 @@ class Controller {
       if (this.normalizePlatformPlan(access.platform.subscriptionPlan) !== "professional") {
         return res.json({ success: false, message: "Professional plan required" });
       }
-      const unpaid = await this.db.getUnpaidPlatformBilling(access.platformID);
+      const unpaid = await this.getUnpaidPlatformBilling(access.platformID);
       const hasOverdue = unpaid.some((bill) => Number(bill.amount || 0) > 0 && bill.dueDate && new Date(bill.dueDate).getTime() < Date.now());
       if (hasOverdue && !this.isPremiumPlatform(access.platform)) {
         return res.json({ success: false, message: "Settle overdue bills before provisioning." });
