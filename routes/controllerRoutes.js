@@ -84,6 +84,13 @@ router.post("/bills", use("fetchPlatformBills"));
 router.post("/serverInfo", use("fetchDedicatedServer"));
 router.post("/updateServerInfo", use("updateDedicatedServer"));
 router.post("/restartServerService", use("restartDedicatedServerService"));
+router.post("/server/provision", use("provisionDedicatedServer"));
+router.post("/server/reboot", use("rebootDedicatedServer"));
+router.post("/server/delete", use("deleteDedicatedServer"));
+router.post("/server/resize/preview", use("previewDedicatedServerResize"));
+router.post("/server/resize", use("resizeDedicatedServer"));
+router.post("/server/migrations", use("fetchPlatformMigrations"));
+router.post("/server/migrate", use("migratePlatformHosting"));
 router.post("/funds", use("fetchFunds"));
 router.post("/sessions", use("fetchSessions"));
 router.post("/deleteSession", use("deleteMySession"))

@@ -17,6 +17,7 @@ const { MpesaConfig } = require("../configs/mpesaConfig");
 const { Mikrotikcontroller } = require("./mikrotikController");
 const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
+const { WebdockService } = require("../services/webdockService");
 const cache = require("../utils/cache");
 
 
@@ -46,9 +47,123 @@ class MpesaController {
         this.darajaRequests = new Map();
         this.darajaRequestTTL = 10 * 60 * 1000;
         this.cache = cache;
+        this.webdock = new WebdockService();
         this.verifyPaymentsRunning = false;
         this.processingPayments = new Map();
         this.processingPaymentsTTL = 60 * 1000;
+    }
+
+    addDays(date, days) {
+        const next = new Date(date || Date.now());
+        next.setDate(next.getDate() + days);
+        return next;
+    }
+
+    async provisionPaidProfessionalServer(platformID) {
+        if (!this.webdock.isConfigured()) return null;
+        const platform = await this.db.getPlatformByplatformID(platformID);
+        if (String(platform?.subscriptionPlan || "").toLowerCase() !== "professional") return null;
+        const existing = await this.db.getPlatformServer(platformID);
+        if (existing?.webdockSlug && !["deleted", "delete_failed"].includes(String(existing.webdockStatus || "").toLowerCase())) {
+            return existing;
+        }
+
+        const resources = {
+            platform: process.env.WEBDOCK_PLATFORM || this.webdock.defaultPlatform,
+            cpuThreads: this.webdock.defaultCpuThreads,
+            ramGb: this.webdock.defaultRamGb,
+            diskGb: this.webdock.defaultDiskGb,
+            networkBandwidth: this.webdock.defaultNetworkBandwidth,
+        };
+        const profile = await this.webdock.createCustomProfile(resources);
+        const profileSlug = profile?.data?.slug;
+        if (!profileSlug) throw new Error("Webdock did not return a profile slug");
+
+        const suggestedSlug = this.webdock.makeSlug(platformID);
+        const provision = await this.webdock.provisionServer({
+            name: `${platform?.name || "Nova"} Dedicated`,
+            slug: suggestedSlug,
+            profileSlug,
+            imageSlug: process.env.WEBDOCK_IMAGE_SLUG || this.webdock.defaultImageSlug,
+            locationId: process.env.WEBDOCK_LOCATION_ID || this.webdock.defaultLocationId,
+            userScriptId: process.env.WEBDOCK_PROVISION_SCRIPT_ID || undefined,
+        });
+        const normalized = this.webdock.normalizeServer(provision.data);
+        const server = await this.db.upsertPlatformServer(platformID, {
+            provider: "webdock",
+            ...resources,
+            ...normalized,
+            webdockSlug: normalized.webdockSlug || suggestedSlug,
+            webdockStatus: normalized.webdockStatus || "provisioning",
+            locationId: process.env.WEBDOCK_LOCATION_ID || this.webdock.defaultLocationId,
+            imageSlug: process.env.WEBDOCK_IMAGE_SLUG || this.webdock.defaultImageSlug,
+            profileSlug,
+            customProfileSlug: profileSlug,
+            providerData: provision.data,
+            renewsAt: this.addDays(new Date(), 30),
+            expiresAt: this.addDays(new Date(), 30),
+        });
+        await this.db.createDedicatedServerAction({
+            platformID,
+            serverSlug: server.webdockSlug,
+            type: "provision",
+            status: provision.callbackId ? "pending" : "processing",
+            callbackId: provision.callbackId,
+            request: { resources, profileSlug },
+            response: { server: provision.data, callbackSequence: provision.callbackSequence },
+        });
+        await this.db.upsertPlatformNotification(platformID, "Dedicated server provisioning", {
+            message: "Your dedicated server provisioning has started.",
+            status: "info",
+            actionLabel: "View Server",
+            actionUrl: "/admin/server",
+        });
+        return server;
+    }
+
+    async applyPaidDedicatedServerResize(platformID, billId) {
+        if (!this.webdock.isConfigured()) return null;
+        const actions = await this.db.getDedicatedServerActions({
+            platformID,
+            billID: billId,
+            type: "resize",
+            status: "awaiting_payment",
+        });
+        const action = actions?.[0];
+        if (!action) return null;
+        const server = await this.db.getPlatformServer(platformID);
+        if (!server?.webdockSlug) return null;
+        const resources = action.request?.resources || {};
+        const profile = await this.webdock.createCustomProfile({
+            platform: process.env.WEBDOCK_PLATFORM || this.webdock.defaultPlatform,
+            cpuThreads: resources.cpuThreads,
+            ramGb: resources.ramGb,
+            diskGb: resources.diskGb,
+            networkBandwidth: resources.networkBandwidth,
+        });
+        const profileSlug = profile?.data?.slug;
+        if (!profileSlug) throw new Error("Webdock did not return a profile slug");
+        await this.webdock.dryRunResize(server.webdockSlug, profileSlug);
+        const resize = await this.webdock.resizeServer(server.webdockSlug, profileSlug);
+        await this.db.updateDedicatedServerAction(action.id, {
+            status: resize.callbackId ? "pending" : "processing",
+            callbackId: resize.callbackId,
+            request: { ...(action.request || {}), profileSlug },
+            response: { callbackSequence: resize.callbackSequence },
+        });
+        await this.db.upsertPlatformServer(platformID, {
+            ...resources,
+            customProfileSlug: profileSlug,
+            profileSlug,
+            webdockStatus: "resizing",
+        });
+        await this.db.upsertPlatformNotification(platformID, "Dedicated resource upgrade", {
+            message: "Dedicated server resource upgrade has been queued.",
+            status: "info",
+            actionLabel: "View Server",
+            actionUrl: "/admin/server",
+        });
+        return resize;
     }
 
     getDarajaAxios() {
@@ -4507,6 +4622,20 @@ class MpesaController {
             await this.db.updatePlatform(bill.platformID, {
                 status: "active"
             })
+            try {
+                await this.applyPaidDedicatedServerResize(bill.platformID, billId);
+                if (bill.meta?.serviceKey === "billing" && bill.meta?.plan === "professional") {
+                    await this.provisionPaidProfessionalServer(bill.platformID);
+                }
+            } catch (error) {
+                console.error("Dedicated server post-payment action failed:", error);
+                await this.db.upsertPlatformNotification(bill.platformID, "Dedicated server payment action failed", {
+                    message: "Payment was received, but the dedicated server action needs admin review.",
+                    status: "error",
+                    actionLabel: "View Server",
+                    actionUrl: "/admin/server",
+                });
+            }
             return { status: "paid" };
         }
 

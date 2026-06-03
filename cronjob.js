@@ -20,6 +20,7 @@ const { Mikrotikcontroller } = require("./controllers/mikrotikController");
 const { Utils } = require("./utils/Functions");
 const { socketManager } = require("./controllers/socketController");
 const { updateClientIp } = require("./utils/radiusConfig");
+const { WebdockService } = require("./services/webdockService");
 
 class CronJob {
     constructor() {
@@ -30,10 +31,12 @@ class CronJob {
         this.sms = new SMS();
         this.mpesa = new MpesaController();
         this.mikrotikController = new Mikrotikcontroller();
+        this.webdock = new WebdockService();
         this.ssh = new NodeSSH();
         this.pullTransactionsRunning = false;
         this.pm2RestartRunning = false;
         this.mikrotikBackupRunning = false;
+        this.webdockRunning = false;
 
         this.mikrotikConnectionPool = new Map();
         this.routerLocks = new Map();
@@ -164,6 +167,190 @@ class CronJob {
                     level: "error",
                 });
             }
+        }
+    }
+
+    latestSamplingValue(sampling) {
+        if (!sampling) return null;
+        if (Array.isArray(sampling)) return sampling.length ? Number(sampling[sampling.length - 1]?.amount || 0) : null;
+        return Number(sampling.amount || 0);
+    }
+
+    async syncWebdockActions() {
+        if (!this.webdock.isConfigured()) return;
+        const actions = await this.db.getPendingDedicatedServerActions();
+        for (const action of actions) {
+            try {
+                const events = await this.webdock.getEvents(action.callbackId);
+                const event = Array.isArray(events.data) ? events.data[0] : events.data;
+                const status = String(event?.status || event?.state || "").toLowerCase();
+                if (!event || !status) continue;
+                if (["finished", "success", "complete", "completed", "done"].includes(status)) {
+                    const update = { status: "completed", response: { ...(action.response || {}), event } };
+                    await this.db.updateDedicatedServerAction(action.id, update);
+                    if (action.serverSlug) {
+                        try {
+                            const server = await this.webdock.getServer(action.serverSlug);
+                            await this.db.upsertPlatformServer(action.platformID, {
+                                ...this.webdock.normalizeServer(server.data),
+                                webdockStatus: action.type === "delete" ? "deleted" : (server.data?.status || "active"),
+                                lastSyncedAt: new Date(),
+                            });
+                        } catch (err) {
+                            if (action.type === "delete") {
+                                await this.db.upsertPlatformServer(action.platformID, {
+                                    webdockStatus: "deleted",
+                                    lastSyncedAt: new Date(),
+                                });
+                            }
+                        }
+                    }
+                    await this.db.upsertPlatformNotification(action.platformID, `Dedicated server ${action.type} complete`, {
+                        message: `Dedicated server ${action.type} completed successfully.`,
+                        status: "success",
+                        actionLabel: "View Server",
+                        actionUrl: "/admin/server",
+                    });
+                } else if (["error", "failed", "failure"].includes(status)) {
+                    await this.db.updateDedicatedServerAction(action.id, {
+                        status: "failed",
+                        error: event?.message || event?.error || "Webdock action failed",
+                        response: { ...(action.response || {}), event },
+                    });
+                    await this.db.upsertPlatformNotification(action.platformID, `Dedicated server ${action.type} failed`, {
+                        message: event?.message || `Dedicated server ${action.type} failed.`,
+                        status: "error",
+                        actionLabel: "View Server",
+                        actionUrl: "/admin/server",
+                    });
+                } else {
+                    await this.db.updateDedicatedServerAction(action.id, { status: "processing" });
+                }
+            } catch (error) {
+                console.error("[cron] Webdock action sync failed", error?.message || error);
+            }
+        }
+    }
+
+    async syncWebdockServers() {
+        if (!this.webdock.isConfigured()) return;
+        const servers = await this.db.getPlatformServers({
+            webdockSlug: { not: null },
+            webdockStatus: { notIn: ["deleted", "deleting"] },
+        });
+        for (const server of servers) {
+            try {
+                const [webdockServer, instantMetrics, metrics] = await Promise.all([
+                    this.webdock.getServer(server.webdockSlug),
+                    this.webdock.getInstantMetrics(server.webdockSlug),
+                    this.webdock.getMetrics(server.webdockSlug),
+                ]);
+                const normalized = this.webdock.normalizeServer(webdockServer.data);
+                const providerHealth = this.webdock.normalizeInstantMetrics(instantMetrics.data, webdockServer.data);
+                await this.db.upsertPlatformServer(server.platformID, {
+                    ...normalized,
+                    instantMetrics: providerHealth,
+                    metrics: metrics.data,
+                    lastSyncedAt: new Date(),
+                });
+                await this.createWebdockHealthNotifications(server.platformID, providerHealth);
+            } catch (error) {
+                console.error("[cron] Webdock server sync failed", error?.message || error);
+                await this.db.upsertPlatformNotification(server.platformID, "Dedicated server health check failed", {
+                    message: "Could not refresh dedicated server health from Webdock.",
+                    status: "warning",
+                    actionLabel: "View Server",
+                    actionUrl: "/admin/server",
+                });
+            }
+        }
+    }
+
+    async createWebdockHealthNotifications(platformID, health) {
+        const ramLimit = Number(process.env.DEDICATED_SERVER_RAM_ALERT_PERCENT || 85);
+        const diskLimit = Number(process.env.DEDICATED_SERVER_DISK_ALERT_PERCENT || 80);
+        const bandwidthLimit = Number(process.env.DEDICATED_SERVER_BANDWIDTH_ALERT_PERCENT || 85);
+        const cpuSecondsLimit = Number(process.env.DEDICATED_SERVER_CPU_SECONDS_ALERT || 1500);
+
+        if (health?.memory?.usedPercent !== null && health.memory.usedPercent >= ramLimit) {
+            await this.db.upsertPlatformNotification(platformID, "Dedicated server RAM overusage", {
+                message: `RAM usage is ${health.memory.usedPercent}%.`,
+                status: "warning",
+                actionLabel: "Upgrade Resources",
+                actionUrl: "/admin/server",
+            });
+        }
+        if (health?.disk?.usedPercent !== null && health.disk.usedPercent >= diskLimit) {
+            await this.db.upsertPlatformNotification(platformID, "Dedicated server storage filling", {
+                message: `Storage usage is ${health.disk.usedPercent}%.`,
+                status: "warning",
+                actionLabel: "Upgrade Resources",
+                actionUrl: "/admin/server",
+            });
+        }
+        if (health?.cpu?.usedSeconds !== null && health.cpu.usedSeconds >= cpuSecondsLimit) {
+            await this.db.upsertPlatformNotification(platformID, "Dedicated server CPU overusage", {
+                message: `CPU usage is high in the latest Webdock sample.`,
+                status: "warning",
+                actionLabel: "Upgrade Resources",
+                actionUrl: "/admin/server",
+            });
+        }
+        const network = health?.network;
+        if (network?.allowed && network?.total && Number(network.total) / Number(network.allowed) * 100 >= bandwidthLimit) {
+            await this.db.upsertPlatformNotification(platformID, "Dedicated server bandwidth usage", {
+                message: `Bandwidth usage is ${Number((Number(network.total) / Number(network.allowed) * 100).toFixed(1))}%.`,
+                status: "warning",
+                actionLabel: "View Server",
+                actionUrl: "/admin/server",
+            });
+        }
+    }
+
+    async deleteOverdueDedicatedServers() {
+        if (!this.webdock.isConfigured()) return;
+        const platforms = await this.db.getAllPlatforms();
+        const cutoffMs = 30 * 24 * 60 * 60 * 1000;
+        for (const platform of platforms) {
+            try {
+                const server = await this.db.getPlatformServer(platform.platformID);
+                if (!server?.webdockSlug || ["deleted", "deleting"].includes(String(server.webdockStatus || "").toLowerCase())) continue;
+                const unpaid = await this.db.getUnpaidPlatformBilling(platform.platformID);
+                const overdue = unpaid.some((bill) => Number(bill.amount || 0) > 0 && bill.dueDate && Date.now() - new Date(bill.dueDate).getTime() > cutoffMs);
+                if (!overdue) continue;
+                const response = await this.webdock.deleteServer(server.webdockSlug);
+                await this.db.upsertPlatformServer(platform.platformID, {
+                    webdockStatus: "deleting",
+                    pendingDeletionAt: new Date(),
+                });
+                await this.db.createDedicatedServerAction({
+                    platformID: platform.platformID,
+                    serverSlug: server.webdockSlug,
+                    type: "delete",
+                    status: response.callbackId ? "pending" : "processing",
+                    callbackId: response.callbackId,
+                    response: { callbackSequence: response.callbackSequence },
+                });
+                await this.db.upsertPlatformNotification(platform.platformID, "Dedicated server deleted for unpaid bill", {
+                    message: "Dedicated server deletion was queued because a bill has been unpaid for more than 30 days.",
+                    status: "error",
+                    actionLabel: "View Bills",
+                    actionUrl: "/admin/bills",
+                });
+            } catch (error) {
+                console.error("[cron] overdue Webdock deletion failed", error?.message || error);
+            }
+        }
+    }
+
+    async runWebdockCron() {
+        if (this.webdockRunning) return;
+        this.webdockRunning = true;
+        try {
+            await this.syncWebdockActions();
+            await this.syncWebdockServers();
+        } finally {
+            this.webdockRunning = false;
         }
     }
 
@@ -1978,6 +2165,12 @@ Price: KSH ${service.price}</p>
                     60_000,
                     "internal email"
                 );
+
+                await withTimeout(
+                    this.runWebdockCron(),
+                    90_000,
+                    "webdock sync"
+                );
             } catch (err) {
                 console.error("[cron] 5-minute fatal error", err);
             } finally {
@@ -2008,6 +2201,12 @@ Price: KSH ${service.price}</p>
 
                 console.log("[cron] Running hourly cleanup...");
                 try {
+                    await withTimeout(
+                        this.deleteOverdueDedicatedServers(),
+                        120_000,
+                        "webdock overdue deletion"
+                    );
+
                     await withTimeout(
                         this.purgeOldPublicLiveChats(),
                         10 * 60 * 1000,

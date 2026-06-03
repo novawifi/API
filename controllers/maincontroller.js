@@ -13,6 +13,7 @@ const dns = require("dns").promises;
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const appRoot = require("app-root-path").path;
+const { Prisma } = require("@prisma/client");
 const { DataBase } = require("../helpers/databaseOperation");
 const { Utils } = require("../utils/Functions");
 const { getHotspotHash, renderOfflineBoxLoginTemplate } = require("../utils/hotspotTemplate");
@@ -24,6 +25,7 @@ const { MpesaController } = require("./mpesaController");
 const { socketManager } = require("./socketController");
 const cache = require("../utils/cache");
 const { ensureRadiusClient, removeRadiusClient } = require("../utils/radiusConfig");
+const { WebdockService } = require("../services/webdockService");
 
 class Controller {
   constructor() {
@@ -34,6 +36,7 @@ class Controller {
     this.mikrotik = new Mikrotikcontroller();
     this.mpesa = new MpesaController();
     this.cache = cache;
+    this.webdock = new WebdockService();
 
     this.PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
     this.JWT_SECRET = process.env.JWT_SECRET || "";
@@ -94,6 +97,48 @@ class Controller {
       professional: { id: "professional", name: "Professional", price: 2499, trialDays: 0 },
     };
     return plans[this.normalizePlatformPlan(plan)] || plans.basic;
+  }
+
+  getDedicatedServerPricing() {
+    return {
+      baseMonthlyKes: Number(process.env.DEDICATED_SERVER_BASE_PRICE_KES || 0),
+      cpuThreadKes: Number(process.env.DEDICATED_SERVER_CPU_THREAD_PRICE_KES || 500),
+      ramGbKes: Number(process.env.DEDICATED_SERVER_RAM_GB_PRICE_KES || 350),
+      diskGbKes: Number(process.env.DEDICATED_SERVER_DISK_GB_PRICE_KES || 40),
+      networkGbpsKes: Number(process.env.DEDICATED_SERVER_NETWORK_GBPS_PRICE_KES || 0),
+    };
+  }
+
+  calculateDedicatedServerPrice(current = {}, requested = {}) {
+    const pricing = this.getDedicatedServerPricing();
+    const currentCpu = Number(current.cpuThreads || this.webdock.defaultCpuThreads);
+    const currentRam = Number(current.ramGb || this.webdock.defaultRamGb);
+    const currentDisk = Number(current.diskGb || this.webdock.defaultDiskGb);
+    const currentNetwork = Number(current.networkBandwidth || this.webdock.defaultNetworkBandwidth);
+    const nextCpu = Math.max(currentCpu, Number(requested.cpuThreads || currentCpu));
+    const nextRam = Math.max(currentRam, Number(requested.ramGb || currentRam));
+    const nextDisk = Math.max(currentDisk, Number(requested.diskGb || currentDisk));
+    const nextNetwork = Math.max(currentNetwork, Number(requested.networkBandwidth || currentNetwork));
+    const additionalMonthlyKes =
+      Math.max(0, nextCpu - currentCpu) * pricing.cpuThreadKes +
+      Math.max(0, nextRam - currentRam) * pricing.ramGbKes +
+      Math.max(0, nextDisk - currentDisk) * pricing.diskGbKes +
+      Math.max(0, nextNetwork - currentNetwork) * pricing.networkGbpsKes;
+
+    return {
+      additionalMonthlyKes,
+      resources: {
+        cpuThreads: nextCpu,
+        ramGb: nextRam,
+        diskGb: nextDisk,
+        networkBandwidth: nextNetwork,
+      },
+      pricing,
+    };
+  }
+
+  isPaidBillStatus(status) {
+    return String(status || "").trim().toLowerCase() === "paid";
   }
 
   isPremiumPlatform(platform) {
@@ -7206,6 +7251,10 @@ class Controller {
 
       await this.db.updatePlatform(platformID, data);
       const bill = await this.ensurePlatformBillingService(platformID);
+      const migration = await this.queuePlanMigration(existing, plan, {
+        requestedPlan,
+        token,
+      });
       await this.db.upsertPlatformNotification(platformID, "Account plan updated", {
         message: `Your account is now on the ${this.getAccountPlan(plan).name} plan.`,
         status: "success",
@@ -7220,6 +7269,7 @@ class Controller {
         message: "Account plan updated successfully",
         platform,
         bill,
+        migration,
       });
     } catch (error) {
       console.log("An error occured", error);
@@ -7236,15 +7286,23 @@ class Controller {
       });
     }
 
+    const sanitizedUrl = this.sanitizeDomain(url);
+    if (!sanitizedUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid platform URL. Use letters, numbers, dots, and hyphens only.",
+      });
+    }
+
     try {
-      const checkplatform = await this.db.getPlatformByURLData(url);
+      const checkplatform = await this.db.getPlatformByURLData(sanitizedUrl);
       if (checkplatform) {
         return res.status(409).json({
           success: false,
           message: "Platform name or URL already exists. Please choose another name.",
         });
       }
-      const existingWebfigHost = await this.db.getStationByWebfigHost(url);
+      const existingWebfigHost = await this.db.getStationByWebfigHost(sanitizedUrl);
       if (existingWebfigHost) {
         return res.status(409).json({
           success: false,
@@ -7260,12 +7318,12 @@ class Controller {
         });
       }
 
-      const provision = await this.addReverseProxySite(url, "http://127.0.0.1:3001");
+      const provision = await this.addReverseProxySite(sanitizedUrl, "http://127.0.0.1:3001");
       if (!provision.success) {
         return res.json({
           success: false,
           message: provision.message || "Reverse proxy provisioning failed, try again.",
-          error: provision.error
+          error: provision.error,
         });
       }
 
@@ -7346,7 +7404,7 @@ class Controller {
       await this.db.createPlatformBilling(billingdata);
       const newPlatform = await this.db.createPlatform({
         name,
-        url: url,
+        url: sanitizedUrl,
         platformID,
         adminID,
         subscriptionPlan: plan,
@@ -7361,7 +7419,7 @@ class Controller {
       await this.refreshDashboardStats(platformID);
 
       const subject = `Account created!`
-      const message = `Your platform ${name} has been created. Login to your Admin dashboard at https://${url}/admin/login.`;
+      const message = `Your platform ${name} has been created. Login to your Admin dashboard at https://${sanitizedUrl}/admin/login.`;
       const data = {
         name: name,
         type: "accounts",
@@ -7394,16 +7452,28 @@ class Controller {
       console.error("Registration error:", error);
 
       let errorMessage = "An error occurred during registration";
-      if (error.response) {
-        errorMessage = error.response.data?.errors?.map(err => err.message).join(', ') || errorMessage;
+      let statusCode = 500;
+
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        if (error.code === "P2002") {
+          statusCode = 409;
+          errorMessage = "A record with this value already exists.";
+        } else {
+          errorMessage = error.message;
+        }
+      } else if (error instanceof Prisma.PrismaClientValidationError) {
+        statusCode = 400;
+        errorMessage = error.message;
+      } else if (error && error.response) {
+        errorMessage = error.response.data?.errors?.map(err => err.message).join(", ") || errorMessage;
       } else if (error instanceof Error) {
         errorMessage = error.message;
       }
 
-      return res.status(500).json({
+      return res.status(statusCode).json({
         success: false,
-        message: "An error occurred during registration",
-        error: error
+        message: errorMessage,
+        error: errorMessage,
       });
     }
   };
@@ -7969,6 +8039,420 @@ class Controller {
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
+  async getDedicatedServerAuth(token) {
+    const auth = await this.auth.AuthenticateRequest(token);
+    if (!auth.success || !auth.admin) return { success: false, message: auth.message || "Unauthorised!" };
+    if (auth.admin.role !== "superuser") return { success: false, message: "Unauthorised!" };
+    const platformID = auth.admin.platformID;
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return { success: false, message: "Platform not found!" };
+    return { success: true, auth, platform, platformID };
+  }
+
+  async createDedicatedServerForPlatform(platformID, options = {}) {
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return { success: false, message: "Platform not found!" };
+    if (this.normalizePlatformPlan(platform.subscriptionPlan) !== "professional") {
+      return { success: false, message: "Professional plan required" };
+    }
+
+    const existing = await this.db.getPlatformServer(platformID);
+    if (existing?.webdockSlug && !["deleted", "delete_failed"].includes(String(existing.webdockStatus || "").toLowerCase())) {
+      return { success: true, message: "Server already exists", server: existing };
+    }
+
+    const resources = {
+      platform: process.env.WEBDOCK_PLATFORM || this.webdock.defaultPlatform,
+      cpuThreads: Number(options.cpuThreads || this.webdock.defaultCpuThreads),
+      ramGb: Number(options.ramGb || this.webdock.defaultRamGb),
+      diskGb: Number(options.diskGb || this.webdock.defaultDiskGb),
+      networkBandwidth: Number(options.networkBandwidth || this.webdock.defaultNetworkBandwidth),
+    };
+
+    const profile = await this.webdock.createCustomProfile(resources);
+    const profileSlug = profile?.data?.slug;
+    if (!profileSlug) throw new Error("Webdock did not return a profile slug");
+
+    const suggestedSlug = this.webdock.makeSlug(platformID);
+    const provision = await this.webdock.provisionServer({
+      name: `${platform.name || "Nova"} Dedicated`,
+      slug: suggestedSlug,
+      profileSlug,
+      imageSlug: process.env.WEBDOCK_IMAGE_SLUG || this.webdock.defaultImageSlug,
+      locationId: process.env.WEBDOCK_LOCATION_ID || this.webdock.defaultLocationId,
+      userScriptId: process.env.WEBDOCK_PROVISION_SCRIPT_ID || undefined,
+    });
+
+    const normalized = this.webdock.normalizeServer(provision.data);
+    const server = await this.db.upsertPlatformServer(platformID, {
+      provider: "webdock",
+      ...resources,
+      ...normalized,
+      webdockSlug: normalized.webdockSlug || suggestedSlug,
+      webdockStatus: normalized.webdockStatus || "provisioning",
+      locationId: process.env.WEBDOCK_LOCATION_ID || this.webdock.defaultLocationId,
+      imageSlug: process.env.WEBDOCK_IMAGE_SLUG || this.webdock.defaultImageSlug,
+      profileSlug,
+      customProfileSlug: profileSlug,
+      providerData: provision.data,
+      renewsAt: this.addDays(new Date(), 30),
+      expiresAt: this.addDays(new Date(), 30),
+    });
+
+    await this.db.createDedicatedServerAction({
+      platformID,
+      serverSlug: server.webdockSlug,
+      type: "provision",
+      status: provision.callbackId ? "pending" : "processing",
+      callbackId: provision.callbackId,
+      request: { resources, profileSlug },
+      response: { server: provision.data, callbackSequence: provision.callbackSequence },
+    });
+
+    await this.db.upsertPlatformNotification(platformID, "Dedicated server provisioning", {
+      message: "Your dedicated server provisioning has started.",
+      status: "info",
+      actionLabel: "View Server",
+      actionUrl: "/admin/server",
+    });
+
+    return { success: true, message: "Provisioning started", server };
+  }
+
+  getSharedPortalTarget() {
+    return process.env.SHARED_PORTAL_TARGET || "http://127.0.0.1:3001";
+  }
+
+  getDedicatedPortalTarget(server) {
+    const port = process.env.DEDICATED_PORTAL_PORT || "3001";
+    const ipAddress = server?.ipAddress || server?.providerData?.ip || server?.providerData?.ipv4 || "";
+    if (!ipAddress) return "";
+    return `http://${ipAddress}:${port}`;
+  }
+
+  isDedicatedPlan(plan) {
+    return this.normalizePlatformPlan(plan) === "professional";
+  }
+
+  getMigrationDirection(sourcePlan, targetPlan) {
+    const fromDedicated = this.isDedicatedPlan(sourcePlan);
+    const toDedicated = this.isDedicatedPlan(targetPlan);
+    if (fromDedicated && !toDedicated) return "dedicated_to_shared";
+    if (!fromDedicated && toDedicated) return "shared_to_dedicated";
+    return null;
+  }
+
+  async queuePlanMigration(platform, targetPlan, meta = {}) {
+    const sourcePlan = this.normalizePlatformPlan(platform?.subscriptionPlan);
+    const normalizedTarget = this.normalizePlatformPlan(targetPlan);
+    const direction = this.getMigrationDirection(sourcePlan, normalizedTarget);
+    if (!direction) return null;
+
+    const existing = await this.db.getLatestPlatformMigration(platform.platformID, ["pending", "running"]);
+    if (existing) return existing;
+
+    const server = await this.db.getPlatformServer(platform.platformID);
+    const domain = this.sanitizeDomain(platform.domain || platform.url);
+    const sourceTarget = direction === "dedicated_to_shared"
+      ? this.getDedicatedPortalTarget(server)
+      : this.getSharedPortalTarget();
+    const destinationTarget = direction === "dedicated_to_shared"
+      ? this.getSharedPortalTarget()
+      : this.getDedicatedPortalTarget(server);
+
+    const migration = await this.db.createPlatformMigration({
+      platformID: platform.platformID,
+      direction,
+      status: destinationTarget ? "pending" : "blocked",
+      domain,
+      requestedPlan: meta.requestedPlan || normalizedTarget,
+      sourcePlan,
+      targetPlan: normalizedTarget,
+      sourceServerSlug: direction === "dedicated_to_shared" ? server?.webdockSlug || null : null,
+      destinationServerSlug: direction === "shared_to_dedicated" ? server?.webdockSlug || null : null,
+      sourceTarget,
+      destinationTarget,
+      request: {
+        reason: "plan_change",
+        webdockApi: this.webdock.baseURL,
+      },
+      error: destinationTarget ? null : "Dedicated server IP is not ready yet.",
+    });
+
+    await this.db.upsertPlatformNotification(platform.platformID, "Platform migration queued", {
+      message: direction === "dedicated_to_shared"
+        ? "Downgrade queued. Platform records will remain on shared hosting and the portal domain will point back to the main API."
+        : "Dedicated migration queued. Provision the dedicated server, then complete migration after the server IP is ready.",
+      status: destinationTarget ? "info" : "warning",
+      actionLabel: "View Server",
+      actionUrl: "/admin/server",
+    });
+
+    return migration;
+  }
+
+  async runPlatformMigration(platformID, migrationId) {
+    const migration = await this.db.getPlatformMigration(migrationId, platformID);
+    if (!migration) return { success: false, message: "Migration not found" };
+    if (["completed", "running"].includes(String(migration.status || "").toLowerCase())) {
+      return { success: true, message: "Migration already handled", migration };
+    }
+
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return { success: false, message: "Platform not found" };
+
+    const server = await this.db.getPlatformServer(platformID);
+    const destinationTarget = migration.direction === "dedicated_to_shared"
+      ? this.getSharedPortalTarget()
+      : this.getDedicatedPortalTarget(server);
+    if (!destinationTarget) {
+      const updated = await this.db.updatePlatformMigration(migration.id, {
+        status: "blocked",
+        error: "Dedicated server IP is not ready yet.",
+      });
+      return { success: false, message: "Dedicated server IP is not ready yet.", migration: updated };
+    }
+
+    await this.db.updatePlatformMigration(migration.id, {
+      status: "running",
+      startedAt: migration.startedAt || new Date(),
+      destinationTarget,
+      destinationServerSlug: migration.direction === "shared_to_dedicated" ? server?.webdockSlug || null : migration.destinationServerSlug,
+    });
+
+    try {
+      const records = await this.db.getPlatformRecordCounts(platformID);
+      const domain = this.sanitizeDomain(migration.domain || platform.domain || platform.url);
+      let proxy = null;
+      if (domain) {
+        proxy = await this.addReverseProxySite(domain, destinationTarget);
+        if (!proxy.success) throw new Error(proxy.message || "Reverse proxy update failed");
+      }
+
+      const completed = await this.db.updatePlatformMigration(migration.id, {
+        status: "completed",
+        completedAt: new Date(),
+        records,
+        response: {
+          proxy,
+          destinationTarget,
+          webdockApi: this.webdock.baseURL,
+        },
+        error: null,
+      });
+
+      await this.db.upsertPlatformNotification(platformID, "Platform migration completed", {
+        message: migration.direction === "dedicated_to_shared"
+          ? "Portal domain now points to shared hosting."
+          : "Portal domain now points to the dedicated server.",
+        status: "success",
+        actionLabel: "View Server",
+        actionUrl: "/admin/server",
+      });
+
+      return { success: true, message: "Migration completed", migration: completed };
+    } catch (error) {
+      const failed = await this.db.updatePlatformMigration(migration.id, {
+        status: "failed",
+        error: error?.message || "Migration failed",
+      });
+      await this.db.upsertPlatformNotification(platformID, "Platform migration failed", {
+        message: error?.message || "Migration failed.",
+        status: "error",
+        actionLabel: "View Server",
+        actionUrl: "/admin/server",
+      });
+      return { success: false, message: error?.message || "Migration failed", migration: failed };
+    }
+  }
+
+  async migratePlatformHosting(req, res) {
+    const { token, migrationId } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const migration = migrationId
+        ? await this.db.getPlatformMigration(migrationId, access.platformID)
+        : await this.db.getLatestPlatformMigration(access.platformID, ["pending", "blocked", "failed"]);
+      if (!migration) return res.json({ success: false, message: "No migration is queued" });
+      const result = await this.runPlatformMigration(access.platformID, migration.id);
+      return res.json(result);
+    } catch (error) {
+      console.error("Platform migration error:", error);
+      return res.json({ success: false, message: error?.message || "Migration failed" });
+    }
+  }
+
+  async fetchPlatformMigrations(req, res) {
+    const { token } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const migrations = await this.db.getPlatformMigrations(access.platformID);
+      return res.json({ success: true, migrations });
+    } catch (error) {
+      console.error("Fetch platform migrations error:", error);
+      return res.json({ success: false, message: "Failed to fetch migrations" });
+    }
+  }
+
+  async provisionDedicatedServer(req, res) {
+    const { token } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      if (this.normalizePlatformPlan(access.platform.subscriptionPlan) !== "professional") {
+        return res.json({ success: false, message: "Professional plan required" });
+      }
+      const unpaid = await this.db.getUnpaidPlatformBilling(access.platformID);
+      const hasOverdue = unpaid.some((bill) => Number(bill.amount || 0) > 0 && bill.dueDate && new Date(bill.dueDate).getTime() < Date.now());
+      if (hasOverdue && !this.isPremiumPlatform(access.platform)) {
+        return res.json({ success: false, message: "Settle overdue bills before provisioning." });
+      }
+      const result = await this.createDedicatedServerForPlatform(access.platformID);
+      return res.json(result);
+    } catch (error) {
+      console.error("Dedicated server provision error:", error);
+      return res.json({ success: false, message: error?.message || "Failed to provision server" });
+    }
+  }
+
+  async rebootDedicatedServer(req, res) {
+    const { token } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const server = await this.db.getPlatformServer(access.platformID);
+      if (!server?.webdockSlug) return res.json({ success: false, message: "Server is not provisioned yet" });
+      const response = await this.webdock.rebootServer(server.webdockSlug);
+      await this.db.createDedicatedServerAction({
+        platformID: access.platformID,
+        serverSlug: server.webdockSlug,
+        type: "reboot",
+        status: response.callbackId ? "pending" : "processing",
+        callbackId: response.callbackId,
+        response: { callbackSequence: response.callbackSequence },
+      });
+      await this.db.upsertPlatformNotification(access.platformID, "Dedicated server reboot", {
+        message: "Server reboot has been queued.",
+        status: "info",
+        actionLabel: "View Server",
+        actionUrl: "/admin/server",
+      });
+      return res.json({ success: true, message: "Server reboot queued" });
+    } catch (error) {
+      console.error("Dedicated server reboot error:", error);
+      return res.json({ success: false, message: "Failed to reboot server" });
+    }
+  }
+
+  async deleteDedicatedServer(req, res) {
+    const { token } = req.body;
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const server = await this.db.getPlatformServer(access.platformID);
+      if (!server?.webdockSlug) return res.json({ success: false, message: "Server is not provisioned yet" });
+      const response = await this.webdock.deleteServer(server.webdockSlug);
+      await this.db.upsertPlatformServer(access.platformID, {
+        webdockStatus: "deleting",
+        pendingDeletionAt: new Date(),
+      });
+      await this.db.createDedicatedServerAction({
+        platformID: access.platformID,
+        serverSlug: server.webdockSlug,
+        type: "delete",
+        status: response.callbackId ? "pending" : "processing",
+        callbackId: response.callbackId,
+        response: { callbackSequence: response.callbackSequence },
+      });
+      await this.db.upsertPlatformNotification(access.platformID, "Dedicated server deletion", {
+        message: "Server deletion has been queued.",
+        status: "warning",
+        actionLabel: "View Server",
+        actionUrl: "/admin/server",
+      });
+      return res.json({ success: true, message: "Server deletion queued" });
+    } catch (error) {
+      console.error("Dedicated server delete error:", error);
+      return res.json({ success: false, message: "Failed to delete server" });
+    }
+  }
+
+  async previewDedicatedServerResize(req, res) {
+    const { token, resources } = req.body;
+    if (!token || !resources) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const server = await this.db.getPlatformServer(access.platformID);
+      if (!server?.webdockSlug) return res.json({ success: false, message: "Server is not provisioned yet" });
+      const price = this.calculateDedicatedServerPrice(server, resources);
+      return res.json({ success: true, resources: price.resources, price });
+    } catch (error) {
+      console.error("Dedicated server resize preview error:", error);
+      return res.json({ success: false, message: "Failed to preview resize" });
+    }
+  }
+
+  async resizeDedicatedServer(req, res) {
+    const { token, resources } = req.body;
+    if (!token || !resources) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      const server = await this.db.getPlatformServer(access.platformID);
+      if (!server?.webdockSlug) return res.json({ success: false, message: "Server is not provisioned yet" });
+
+      const price = this.calculateDedicatedServerPrice(server, resources);
+      if (price.additionalMonthlyKes <= 0) {
+        return res.json({ success: false, message: "Choose resources above your current allocation." });
+      }
+
+      const bill = await this.db.createPlatformBilling({
+        name: "Dedicated server resources",
+        platformID: access.platformID,
+        amount: String(price.additionalMonthlyKes),
+        price: String(price.additionalMonthlyKes),
+        currency: "KES",
+        status: "Unpaid",
+        dueDate: new Date(),
+        description: `Dedicated server resource upgrade to ${price.resources.cpuThreads} CPU threads, ${price.resources.ramGb}GB RAM, ${price.resources.diskGb}GB disk.`,
+        meta: {
+          serviceKey: "dedicated-server-resize",
+          resources: price.resources,
+          serverSlug: server.webdockSlug,
+        },
+      });
+
+      await this.db.createDedicatedServerAction({
+        platformID: access.platformID,
+        serverSlug: server.webdockSlug,
+        type: "resize",
+        status: "awaiting_payment",
+        billID: bill.id,
+        request: { resources: price.resources, price },
+      });
+
+      await this.db.upsertPlatformNotification(access.platformID, "Dedicated resource upgrade payment", {
+        message: `Pay KES ${price.additionalMonthlyKes} to apply the dedicated server resource upgrade.`,
+        status: "info",
+        actionLabel: "Pay Bill",
+        actionUrl: "/admin/bills",
+      });
+
+      return res.json({ success: true, message: "Resource upgrade bill created", bill, price });
+    } catch (error) {
+      console.error("Dedicated server resize error:", error);
+      return res.json({ success: false, message: "Failed to create resource upgrade" });
+    }
+  }
+
   async fetchDedicatedServer(req, res) {
     const { token } = req.body;
     if (!token) return res.json({ success: false, message: "Missing credentials required!" });
@@ -7978,17 +8462,46 @@ class Controller {
       if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
 
       const platformID = auth.admin.platformID;
-      const [platform, server, health] = await Promise.all([
+      const [platform, server, health, migrations] = await Promise.all([
         this.db.getPlatformByplatformID(platformID),
         this.db.getPlatformServer(platformID),
         this.buildPortalHealth(),
+        this.db.getPlatformMigrations(platformID),
       ]);
+
+      let liveServer = server;
+      let providerHealth = null;
+      if (server?.webdockSlug && this.webdock.token) {
+        try {
+          const [webdockServer, instantMetrics, metrics] = await Promise.all([
+            this.webdock.getServer(server.webdockSlug),
+            this.webdock.getInstantMetrics(server.webdockSlug),
+            this.webdock.getMetrics(server.webdockSlug),
+          ]);
+          const normalized = this.webdock.normalizeServer(webdockServer.data);
+          providerHealth = this.webdock.normalizeInstantMetrics(instantMetrics.data, webdockServer.data);
+          liveServer = await this.db.upsertPlatformServer(platformID, {
+            ...normalized,
+            instantMetrics: providerHealth,
+            metrics: metrics.data,
+            lastSyncedAt: new Date(),
+          });
+        } catch (err) {
+          console.error("Webdock server sync failed:", err?.message || err);
+        }
+      }
 
       return res.json({
         success: true,
         platform,
-        server,
-        health,
+        server: liveServer,
+        health: {
+          ...health,
+          webdock: providerHealth,
+        },
+        pricing: this.getDedicatedServerPricing(),
+        webdockConfigured: this.webdock.isConfigured(),
+        migrations,
       });
     } catch (error) {
       console.error("Dedicated server fetch error:", error);

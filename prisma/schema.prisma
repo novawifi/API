@@ -184,6 +184,18 @@ model PlatformNotification {
 model PlatformServer {
   id             String    @id @default(uuid())
   platformID     String    @unique
+  provider       String?   @default("webdock")
+  webdockSlug    String?   @unique
+  webdockId      String?
+  webdockStatus  String?   @default("pending")
+  locationId     String?
+  profileSlug    String?
+  customProfileSlug String?
+  imageSlug      String?
+  cpuThreads     Int?      @default(2)
+  ramGb          Int?      @default(4)
+  diskGb         Int?      @default(30)
+  networkBandwidth Int?    @default(1)
   rootUser       String?   @default("")
   ipAddress      String?   @default("")
   databaseName   String?   @default("")
@@ -191,6 +203,12 @@ model PlatformServer {
   nginxStatus    String?   @default("")
   sshPort        String?   @default("22")
   sshStatus      String?   @default("")
+  metrics        Json?
+  instantMetrics Json?
+  providerData   Json?
+  lastSyncedAt   DateTime?
+  lastHealthAlertAt DateTime?
+  pendingDeletionAt DateTime?
   notes          String?   @default("")
   expiresAt      DateTime?
   renewsAt       DateTime?
@@ -199,6 +217,55 @@ model PlatformServer {
   updatedAt      DateTime  @updatedAt
 
   @@index([platformID])
+  @@index([webdockSlug])
+  @@index([webdockStatus])
+}
+
+model DedicatedServerAction {
+  id          String   @id @default(uuid())
+  platformID  String
+  serverSlug  String?
+  type        String
+  status      String   @default("pending")
+  callbackId  String?
+  request     Json?
+  response    Json?
+  error       String?
+  billID      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([platformID])
+  @@index([callbackId])
+  @@index([status])
+  @@index([type])
+}
+
+model PlatformMigration {
+  id                    String    @id @default(uuid())
+  platformID            String
+  direction             String
+  status                String    @default("pending")
+  domain                String?
+  requestedPlan         String?
+  sourcePlan            String?
+  targetPlan            String?
+  sourceServerSlug      String?
+  destinationServerSlug String?
+  sourceTarget          String?
+  destinationTarget     String?
+  records               Json?
+  request               Json?
+  response              Json?
+  error                 String?
+  startedAt             DateTime?
+  completedAt           DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([platformID])
+  @@index([direction])
+  @@index([status])
 }
 
 model PlatformSetting {

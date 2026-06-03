@@ -4448,6 +4448,209 @@ class DataBase {
         }
     }
 
+    async getPlatformServers(where = {}) {
+        try {
+            return prisma.platformServer.findMany({
+                where,
+                orderBy: { updatedAt: "desc" },
+            });
+        } catch (error) {
+            console.error("Error getting platform servers:", error);
+            throw error;
+        }
+    }
+
+    async updatePlatformServerById(id, data) {
+        if (!id || !data) return null;
+        try {
+            return prisma.platformServer.update({
+                where: { id },
+                data,
+            });
+        } catch (error) {
+            console.error("Error updating platform server:", error);
+            throw error;
+        }
+    }
+
+    async getPlatformServerBySlug(webdockSlug) {
+        if (!webdockSlug) return null;
+        try {
+            return prisma.platformServer.findUnique({
+                where: { webdockSlug },
+            });
+        } catch (error) {
+            console.error("Error getting platform server by slug:", error);
+            throw error;
+        }
+    }
+
+    async createDedicatedServerAction(data) {
+        if (!data?.platformID || !data?.type) return null;
+        try {
+            return prisma.dedicatedServerAction.create({ data });
+        } catch (error) {
+            console.error("Error creating dedicated server action:", error);
+            throw error;
+        }
+    }
+
+    async updateDedicatedServerAction(id, data) {
+        if (!id || !data) return null;
+        try {
+            return prisma.dedicatedServerAction.update({
+                where: { id },
+                data,
+            });
+        } catch (error) {
+            console.error("Error updating dedicated server action:", error);
+            throw error;
+        }
+    }
+
+    async getDedicatedServerActions(where = {}) {
+        try {
+            return prisma.dedicatedServerAction.findMany({
+                where,
+                orderBy: { createdAt: "asc" },
+            });
+        } catch (error) {
+            console.error("Error getting dedicated server actions:", error);
+            throw error;
+        }
+    }
+
+    async getPendingDedicatedServerActions() {
+        return this.getDedicatedServerActions({
+            status: { in: ["pending", "processing"] },
+            callbackId: { not: null },
+        });
+    }
+
+    async createPlatformMigration(data) {
+        if (!data?.platformID || !data?.direction) return null;
+        try {
+            return prisma.platformMigration.create({ data });
+        } catch (error) {
+            console.error("Error creating platform migration:", error);
+            throw error;
+        }
+    }
+
+    async updatePlatformMigration(id, data) {
+        if (!id || !data) return null;
+        try {
+            return prisma.platformMigration.update({
+                where: { id },
+                data,
+            });
+        } catch (error) {
+            console.error("Error updating platform migration:", error);
+            throw error;
+        }
+    }
+
+    async getPlatformMigration(id, platformID) {
+        if (!id) return null;
+        try {
+            return prisma.platformMigration.findFirst({
+                where: {
+                    id,
+                    ...(platformID ? { platformID } : {}),
+                },
+            });
+        } catch (error) {
+            console.error("Error getting platform migration:", error);
+            throw error;
+        }
+    }
+
+    async getPlatformMigrations(platformID, limit = 20) {
+        if (!platformID) return [];
+        try {
+            return prisma.platformMigration.findMany({
+                where: { platformID },
+                orderBy: { createdAt: "desc" },
+                take: limit,
+            });
+        } catch (error) {
+            console.error("Error getting platform migrations:", error);
+            throw error;
+        }
+    }
+
+    async getLatestPlatformMigration(platformID, statuses = []) {
+        if (!platformID) return null;
+        try {
+            return prisma.platformMigration.findFirst({
+                where: {
+                    platformID,
+                    ...(statuses.length ? { status: { in: statuses } } : {}),
+                },
+                orderBy: { createdAt: "desc" },
+            });
+        } catch (error) {
+            console.error("Error getting latest platform migration:", error);
+            throw error;
+        }
+    }
+
+    async getPlatformRecordCounts(platformID) {
+        if (!platformID) return {};
+        try {
+            const [
+                admins,
+                users,
+                packages,
+                payments,
+                stations,
+                pppoe,
+                pppoePlans,
+                settings,
+                funds,
+                bills,
+                ddns,
+                backups,
+                sessions,
+                notifications,
+            ] = await Promise.all([
+                prisma.admin.count({ where: { platformID } }),
+                prisma.user.count({ where: { platformID } }),
+                prisma.package.count({ where: { platformID } }),
+                prisma.mpesa.count({ where: { platformID } }),
+                prisma.station.count({ where: { platformID } }),
+                prisma.pppoe.count({ where: { platformID } }),
+                prisma.pPPoEPlan.count({ where: { platformID } }),
+                prisma.platformSetting.count({ where: { platformID } }),
+                prisma.funds.count({ where: { platformID } }),
+                prisma.bill.count({ where: { platformID } }),
+                prisma.ddns.count({ where: { platformID } }),
+                prisma.backUp.count({ where: { platformID } }),
+                prisma.session.count({ where: { platformID } }),
+                prisma.platformNotification.count({ where: { platformID } }),
+            ]);
+            return {
+                admins,
+                users,
+                packages,
+                payments,
+                stations,
+                pppoe,
+                pppoePlans,
+                settings,
+                funds,
+                bills,
+                ddns,
+                backups,
+                sessions,
+                notifications,
+            };
+        } catch (error) {
+            console.error("Error counting platform records:", error);
+            throw error;
+        }
+    }
+
     async getPlatformNotifications(platformID, includeDismissed = false) {
         if (!platformID) return [];
         try {
