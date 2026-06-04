@@ -3762,17 +3762,12 @@ class DataBase {
         const existing = await this.getDashboardStats(platformID);
         const previousStats = existing?.stats || {};
 
-        const stationOnline = options?.stationOnlineUsers?.[stationId];
-        const onlineHotspotUsers = Number.isFinite(stationOnline?.hotspot)
-            ? Number(stationOnline.hotspot)
-            : Number.isFinite(options?.onlineHotspotUsers)
-                ? options.onlineHotspotUsers
-                : Number(previousStats.totalUsersOnline) || 0;
-        const onlinePPPoEUsers = Number.isFinite(stationOnline?.pppoe)
-            ? Number(stationOnline.pppoe)
-            : Number.isFinite(options?.onlinePPPoEUsers)
-                ? options.onlinePPPoEUsers
-                : Number(previousStats.totalPPPoEUsersOnline) || 0;
+        const onlineHotspotUsers = Number.isFinite(options?.onlineHotspotUsers)
+            ? options.onlineHotspotUsers
+            : Number(previousStats.totalUsersOnline) || 0;
+        const onlinePPPoEUsers = Number.isFinite(options?.onlinePPPoEUsers)
+            ? options.onlinePPPoEUsers
+            : Number(previousStats.totalPPPoEUsersOnline) || 0;
 
         const stats = {
             totalUsers: codes.length,
@@ -4143,12 +4138,17 @@ class DataBase {
         const existing = await this.getStationDashboardStats(platformID, stationId);
         const previousStats = existing?.stats || {};
 
-        const onlineHotspotUsers = Number.isFinite(options?.onlineHotspotUsers)
-            ? options.onlineHotspotUsers
-            : Number(previousStats.totalUsersOnline) || 0;
-        const onlinePPPoEUsers = Number.isFinite(options?.onlinePPPoEUsers)
-            ? options.onlinePPPoEUsers
-            : Number(previousStats.totalPPPoEUsersOnline) || 0;
+        const stationOnline = options?.stationOnlineUsers?.[stationId];
+        const onlineHotspotUsers = Number.isFinite(stationOnline?.hotspot)
+            ? Number(stationOnline.hotspot)
+            : Number.isFinite(options?.onlineHotspotUsers)
+                ? options.onlineHotspotUsers
+                : Number(previousStats.totalUsersOnline) || 0;
+        const onlinePPPoEUsers = Number.isFinite(stationOnline?.pppoe)
+            ? Number(stationOnline.pppoe)
+            : Number.isFinite(options?.onlinePPPoEUsers)
+                ? options.onlinePPPoEUsers
+                : Number(previousStats.totalPPPoEUsersOnline) || 0;
 
         const stats = {
             totalUsers: codes.length,
