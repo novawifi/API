@@ -91,6 +91,7 @@ class MpesaController {
         const server = await this.db.upsertPlatformServer(platformID, {
             provider: "webdock",
             ...resources,
+            ...this.webdock.defaultServerDetails(platformID, platform),
             ...normalized,
             webdockSlug: normalized.webdockSlug || suggestedSlug,
             webdockStatus: normalized.webdockStatus || "provisioning",

@@ -164,27 +164,92 @@ class WebdockService {
       .slice(0, 12) || `nova${Date.now().toString().slice(-8)}`;
   }
 
+  firstString(...values) {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    }
+    return undefined;
+  }
+
+  makeDatabaseName(platformID, platform = {}) {
+    const template = process.env.DEDICATED_DATABASE_NAME_TEMPLATE || "nova_{platformID}";
+    const platformSlug = String(platform?.url || platform?.name || platformID || "platform")
+      .toLowerCase()
+      .replace(/^https?:\/\//, "")
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40);
+    return template
+      .replace(/\{platformID\}/g, String(platformID || "").toLowerCase())
+      .replace(/\{platformSlug\}/g, platformSlug || String(platformID || "").toLowerCase())
+      .replace(/[^a-z0-9_]/gi, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  defaultServerDetails(platformID, platform = {}) {
+    return {
+      rootUser: process.env.DEDICATED_SERVER_ROOT_USER || "root",
+      databaseName: this.makeDatabaseName(platformID, platform),
+      sshPort: String(process.env.DEDICATED_SERVER_SSH_PORT || 22),
+      sshStatus: "provisioning",
+    };
+  }
+
   normalizeServer(server) {
     if (!server) return {};
     const profile = server.profileData || {};
+    const credentials = server.credentials || server.serverCredentials || {};
     const shellUser =
       server.shellUser ||
       server.adminUser ||
       server.defaultShellUser ||
-      server.credentials?.shellUser ||
-      "";
+      credentials.shellUser ||
+      credentials.username;
+    const ipAddress = this.firstString(
+      server.ip,
+      server.ipv4,
+      server.ipAddress,
+      server.publicIp,
+      server.publicIPv4,
+      server.network?.ipv4,
+      server.network?.publicIp,
+    );
+    const sshPassword = this.firstString(
+      server.sshPassword,
+      server.rootPassword,
+      server.adminPassword,
+      server.shellPassword,
+      server.password,
+      credentials.sshPassword,
+      credentials.rootPassword,
+      credentials.adminPassword,
+      credentials.password,
+    );
+    const databaseName = this.firstString(
+      server.databaseName,
+      server.postgresDatabase,
+      server.postgresqlDatabase,
+      server.mysqlDatabase,
+      server.database?.name,
+    );
 
-    return {
-      webdockSlug: server.slug || server.webdockSlug || "",
-      webdockId: server.id !== undefined && server.id !== null ? String(server.id) : "",
-      webdockStatus: server.status || server.webdockStatus || "",
-      profileSlug: server.profile || server.profileSlug || profile.slug || "",
-      ipAddress: server.ip || server.ipv4 || server.ipAddress || server.publicIp || "",
-      rootUser: shellUser || server.rootUser || "",
+    const normalized = {
+      webdockSlug: this.firstString(server.slug, server.webdockSlug),
+      webdockId: server.id !== undefined && server.id !== null ? String(server.id) : undefined,
+      webdockStatus: this.firstString(server.status, server.webdockStatus),
+      profileSlug: this.firstString(server.profile, server.profileSlug, profile.slug),
+      ipAddress,
+      rootUser: this.firstString(shellUser, server.rootUser),
+      sshPassword,
       sshPort: String(server.sshPort || server.ssh_port || 22),
-      sshStatus: server.SSHPasswordAuthEnabled ? "password enabled" : "key only",
-      nginxStatus: String(server.webServer || "").toLowerCase() === "nginx" ? "active" : "",
-      databaseName: server.databaseName || server.mysqlDatabase || "",
+      sshStatus: sshPassword
+        ? "password available"
+        : server.SSHPasswordAuthEnabled
+          ? "password enabled"
+          : "key only",
+      nginxStatus: String(server.webServer || "").toLowerCase() === "nginx" ? "active" : undefined,
+      databaseName,
       providerData: server,
       cpuThreads: profile?.cpu?.threads || server.cpuThreads || undefined,
       ramGb: profile?.ram ? Math.round(Number(profile.ram) / 1024) : undefined,
@@ -193,6 +258,7 @@ class WebdockService {
       lastSyncedAt: new Date(),
       pendingDeletionAt: server.pendingDeletion ? new Date() : null,
     };
+    return Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== undefined));
   }
 
   latestSamplingValue(sampling) {

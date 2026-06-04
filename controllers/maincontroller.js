@@ -8410,6 +8410,7 @@ class Controller {
     const server = await this.db.upsertPlatformServer(platformID, {
       provider: "webdock",
       ...resources,
+      ...this.webdock.defaultServerDetails(platformID, platform),
       ...normalized,
       webdockSlug: normalized.webdockSlug || suggestedSlug,
       webdockStatus: normalized.webdockStatus || "provisioning",
@@ -8819,8 +8820,15 @@ class Controller {
         platform,
         server: liveServer,
         health: {
-          ...health,
+          dedicated: {
+            status: liveServer?.webdockStatus || "not provisioned",
+            ssh: liveServer?.sshStatus || "not ready",
+            nginx: liveServer?.nginxStatus || "unknown",
+            database: liveServer?.databaseName ? "configured" : "not configured",
+            checkedAt: new Date().toISOString(),
+          },
           webdock: providerHealth,
+          sharedPortal: health,
         },
         pricing: this.getDedicatedServerPricing(),
         webdockConfigured: this.webdock.isConfigured(),
@@ -8864,27 +8872,10 @@ class Controller {
       if (String(platform?.subscriptionPlan || "").toLowerCase() !== "professional") {
         return res.json({ success: false, message: "Dedicated server plan not active" });
       }
-
-      const services = this.getRestartableServerServices();
-      const selected = services[String(service).toLowerCase()];
-      if (!selected) return res.json({ success: false, message: "Unsupported service" });
-
-      let lastMessage = "";
-      for (const candidate of selected.candidates) {
-        const restarted = await this.runSystemctl("restart", candidate);
-        if (restarted.success) {
-          const status = await this.runSystemctl("is-active", candidate);
-          return res.json({
-            success: true,
-            message: `${selected.label} restarted`,
-            service: String(service).toLowerCase(),
-            status: status.success ? status.message || "active" : "unknown",
-          });
-        }
-        lastMessage = restarted.message;
-      }
-
-      return res.json({ success: false, message: lastMessage || `Failed to restart ${selected.label}` });
+      return res.json({
+        success: false,
+        message: "Dedicated server remote service restart is not configured yet.",
+      });
     } catch (error) {
       console.error("Dedicated server service restart error:", error);
       return res.json({ success: false, message: "Failed to restart service" });
