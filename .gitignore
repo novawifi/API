@@ -9,6 +9,7 @@ seed.js
 backups
 files
 d.sh
+public
 
 # Testing
 /coverage
