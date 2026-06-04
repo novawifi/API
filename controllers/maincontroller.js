@@ -1,5 +1,3 @@
-//@ts-check
-
 const axios = require("axios");
 const https = require("https");
 const crypto = require("crypto");
@@ -41,6 +39,16 @@ class Controller {
     this.ENVIRONMENT = process.env.ENVIRONMENT || process.env.NODE_ENV;
     this.PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || "";
     this.JWT_SECRET = process.env.JWT_SECRET || "";
+    // Ensure older DB implementations without upsertPlatformNotification don't crash
+    try {
+      if (this.db && typeof this.db.upsertPlatformNotification !== "function" && typeof this.db.createPlatformNotification === "function") {
+        this.db.upsertPlatformNotification = async (platformID, title, data) => {
+          return this.db.createPlatformNotification({ platformID, title, ...data });
+        };
+      }
+    } catch (e) {
+      console.warn("Error setting up db.upsertPlatformNotification fallback:", e);
+    }
   }
 
   logPlatform(platformID, message, meta = {}) {
@@ -170,6 +178,23 @@ class Controller {
       dueDate = Utils.addPeriod(dueDate, value, unit);
     }
     return dueDate;
+  }
+
+  async notifyPlatform(platformID, title, data) {
+    if (!platformID || !title) return null;
+    try {
+      if (this.db && typeof this.db.upsertPlatformNotification === "function") {
+        return await this.db.upsertPlatformNotification(platformID, title, data);
+      }
+      if (this.db && typeof this.db.createPlatformNotification === "function") {
+        return await this.db.createPlatformNotification({ platformID, title, ...data });
+      }
+      console.warn("notifyPlatform: no suitable db notification method available");
+      return null;
+    } catch (error) {
+      console.error("Error notifying platform:", error);
+      return null;
+    }
   }
 
   async ensurePlatformBillingService(platformID) {
@@ -1232,9 +1257,8 @@ class Controller {
       if (!auth.success || !auth.admin) {
         return res.json({ success: false, message: auth.message });
       }
-      const platformID = auth.admin.platformID;
-      await this.enforcePlatformSubscription(platformID);
-      const notifications = await this.db.getPlatformNotifications(platformID);
+      const includeDismissed = Boolean(req.body?.includeDismissed);
+      const notifications = await this.db.getPlatformNotifications(auth.admin.platformID, includeDismissed);
       return res.json({ success: true, notifications });
     } catch (error) {
       console.error("Error fetching platform notifications:", error);
@@ -1252,7 +1276,7 @@ class Controller {
       if (!auth.success || !auth.admin) {
         return res.json({ success: false, message: auth.message });
       }
-      await this.db.dismissPlatformNotification(id, auth.admin.platformID);
+      await this.db.dismissPlatformNot(id, auth.admin.platformID);
       return res.json({ success: true, message: "Notification dismissed." });
     } catch (error) {
       console.error("Error dismissing platform notification:", error);
@@ -3075,16 +3099,16 @@ class Controller {
       supportPhone,
       brandingImage,
     } = data;
-	    try {
-	      const existingConfig = await this.db.getPlatformConfig(platformID);
-	      const b2bShortCodeType = ["till", "paybill"].includes(String(mpesaShortCodeType || "").toLowerCase())
-	        ? mpesaShortCodeType
-	        : "Till";
-	      const c2bShortCodeType = ["till", "paybill"].includes(String(mpesaC2BShortCodeType || "").toLowerCase())
-	        ? mpesaC2BShortCodeType
-	        : "Till";
-	      if (IsC2B === true) {
-	        if (!mpesaC2BShortCode || !mpesaC2BShortCodeType || !adminID) {
+    try {
+      const existingConfig = await this.db.getPlatformConfig(platformID);
+      const b2bShortCodeType = ["till", "paybill"].includes(String(mpesaShortCodeType || "").toLowerCase())
+        ? mpesaShortCodeType
+        : "Till";
+      const c2bShortCodeType = ["till", "paybill"].includes(String(mpesaC2BShortCodeType || "").toLowerCase())
+        ? mpesaC2BShortCodeType
+        : "Till";
+      if (IsC2B === true) {
+        if (!mpesaC2BShortCode || !mpesaC2BShortCodeType || !adminID) {
           return res.json({
             success: false,
             message: "All MPESA fields must be filled out!",
@@ -3108,16 +3132,16 @@ class Controller {
           return res.json({
             success: false,
             message: "All MPESA fields must be filled out!",
-	          });
-	        }
-	      }
-	      const payload = {
-	        ...data,
-	        mpesaShortCodeType: b2bShortCodeType,
-	        mpesaC2BShortCodeType: c2bShortCodeType,
-	      };
-	      if (!existingConfig) {
-	        const add = await this.db.createPlatformConfig(platformID, payload);
+          });
+        }
+      }
+      const payload = {
+        ...data,
+        mpesaShortCodeType: b2bShortCodeType,
+        mpesaC2BShortCodeType: c2bShortCodeType,
+      };
+      if (!existingConfig) {
+        const add = await this.db.createPlatformConfig(platformID, payload);
         await this.refreshDashboardStats(platformID, { role: auth.admin.role });
         this.cache.del(`main:settings:${platformID}`);
         return res.json({
@@ -3126,7 +3150,7 @@ class Controller {
         });
       }
 
-	      const updatedConfig = await this.db.updatePlatformConfig(platformID, payload);
+      const updatedConfig = await this.db.updatePlatformConfig(platformID, payload);
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
       this.cache.del(`main:settings:${platformID}`);
       return res.json({
@@ -3288,17 +3312,17 @@ class Controller {
         }
         const rateLimit = `${speed}M/${speed}M`;
 
-	        const profileUpdate = await this.mikrotik.updateMikrotikProfile(
-	          platformID,
-	          packagename,
-	          name,
-	          rateLimit,
-	          pool,
-	          host,
-	          devices,
-	          period,
-	          category,
-	        )
+        const profileUpdate = await this.mikrotik.updateMikrotikProfile(
+          platformID,
+          packagename,
+          name,
+          rateLimit,
+          pool,
+          host,
+          devices,
+          period,
+          category,
+        )
         if (!profileUpdate.success) {
           return res.json({
             success: false,
@@ -4156,93 +4180,93 @@ class Controller {
         }
       }
 
-	      const targetInternalHost = String(mikrotikHost || "").trim().split("/")[0];
-	      const targetPublicKey = String(mikrotikPublicKey || "").trim();
-	      const peerBlock = [
-	        "[Peer]",
-	        `PublicKey = ${targetPublicKey}`,
-	        `Endpoint = ${endpointHost}:13231`,
-	        `AllowedIPs = ${targetInternalHost}/32`,
-	        "PersistentKeepalive = 10",
-	      ].join("\n");
+      const targetInternalHost = String(mikrotikHost || "").trim().split("/")[0];
+      const targetPublicKey = String(mikrotikPublicKey || "").trim();
+      const peerBlock = [
+        "[Peer]",
+        `PublicKey = ${targetPublicKey}`,
+        `Endpoint = ${endpointHost}:13231`,
+        `AllowedIPs = ${targetInternalHost}/32`,
+        "PersistentKeepalive = 10",
+      ].join("\n");
 
       const wgConfPath = "/etc/wireguard/wg0.conf";
 
-	      exec(`sudo -n cat ${wgConfPath}`, (readErr, fileData) => {
-	        if (readErr) {
-	          return res.json({ success: false, message: "WireGuard config read failed." });
-	        }
+      exec(`sudo -n cat ${wgConfPath}`, (readErr, fileData) => {
+        if (readErr) {
+          return res.json({ success: false, message: "WireGuard config read failed." });
+        }
 
-	        try {
-	          fs.writeFileSync(`/tmp/wg0.conf.bak-${Date.now()}`, fileData, "utf8");
-	        } catch (backupErr) {
-	          console.warn("WireGuard backup skipped:", backupErr?.message || backupErr);
-	        }
+        try {
+          fs.writeFileSync(`/tmp/wg0.conf.bak-${Date.now()}`, fileData, "utf8");
+        } catch (backupErr) {
+          console.warn("WireGuard backup skipped:", backupErr?.message || backupErr);
+        }
 
-		        const blocks = fileData.toString().replace(/\r\n/g, "\n").split(/\n(?=\s*\[Peer\])/);
+        const blocks = fileData.toString().replace(/\r\n/g, "\n").split(/\n(?=\s*\[Peer\])/);
 
-		        const extractInternalHost = (block) => {
-		          const match = String(block || "").match(/AllowedIPs\s*=\s*(10\.10\.10\.\d{1,3})\/32\b/i);
-		          return match?.[1] ? String(match[1]).trim() : "";
-		        };
-		        const extractPublicKey = (block) => {
-		          const match = String(block || "").match(/PublicKey\s*=\s*(.+)/i);
-		          return match?.[1] ? String(match[1]).trim() : "";
-		        };
-		        const isPeerBlock = (block) => String(block || "").trimStart().startsWith("[Peer]");
-		        const normalizeBlock = (block) =>
-		          String(block || "")
-		            .replace(/\r\n/g, "\n")
-		            .split("\n")
-		            .map((line) => line.trim())
-		            .filter(Boolean)
-		            .join("\n");
+        const extractInternalHost = (block) => {
+          const match = String(block || "").match(/AllowedIPs\s*=\s*(10\.10\.10\.\d{1,3})\/32\b/i);
+          return match?.[1] ? String(match[1]).trim() : "";
+        };
+        const extractPublicKey = (block) => {
+          const match = String(block || "").match(/PublicKey\s*=\s*(.+)/i);
+          return match?.[1] ? String(match[1]).trim() : "";
+        };
+        const isPeerBlock = (block) => String(block || "").trimStart().startsWith("[Peer]");
+        const normalizeBlock = (block) =>
+          String(block || "")
+            .replace(/\r\n/g, "\n")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .join("\n");
 
-		        const seenIPs = new Set();
-		        const seenKeys = new Set();
-	        const cleaned = [];
-	        let updatedPeerInserted = false;
+        const seenIPs = new Set();
+        const seenKeys = new Set();
+        const cleaned = [];
+        let updatedPeerInserted = false;
 
-	        for (const rawBlock of blocks) {
-	          const block = String(rawBlock || "");
-	          if (!isPeerBlock(block)) {
-	            cleaned.push(block.trim());
-	            continue;
-	          }
+        for (const rawBlock of blocks) {
+          const block = String(rawBlock || "");
+          if (!isPeerBlock(block)) {
+            cleaned.push(block.trim());
+            continue;
+          }
 
-		          const internalHost = extractInternalHost(block);
-		          const publicKey = extractPublicKey(block);
-		          const isTargetPeer = internalHost && targetInternalHost && internalHost === targetInternalHost;
+          const internalHost = extractInternalHost(block);
+          const publicKey = extractPublicKey(block);
+          const isTargetPeer = internalHost && targetInternalHost && internalHost === targetInternalHost;
 
-		          if (isTargetPeer) {
-		            if (!updatedPeerInserted) {
-		              cleaned.push(peerBlock);
-		              if (targetInternalHost) seenIPs.add(targetInternalHost);
-		              if (targetPublicKey) seenKeys.add(targetPublicKey);
-		              updatedPeerInserted = true;
-		            }
-		            continue;
-		          }
+          if (isTargetPeer) {
+            if (!updatedPeerInserted) {
+              cleaned.push(peerBlock);
+              if (targetInternalHost) seenIPs.add(targetInternalHost);
+              if (targetPublicKey) seenKeys.add(targetPublicKey);
+              updatedPeerInserted = true;
+            }
+            continue;
+          }
 
-		          if (internalHost && seenIPs.has(internalHost)) continue;
-		          if (publicKey && seenKeys.has(publicKey)) continue;
+          if (internalHost && seenIPs.has(internalHost)) continue;
+          if (publicKey && seenKeys.has(publicKey)) continue;
 
-		          if (targetPublicKey && publicKey && publicKey === targetPublicKey) continue;
+          if (targetPublicKey && publicKey && publicKey === targetPublicKey) continue;
 
-		          if (internalHost) seenIPs.add(internalHost);
-		          if (publicKey) seenKeys.add(publicKey);
-		          cleaned.push(normalizeBlock(block));
-		        }
+          if (internalHost) seenIPs.add(internalHost);
+          if (publicKey) seenKeys.add(publicKey);
+          cleaned.push(normalizeBlock(block));
+        }
 
-		        if (!updatedPeerInserted) {
-		          cleaned.push(peerBlock);
-		        }
+        if (!updatedPeerInserted) {
+          cleaned.push(peerBlock);
+        }
 
-		        const newConfig = cleaned
-		          .map(b => normalizeBlock(b))
-		          .filter(Boolean)
-		          .join("\n\n")
-		          .trim() + "\n";
+        const newConfig = cleaned
+          .map(b => normalizeBlock(b))
+          .filter(Boolean)
+          .join("\n\n")
+          .trim() + "\n";
 
         const wgTmpPath = `/tmp/wg.${Date.now()}.conf`;
         fs.writeFile(wgTmpPath, newConfig, async (writeErr) => {
@@ -4250,41 +4274,41 @@ class Controller {
             return res.json({ success: false, message: "WireGuard config write failed." });
           }
 
-	          exec(`sudo -n /bin/mv ${wgTmpPath} ${wgConfPath}`, () => {
-	            exec("sudo -n /usr/bin/wg-quick down wg0", () => {
-	                  exec("sudo -n /usr/bin/wg-quick up wg0", async (upErr) => {
-                    if (upErr) {
-                      return res.json({ success: false, message: "WireGuard restart failed." });
-                    }
+          exec(`sudo -n /bin/mv ${wgTmpPath} ${wgConfPath}`, () => {
+            exec("sudo -n /usr/bin/wg-quick down wg0", () => {
+              exec("sudo -n /usr/bin/wg-quick up wg0", async (upErr) => {
+                if (upErr) {
+                  return res.json({ success: false, message: "WireGuard restart failed." });
+                }
 
-                    if (!station) {
-                      const siteUser = Utils.generateUsername();
-                      const siteUserPassword = Utils.generateRandomString();
-                      if (!siteUser || !siteUserPassword) {
-                        return res.json({ success: false, message: "Internal configuration error" });
-                      }
+                if (!station) {
+                  const siteUser = Utils.generateUsername();
+                  const siteUserPassword = Utils.generateRandomString();
+                  if (!siteUser || !siteUserPassword) {
+                    return res.json({ success: false, message: "Internal configuration error" });
+                  }
 
-                      const addProxy = await this.addReverseProxySite(WebfigHost, `http://${mikrotikHost}`);
-                      if (!addProxy.success) {
-                        return res.json({ success: false, message: "Reverse proxy creation failed." });
-                      }
+                  const addProxy = await this.addReverseProxySite(WebfigHost, `http://${mikrotikHost}`);
+                  if (!addProxy.success) {
+                    return res.json({ success: false, message: "Reverse proxy creation failed." });
+                  }
 
-                      // SSL handled via wildcard certificate; skip per-host install.
-                    }
+                  // SSL handled via wildcard certificate; skip per-host install.
+                }
 
-                    const seedScripts = await this.mikrotik.seedStationScriptsOnConnect(platformID, {
-                      mikrotikHost: stationResult?.mikrotikHost || mikrotikHost,
-                      systemBasis: stationResult?.systemBasis || systemBasis || "API",
-                    });
+                const seedScripts = await this.mikrotik.seedStationScriptsOnConnect(platformID, {
+                  mikrotikHost: stationResult?.mikrotikHost || mikrotikHost,
+                  systemBasis: stationResult?.systemBasis || systemBasis || "API",
+                });
 
-                    await this.refreshDashboardStats(platformID, { role: auth.admin.role });
-                    return res.json({
-                      success: true,
-                      message: `${responseMessage} and WireGuard updated.`,
-                      station: stationResult,
-                      seedScripts,
-	            });
-	          });
+                await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+                return res.json({
+                  success: true,
+                  message: `${responseMessage} and WireGuard updated.`,
+                  station: stationResult,
+                  seedScripts,
+                });
+              });
             });
           });
         });
@@ -4499,8 +4523,8 @@ class Controller {
       const mergeIds =
         existingGroupIds.length > 1
           ? stations
-              .filter((s) => s.linkGroupId && existingGroupIds.includes(s.linkGroupId))
-              .map((s) => s.id)
+            .filter((s) => s.linkGroupId && existingGroupIds.includes(s.linkGroupId))
+            .map((s) => s.id)
           : [];
       const idsToUpdate = Array.from(new Set([...mergeIds, ...selected.map((s) => s.id)]));
 

@@ -1,4 +1,3 @@
-//@ts-check
 
 const prisma = require("../prisma");
 const { Prisma } = require("@prisma/client");
@@ -4710,7 +4709,7 @@ class DataBase {
         }
     }
 
-    async dismissPlatformNotification(id, platformID) {
+    async dismissPlatformNot(id, platformID) {
         if (!id || !platformID) return null;
         try {
             return prisma.platformNotification.updateMany({

@@ -1,4 +1,3 @@
-//@ts-check
 
 class Mikrotik {
     async addSecret(channel, { name, password, service = 'pppoe', profile = 'default', disabled = 'false' }) {

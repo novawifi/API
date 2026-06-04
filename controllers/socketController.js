@@ -1,4 +1,3 @@
-// @ts-check
 
 const socketIo = require("socket.io");
 const { DataBase } = require("../helpers/databaseOperation");

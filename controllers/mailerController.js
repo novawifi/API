@@ -1,4 +1,3 @@
-// @ts-check
 
 const { MailerConnection } = require("../configs/mailerConfig");
 const { DataBase } = require("../helpers/databaseOperation");
