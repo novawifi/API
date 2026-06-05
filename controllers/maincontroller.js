@@ -6985,6 +6985,7 @@ class Controller {
       platformID,
       host,
       hash: options.hash || getHotspotHash(host),
+      preview: Boolean(options.preview),
     });
   }
 
@@ -7007,7 +7008,7 @@ class Controller {
     }
 
     try {
-      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req });
+      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req, preview: true });
       return res
         .status(200)
         .set("Content-Type", "text/html; charset=utf-8")
