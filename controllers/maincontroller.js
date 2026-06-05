@@ -7751,6 +7751,12 @@ class Controller {
         message: "Invalid platform URL. Use letters, numbers, dots, and hyphens only.",
       });
     }
+    if (this.isReservedPlatformSubdomain(sanitizedUrl)) {
+      return res.status(400).json({
+        success: false,
+        message: "Choose a different DNS subdomain name.",
+      });
+    }
 
     try {
       const checkplatform = await this.db.getPlatformByURLData(sanitizedUrl);
@@ -7941,6 +7947,38 @@ class Controller {
     if (!/^[a-z0-9.-]+$/.test(normalized)) return null;
     if (normalized.includes("..") || normalized.includes("/") || normalized.startsWith(".") || normalized.endsWith(".")) return null;
     return normalized;
+  }
+
+  getReservedPlatformSubdomains() {
+    return new Set([
+      "admin", "administrator", "api", "app", "apps", "assets", "auth", "billing", "blog", "cdn",
+      "console", "cpanel", "dashboard", "db", "demo", "dev", "docs", "download", "downloads",
+      "email", "faq", "faqs", "files", "ftp", "gateway", "git", "help", "host", "hosting",
+      "imap", "internal", "jobs", "login", "mail", "manage", "manager", "metrics", "monitor",
+      "monitoring", "mx", "new", "news", "nova", "novawifi", "ns", "ns1", "ns2", "panel",
+      "pay", "payments", "pop", "pop3", "portal", "privacy", "prod", "production", "radius",
+      "register", "reports", "root", "router", "routers", "server", "servers", "service",
+      "services", "smtp", "ssh", "ssl", "staging", "status", "support", "sys", "system",
+      "terms", "test", "testing", "updates", "vps", "web", "webfig", "webmail", "www",
+    ]);
+  }
+
+  getPlatformDnsSubdomain(domain) {
+    const normalized = this.sanitizeDomain(domain);
+    if (!normalized) return "";
+    const baseDomain = this.sanitizeDomain(process.env.DOMAIN || "novawifi.co.ke");
+    if (baseDomain && normalized === baseDomain) return normalized.split(".")[0] || "";
+    if (baseDomain && normalized.endsWith(`.${baseDomain}`)) {
+      const subdomain = normalized.slice(0, -(`.${baseDomain}`).length);
+      return subdomain.split(".")[0] || "";
+    }
+    if (!normalized.includes(".")) return normalized;
+    return "";
+  }
+
+  isReservedPlatformSubdomain(domain) {
+    const subdomain = this.getPlatformDnsSubdomain(domain);
+    return Boolean(subdomain && this.getReservedPlatformSubdomains().has(subdomain));
   }
 
   buildNginxConfig(domain, targetUrl) {
