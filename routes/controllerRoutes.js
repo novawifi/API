@@ -95,6 +95,11 @@ router.post("/server/resize/preview", use("previewDedicatedServerResize"));
 router.post("/server/resize", use("resizeDedicatedServer"));
 router.post("/server/migrations", use("fetchPlatformMigrations"));
 router.post("/server/migrate", use("migratePlatformHosting"));
+router.get("/dedicated/agent/config", use("dedicatedAgentConfig"));
+router.post("/dedicated/agent/config", use("dedicatedAgentConfig"));
+router.post("/dedicated/agent/heartbeat", use("dedicatedAgentHeartbeat"));
+router.post("/dedicated/agent/event", use("dedicatedAgentEvent"));
+router.post("/dedicated/agent/service", use("dedicatedAgentService"));
 router.post("/funds", use("fetchFunds"));
 router.post("/sessions", use("fetchSessions"));
 router.post("/deleteSession", use("deleteMySession"))

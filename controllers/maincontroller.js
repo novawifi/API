@@ -509,6 +509,7 @@ class Controller {
       await this.intasendRequest("post", `/api/v1/subscriptions/${cardAutopay.subscriptionID}/unsubscribe/`, {});
       await this.updateBillCardAutopay(bill, {
         status: "CANCELED",
+        setupUrl: null,
         canceledAt: new Date().toISOString(),
       });
       return res.json({ success: true, message: "Card billing canceled." });
@@ -8894,6 +8895,231 @@ class Controller {
     } catch (error) {
       console.error("Dedicated server service restart error:", error);
       return res.json({ success: false, message: "Failed to restart service" });
+    }
+  }
+
+  getDedicatedAgentToken(req) {
+    const authHeader = String(req.headers?.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    return String(
+      req.headers?.["x-nova-agent-token"] ||
+      req.body?.agentToken ||
+      req.query?.agentToken ||
+      authHeader ||
+      ""
+    ).trim();
+  }
+
+  safeCompareSecret(left, right) {
+    const a = Buffer.from(String(left || ""));
+    const b = Buffer.from(String(right || ""));
+    if (!a.length || !b.length || a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
+
+  async authenticateDedicatedAgent(req) {
+    const expected = process.env.DEDICATED_AGENT_SECRET || "";
+    if (!expected) return { success: false, message: "Dedicated agent secret is not configured." };
+
+    const token = this.getDedicatedAgentToken(req);
+    if (!this.safeCompareSecret(token, expected)) {
+      return { success: false, message: "Unauthorised dedicated agent." };
+    }
+
+    const platformID = String(
+      req.headers?.["x-nova-platform-id"] ||
+      req.body?.platformID ||
+      req.query?.platformID ||
+      ""
+    ).trim();
+    if (!platformID) return { success: false, message: "Missing platformID." };
+
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    if (!platform) return { success: false, message: "Platform not found." };
+    if (this.normalizePlatformPlan(platform.subscriptionPlan) !== "professional") {
+      return { success: false, message: "Dedicated server plan not active." };
+    }
+
+    return { success: true, platformID, platform };
+  }
+
+  getPublicPlatformConfig(config) {
+    if (!config) return {};
+    return {
+      IsC2B: Boolean(config.IsC2B),
+      IsAPI: Boolean(config.IsAPI),
+      IsB2B: Boolean(config.IsB2B),
+      supportPhone: config.supportPhone || "",
+      brandingImage: config.brandingImage || "",
+      template: config.template || "",
+      sms: Boolean(config.sms),
+      mpesaShortCodeType: config.mpesaShortCodeType || "",
+      mpesaC2BShortCodeType: config.mpesaC2BShortCodeType || "",
+    };
+  }
+
+  async dedicatedAgentConfig(req, res) {
+    try {
+      const access = await this.authenticateDedicatedAgent(req);
+      if (!access.success) return res.status(401).json(access);
+
+      const [config, server] = await Promise.all([
+        this.db.getPlatformConfig(access.platformID),
+        this.db.getPlatformServer(access.platformID),
+      ]);
+
+      return res.json({
+        success: true,
+        platform: {
+          platformID: access.platform.platformID,
+          name: access.platform.name,
+          url: access.platform.url,
+          domain: access.platform.domain,
+          status: access.platform.status,
+          subscriptionPlan: this.normalizePlatformPlan(access.platform.subscriptionPlan),
+        },
+        settings: this.getPublicPlatformConfig(config),
+        server,
+        centralServices: {
+          baseUrl: process.env.PUBLIC_API_URL || process.env.SERVER_URL || "https://api.novawifi.co.ke",
+          allowed: ["mpesa", "mail", "sms", "notification"],
+        },
+      });
+    } catch (error) {
+      console.error("Dedicated agent config error:", error);
+      return res.status(500).json({ success: false, message: "Failed to load dedicated config." });
+    }
+  }
+
+  async dedicatedAgentHeartbeat(req, res) {
+    try {
+      const access = await this.authenticateDedicatedAgent(req);
+      if (!access.success) return res.status(401).json(access);
+
+      const payload = req.body || {};
+      const health = payload.health && typeof payload.health === "object" ? payload.health : {};
+      const services = payload.services && typeof payload.services === "object" ? payload.services : {};
+      const metrics = payload.metrics && typeof payload.metrics === "object" ? payload.metrics : {};
+      const remoteAddress = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "")
+        .split(",")[0]
+        .replace(/^::ffff:/, "")
+        .trim();
+      const existing = await this.db.getPlatformServer(access.platformID);
+      const providerData = existing?.providerData && typeof existing.providerData === "object"
+        ? { ...existing.providerData }
+        : {};
+      providerData.dedicatedAgent = {
+        hostname: payload.hostname || "",
+        version: payload.version || "",
+        platformID: access.platformID,
+        services,
+        remoteAddress,
+        lastHeartbeatAt: new Date().toISOString(),
+      };
+
+      const server = await this.db.upsertPlatformServer(access.platformID, {
+        provider: existing?.provider || "dedicated",
+        webdockStatus: payload.status || "active",
+        ipAddress: payload.ipAddress || existing?.ipAddress || remoteAddress,
+        sshStatus: health.ssh || existing?.sshStatus || "",
+        nginxStatus: health.nginx || existing?.nginxStatus || "",
+        databaseName: health.databaseName || existing?.databaseName || "",
+        instantMetrics: metrics,
+        metrics: health,
+        providerData,
+        lastSyncedAt: new Date(),
+      });
+
+      return res.json({ success: true, message: "Heartbeat received.", server });
+    } catch (error) {
+      console.error("Dedicated agent heartbeat error:", error);
+      return res.status(500).json({ success: false, message: "Failed to save heartbeat." });
+    }
+  }
+
+  async dedicatedAgentEvent(req, res) {
+    try {
+      const access = await this.authenticateDedicatedAgent(req);
+      if (!access.success) return res.status(401).json(access);
+
+      const title = String(req.body?.title || "Dedicated server event").slice(0, 120);
+      const message = String(req.body?.message || "").slice(0, 600);
+      const status = String(req.body?.status || "info").toLowerCase();
+      const safeStatus = ["info", "success", "warning", "error"].includes(status) ? status : "info";
+
+      await this.notifyPlatform(access.platformID, title, {
+        message,
+        status: safeStatus,
+        actionLabel: "View Server",
+        actionUrl: "/admin/server",
+      });
+
+      return res.json({ success: true, message: "Event received." });
+    } catch (error) {
+      console.error("Dedicated agent event error:", error);
+      return res.status(500).json({ success: false, message: "Failed to save event." });
+    }
+  }
+
+  async dedicatedAgentService(req, res) {
+    try {
+      const access = await this.authenticateDedicatedAgent(req);
+      if (!access.success) return res.status(401).json(access);
+
+      const service = String(req.body?.service || "").toLowerCase();
+      const action = String(req.body?.action || "").trim();
+      const payload = req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : {};
+
+      if (service === "mpesa") {
+        const allowed = {
+          stkPush: "stkPush",
+          payPPPoE: "payPPPoE",
+          payBill: "payBill",
+          paySMS: "paySMS",
+          checkPayment: "checkPayment",
+          verifyTransaction: "verifyTransaction",
+        };
+        const method = allowed[action];
+        if (!method || typeof this.mpesa[method] !== "function") {
+          return res.status(400).json({ success: false, message: "Unsupported MPESA action." });
+        }
+        const forwardedReq = { ...req, body: payload };
+        return this.mpesa[method].call(this.mpesa, forwardedReq, res);
+      }
+
+      if (service === "mail") {
+        if (action === "sendInternalEmail") {
+          const result = await this.mailer.sendInternalEmail(payload);
+          return res.json(result);
+        }
+        if (action === "EmailTemplate") {
+          const result = await this.mailer.EmailTemplate(payload);
+          return res.json(result);
+        }
+        return res.status(400).json({ success: false, message: "Unsupported mail action." });
+      }
+
+      if (service === "sms") {
+        if (action !== "sendInternalSMS") {
+          return res.status(400).json({ success: false, message: "Unsupported SMS action." });
+        }
+        const result = await this.sms.sendInternalSMS(payload.phone, payload.message);
+        return res.json(result);
+      }
+
+      if (service === "notification") {
+        const result = await this.notifyPlatform(access.platformID, payload.title, {
+          message: payload.message || "",
+          status: payload.status || "info",
+          actionLabel: payload.actionLabel,
+          actionUrl: payload.actionUrl,
+        });
+        return res.json({ success: true, notification: result });
+      }
+
+      return res.status(400).json({ success: false, message: "Unsupported central service." });
+    } catch (error) {
+      console.error("Dedicated agent service error:", error);
+      return res.status(500).json({ success: false, message: "Central service request failed." });
     }
   }
 
