@@ -9,7 +9,7 @@ seed.js
 backups
 files
 d.sh
-public/routeros
+/public/routeros
 
 # Testing
 /coverage
