@@ -4622,6 +4622,28 @@ class MpesaController {
             await this.db.updatePlatform(bill.platformID, {
                 status: "active"
             })
+            if (
+                bill.meta?.serviceKey === "billing" &&
+                String(bill.meta?.plan || "").toLowerCase() === "professional"
+            ) {
+                const server = await this.db.getPlatformServer(bill.platformID);
+                const providerData = server?.providerData && typeof server.providerData === "object"
+                    ? { ...server.providerData }
+                    : {};
+                providerData.dedicatedBillingGrace = {
+                    ...(providerData.dedicatedBillingGrace || {}),
+                    status: "paid",
+                    failureCount: 0,
+                    billID,
+                    resolvedAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                };
+                await this.db.upsertPlatformServer(bill.platformID, {
+                    provider: server?.provider || "dedicated",
+                    providerData,
+                    ...(String(server?.webdockStatus || "").toLowerCase() === "inactive" ? { webdockStatus: "active" } : {}),
+                });
+            }
             try {
                 await this.applyPaidDedicatedServerResize(bill.platformID, billId);
                 if (bill.meta?.serviceKey === "billing" && bill.meta?.plan === "professional") {

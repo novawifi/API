@@ -378,6 +378,113 @@ class Controller {
     };
   }
 
+  getDedicatedCardGracePolicy() {
+    return {
+      retryLimit: Number(process.env.DEDICATED_CARD_RETRY_LIMIT || 5),
+      graceMs: Number(process.env.DEDICATED_CARD_GRACE_MS || 2 * 24 * 60 * 60 * 1000),
+    };
+  }
+
+  isDedicatedBillingBill(bill) {
+    const meta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
+    return meta.serviceKey === "billing" && this.normalizePlatformPlan(meta.plan) === "professional";
+  }
+
+  isDedicatedPaymentDeactivated(server) {
+    const providerData = server?.providerData && typeof server.providerData === "object" ? server.providerData : {};
+    const grace = providerData.dedicatedBillingGrace || {};
+    return grace.status === "deactivated" || String(server?.webdockStatus || "").toLowerCase() === "inactive";
+  }
+
+  async updateDedicatedBillingGrace(platformID, data) {
+    if (!platformID) return null;
+    const existing = await this.db.getPlatformServer(platformID);
+    const providerData = existing?.providerData && typeof existing.providerData === "object"
+      ? { ...existing.providerData }
+      : {};
+    providerData.dedicatedBillingGrace = {
+      ...(providerData.dedicatedBillingGrace || {}),
+      ...data,
+      updatedAt: new Date().toISOString(),
+    };
+    return this.db.upsertPlatformServer(platformID, {
+      provider: existing?.provider || "dedicated",
+      providerData,
+      ...(data.status === "deactivated" ? { webdockStatus: "inactive" } : {}),
+      ...(data.status === "paid" && String(existing?.webdockStatus || "").toLowerCase() === "inactive" ? { webdockStatus: "active" } : {}),
+    });
+  }
+
+  async applyDedicatedCardPaymentGrace(bill, paymentStatus, reason = "") {
+    if (!bill || !this.isDedicatedBillingBill(bill)) return;
+
+    const normalizedStatus = String(paymentStatus || "").toUpperCase();
+    if (normalizedStatus === "COMPLETE") {
+      await this.updateBillCardAutopay(bill, {
+        dedicatedGrace: {
+          status: "paid",
+          failureCount: 0,
+          resolvedAt: new Date().toISOString(),
+        },
+      });
+      await this.updateDedicatedBillingGrace(bill.platformID, {
+        status: "paid",
+        failureCount: 0,
+        billID: bill.id,
+        resolvedAt: new Date().toISOString(),
+      });
+      await this.db.updatePlatform(bill.platformID, { status: "active" });
+      return;
+    }
+
+    if (normalizedStatus !== "FAILED") return;
+
+    const policy = this.getDedicatedCardGracePolicy();
+    const cardAutopay = this.getBillCardAutopay(bill) || {};
+    const currentGrace = cardAutopay.dedicatedGrace && typeof cardAutopay.dedicatedGrace === "object"
+      ? cardAutopay.dedicatedGrace
+      : {};
+    const now = Date.now();
+    const firstFailedAt = currentGrace.firstFailedAt || new Date(now).toISOString();
+    const graceEndsAt = currentGrace.graceEndsAt || new Date(new Date(firstFailedAt).getTime() + policy.graceMs).toISOString();
+    const failureCount = Number(currentGrace.failureCount || 0) + 1;
+    const shouldDeactivate = failureCount >= policy.retryLimit || now >= new Date(graceEndsAt).getTime();
+    const grace = {
+      status: shouldDeactivate ? "deactivated" : "grace",
+      failureCount,
+      retryLimit: policy.retryLimit,
+      firstFailedAt,
+      lastFailedAt: new Date(now).toISOString(),
+      graceEndsAt,
+      reason,
+      deactivatedAt: shouldDeactivate ? new Date(now).toISOString() : currentGrace.deactivatedAt || null,
+    };
+
+    await this.updateBillCardAutopay(bill, { dedicatedGrace: grace });
+    await this.updateDedicatedBillingGrace(bill.platformID, {
+      ...grace,
+      billID: bill.id,
+    });
+
+    if (shouldDeactivate) {
+      await this.db.updatePlatform(bill.platformID, { status: "inactive" });
+      await this.notifyPlatform(bill.platformID, "Dedicated server deactivated: payment required", {
+        message: `Card payment failed ${failureCount} time(s). The dedicated server is deactivated until the bill is paid. Resources were not deleted.`,
+        status: "error",
+        actionLabel: "Pay Bill",
+        actionUrl: "/admin/bills",
+      });
+      return;
+    }
+
+    await this.notifyPlatform(bill.platformID, "Dedicated server payment retry failed", {
+      message: `Card payment failed. Retry ${failureCount}/${policy.retryLimit}; grace ends in 2 days from first failure.`,
+      status: "warning",
+      actionLabel: "Pay Bill",
+      actionUrl: "/admin/bills",
+    });
+  }
+
   async fetchCardBilling(req, res) {
     const { token } = req.body || {};
     if (!token) return res.json({ success: false, message: "Missing credentials required!" });
@@ -558,6 +665,7 @@ class Controller {
         lastInvoiceID: invoiceID,
       });
 
+      let shouldApplyDedicatedGrace = !invoiceID && ["COMPLETE", "FAILED"].includes(status);
       if (invoiceID) {
         const existingPayment = await this.db.getMpesaCode(invoiceID);
         if (!existingPayment) {
@@ -580,6 +688,7 @@ class Controller {
           if (status === "COMPLETE") {
             await this.mpesa.completePaymentForService(payment);
           }
+          shouldApplyDedicatedGrace = ["COMPLETE", "FAILED"].includes(status);
         } else if (existingPayment.status !== status) {
           const payment = await this.db.updateMpesaCodeByID(existingPayment.id, {
             status,
@@ -589,7 +698,16 @@ class Controller {
           if (status === "COMPLETE") {
             await this.mpesa.completePaymentForService(payment);
           }
+          shouldApplyDedicatedGrace = ["COMPLETE", "FAILED"].includes(status);
         }
+      }
+
+      if (shouldApplyDedicatedGrace) {
+        await this.applyDedicatedCardPaymentGrace(
+          bill,
+          status,
+          invoice.failed_reason || payload.fail_reason || payload.status || ""
+        );
       }
 
       return res.json({ success: true });
@@ -8813,6 +8931,7 @@ class Controller {
       let providerHealth = null;
       if (server?.webdockSlug && this.webdock.token) {
         try {
+          const billingDeactivated = this.isDedicatedPaymentDeactivated(server);
           const [webdockServer, instantMetrics, metrics] = await Promise.all([
             this.webdock.getServer(server.webdockSlug),
             this.webdock.getInstantMetrics(server.webdockSlug),
@@ -8822,6 +8941,7 @@ class Controller {
           providerHealth = this.webdock.normalizeInstantMetrics(instantMetrics.data, webdockServer.data);
           liveServer = await this.db.upsertPlatformServer(platformID, {
             ...normalized,
+            webdockStatus: billingDeactivated ? "inactive" : normalized.webdockStatus,
             instantMetrics: providerHealth,
             metrics: metrics.data,
             lastSyncedAt: new Date(),
@@ -9033,6 +9153,7 @@ class Controller {
         },
         settings: this.getPublicPlatformConfig(config),
         server,
+        billingDeactivated: this.isDedicatedPaymentDeactivated(server),
         centralServices: {
           baseUrl: process.env.PUBLIC_API_URL || process.env.SERVER_URL || "https://api.novawifi.co.ke",
           allowed: ["mpesa", "mail", "sms", "notification"],
@@ -9062,6 +9183,7 @@ class Controller {
         ? { ...existing.providerData }
         : {};
       providerData.dedicatedAgent = {
+        ...(providerData.dedicatedAgent || {}),
         hostname: payload.hostname || "",
         version: payload.version || "",
         platformID: access.platformID,
@@ -9069,10 +9191,11 @@ class Controller {
         remoteAddress,
         lastHeartbeatAt: new Date().toISOString(),
       };
+      const billingDeactivated = this.isDedicatedPaymentDeactivated(existing);
 
       const server = await this.db.upsertPlatformServer(access.platformID, {
         provider: existing?.provider || "dedicated",
-        webdockStatus: payload.status || "active",
+        webdockStatus: billingDeactivated ? "inactive" : (payload.status || "active"),
         ipAddress: payload.ipAddress || existing?.ipAddress || remoteAddress,
         sshStatus: health.ssh || existing?.sshStatus || "",
         nginxStatus: health.nginx || existing?.nginxStatus || "",
@@ -9118,6 +9241,12 @@ class Controller {
     try {
       const access = await this.authenticateDedicatedAgent(req);
       if (!access.success) return res.status(401).json(access);
+      if (this.isDedicatedPaymentDeactivated(access.server)) {
+        return res.status(402).json({
+          success: false,
+          message: "Dedicated server is deactivated until the outstanding bill is paid.",
+        });
+      }
 
       const service = String(req.body?.service || "").toLowerCase();
       const action = String(req.body?.action || "").trim();
