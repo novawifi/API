@@ -3123,6 +3123,9 @@ class Controller {
         platform_id = platform.id;
         domain = platform.domain;
       }
+      const subscriptionPlan = this.normalizePlatformPlan(platform?.subscriptionPlan);
+      const isDedicatedPlan = subscriptionPlan === "professional";
+      const domainTargetIp = await this.getPlatformDomainTargetIp(platformID, platform);
 
       if (auth.admin.role !== "superuser") {
         const limitedResponse = {
@@ -3133,6 +3136,9 @@ class Controller {
           url,
           settings: { name },
           platform_id,
+          subscriptionPlan,
+          isDedicatedPlan,
+          domainTargetIp,
         };
         return res.json(limitedResponse);
       }
@@ -3176,7 +3182,10 @@ class Controller {
         name,
         url,
         settings: platformSettings,
-        platform_id
+        platform_id,
+        subscriptionPlan,
+        isDedicatedPlan,
+        domainTargetIp,
       };
       return res.json(response);
     } catch (error) {
@@ -6603,9 +6612,31 @@ class Controller {
 
   }
 
+  extractDedicatedServerIp(server) {
+    const providerData = server?.providerData && typeof server.providerData === "object" ? server.providerData : {};
+    return String(
+      server?.ipAddress ||
+      providerData.ipAddress ||
+      providerData.ip ||
+      providerData.ipv4 ||
+      providerData.publicIp ||
+      providerData.publicIP ||
+      ""
+    ).trim();
+  }
+
+  async getPlatformDomainTargetIp(platformID, platform = null) {
+    const activePlatform = platform || (platformID ? await this.db.getPlatform(platformID) : null);
+    if (this.normalizePlatformPlan(activePlatform?.subscriptionPlan) === "professional") {
+      const server = await this.db.getPlatformServer(platformID);
+      return this.extractDedicatedServerIp(server);
+    }
+    return String(process.env.SERVER_IP || "").trim();
+  }
+
   async checkIfDomainResolvesToServer(req, res) {
 
-    const { url } = req.body;
+    const { url, token } = req.body;
     if (!url) {
       return res.json({
         success: false,
@@ -6616,12 +6647,21 @@ class Controller {
     try {
       const hostname = url.replace(/^https?:\/\//, "").split("/")[0];
       const addresses = await dns.lookup(hostname);
-      const valid = addresses.address === process.env.SERVER_IP;
+      let targetIp = String(process.env.SERVER_IP || "").trim();
+      if (token) {
+        const auth = await this.auth.AuthenticateRequest(token);
+        if (!auth.success) {
+          return res.json({ success: false, message: auth.message });
+        }
+        targetIp = await this.getPlatformDomainTargetIp(auth.admin?.platformID);
+      }
+      const valid = Boolean(targetIp) && addresses.address === targetIp;
 
       return res.json({
         success: true,
         valid,
         ip: addresses.address,
+        targetIp,
         message: "URL resolves successfully.",
       });
     } catch (err) {
