@@ -1,4 +1,3 @@
-// @ts-check
 
 const { DataBase } = require("../helpers/databaseOperation")
 

@@ -358,7 +358,24 @@ class Controller {
   }
 
   buildCardBillingReference(platformID, billID) {
-    return `nova-card:${platformID}:${billID}`;
+    return `nc:${platformID}:${String(billID || "").replace(/-/g, "")}`;
+  }
+
+  parseCardBillingReference(reference) {
+    const parts = String(reference || "").split(":");
+    if (parts.length !== 3) return null;
+    if (parts[0] === "nova-card") {
+      return { platformID: parts[1], billID: parts[2] };
+    }
+    if (parts[0] !== "nc") return null;
+
+    const compactBillID = parts[2];
+    const uuidMatch = compactBillID.match(/^([a-f0-9]{8})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{12})$/i);
+    if (!uuidMatch) return null;
+    return {
+      platformID: parts[1],
+      billID: uuidMatch.slice(1).join("-"),
+    };
   }
 
   async fetchCardBilling(req, res) {
@@ -509,14 +526,12 @@ class Controller {
         return res.status(401).json({ success: false, message: "Invalid webhook challenge." });
       }
 
-      const reference = String(payload.reference || "");
-      const parts = reference.split(":");
-      if (parts.length !== 3 || parts[0] !== "nova-card") {
+      const parsedReference = this.parseCardBillingReference(payload.reference);
+      if (!parsedReference) {
         return res.json({ success: true, message: "Ignored unrelated subscription." });
       }
 
-      const platformID = parts[1];
-      const billID = parts[2];
+      const { platformID, billID } = parsedReference;
       const bill = await this.db.getPlatformBillingByID(billID);
       if (!bill || bill.platformID !== platformID) {
         return res.json({ success: false, message: "Bill not found." });
