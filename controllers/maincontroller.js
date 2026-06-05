@@ -8916,15 +8916,11 @@ class Controller {
     return crypto.timingSafeEqual(a, b);
   }
 
+  hashDedicatedAgentToken(token) {
+    return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+  }
+
   async authenticateDedicatedAgent(req) {
-    const expected = process.env.DEDICATED_AGENT_SECRET || "";
-    if (!expected) return { success: false, message: "Dedicated agent secret is not configured." };
-
-    const token = this.getDedicatedAgentToken(req);
-    if (!this.safeCompareSecret(token, expected)) {
-      return { success: false, message: "Unauthorised dedicated agent." };
-    }
-
     const platformID = String(
       req.headers?.["x-nova-platform-id"] ||
       req.body?.platformID ||
@@ -8939,7 +8935,65 @@ class Controller {
       return { success: false, message: "Dedicated server plan not active." };
     }
 
-    return { success: true, platformID, platform };
+    const token = this.getDedicatedAgentToken(req);
+    const server = await this.db.getPlatformServer(platformID);
+    const agent = server?.providerData?.dedicatedAgent || {};
+    const tokenHash = agent?.tokenHash || "";
+    const tokenMatchesPlatform = tokenHash
+      ? this.safeCompareSecret(this.hashDedicatedAgentToken(token), tokenHash)
+      : false;
+    const fallbackSecret = process.env.DEDICATED_AGENT_SECRET || "";
+    const tokenMatchesFallback = fallbackSecret ? this.safeCompareSecret(token, fallbackSecret) : false;
+
+    if (!tokenMatchesPlatform && !tokenMatchesFallback) {
+      return { success: false, message: "Unauthorised dedicated agent." };
+    }
+
+    return { success: true, platformID, platform, server };
+  }
+
+  async generateDedicatedAgentToken(req, res) {
+    const { token } = req.body || {};
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const access = await this.getDedicatedServerAuth(token);
+      if (!access.success) return res.json({ success: false, message: access.message });
+      if (this.normalizePlatformPlan(access.platform.subscriptionPlan) !== "professional") {
+        return res.json({ success: false, message: "Dedicated server plan not active." });
+      }
+
+      const agentToken = `nova_da_${access.platformID}_${crypto.randomBytes(32).toString("hex")}`;
+      const existing = await this.db.getPlatformServer(access.platformID);
+      const providerData = existing?.providerData && typeof existing.providerData === "object"
+        ? { ...existing.providerData }
+        : {};
+      providerData.dedicatedAgent = {
+        ...(providerData.dedicatedAgent || {}),
+        tokenHash: this.hashDedicatedAgentToken(agentToken),
+        tokenCreatedAt: providerData.dedicatedAgent?.tokenCreatedAt || new Date().toISOString(),
+        tokenRotatedAt: new Date().toISOString(),
+      };
+
+      await this.db.upsertPlatformServer(access.platformID, {
+        provider: existing?.provider || "dedicated",
+        providerData,
+      });
+
+      return res.json({
+        success: true,
+        message: "Dedicated agent token generated.",
+        platformID: access.platformID,
+        agentToken,
+        env: {
+          PLATFORM_ID: access.platformID,
+          DEDICATED_AGENT_TOKEN: agentToken,
+          MAIN_API_URL: process.env.PUBLIC_API_URL || process.env.SERVER_URL || "https://api.novawifi.co.ke",
+        },
+      });
+    } catch (error) {
+      console.error("Dedicated agent token generation error:", error);
+      return res.json({ success: false, message: "Failed to generate dedicated agent token." });
+    }
   }
 
   getPublicPlatformConfig(config) {
