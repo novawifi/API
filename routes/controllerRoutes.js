@@ -170,6 +170,7 @@ router.post("/homeFibreCallback/resolve", use("resolveHomeFibreCallback"));
 router.post("/homeFibreCallback/delete", use("deleteHomeFibreCallback"));
 router.post("/radius-credentials", use("getRadiusCredentials"));
 router.post("/migrateSystemBasis", use("migrateSystemBasis"));
+router.post("/systemBasisMigrations", use("fetchSystemBasisMigrations"));
 router.post("/managerAuthHealth", use("managerAuthHealth"));
 router.post("/stations/link", use("linkStations"));
 router.post("/stations/unlink", use("unlinkStation"));

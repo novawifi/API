@@ -10900,8 +10900,59 @@ class Controller {
     }
   }
 
+  isRetryableMigrationError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return [
+      "mikrotik",
+      "router",
+      "connection",
+      "timeout",
+      "disconnected",
+      "no valid",
+      "econn",
+      "socket",
+    ].some((term) => message.includes(term));
+  }
+
+  buildSystemBasisMigrationRequest(auth, station, target, extra = {}) {
+    return {
+      type: "system_basis",
+      stationId: station.id,
+      stationName: station.name || station.mikrotikHost || "",
+      stationHost: station.mikrotikHost || "",
+      from: station.systemBasis || "API",
+      to: target,
+      requestedBy: {
+        id: auth.admin?.id || "",
+        adminID: auth.admin?.adminID || "",
+        name: auth.admin?.name || "",
+        email: auth.admin?.email || "",
+        role: auth.admin?.role || "",
+      },
+      retryCount: Number(extra.retryCount || 0),
+      maxRetries: Number(extra.maxRetries || 3),
+      retryable: Boolean(extra.retryable),
+      nextRetryAt: extra.nextRetryAt || null,
+    };
+  }
+
+  async fetchSystemBasisMigrations(req, res) {
+    const { token } = req.body || {};
+    if (!token) return res.status(400).json({ success: false, message: "Missing token" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.status(401).json({ success: false, message: auth.message });
+      const migrations = await this.db.getSystemBasisMigrations(auth.admin.platformID);
+      return res.json({ success: true, migrations });
+    } catch (error) {
+      return res.status(500).json({ success: false, message: "Failed to fetch migration history" });
+    }
+  }
+
   async migrateSystemBasis(req, res) {
     const { token, target, stationId } = req.body || {};
+    let trackingMigration = null;
+    let trackingPlatformID = "";
     if (!token || !target || !stationId) {
       return res.status(400).json({ success: false, message: "Missing token, target, or stationId" });
     }
@@ -10915,6 +10966,7 @@ class Controller {
       }
 
       const platformID = auth.admin.platformID;
+      trackingPlatformID = platformID;
       const normalizedTarget = String(target).toUpperCase();
       if (!["API", "RADIUS"].includes(normalizedTarget)) {
         return res.status(400).json({ success: false, message: "Invalid target basis" });
@@ -10934,6 +10986,44 @@ class Controller {
       const planMap = new Map(plans.map((p) => [p.id, p]));
       const packageMap = new Map(stationPackages.map((p) => [p.id, p]));
       const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+      const existingMigration = await this.db.getLatestSystemBasisMigration(platformID, station.id, ["pending", "running", "failed"]);
+      const existingRequest = existingMigration?.request || {};
+      if (existingMigration?.status === "running") {
+        return res.json({ success: true, message: "Migration already running", migration: existingMigration });
+      }
+      if (existingMigration?.status === "failed" && Number(existingRequest.retryCount || 0) >= Number(existingRequest.maxRetries || 3)) {
+        return res.json({ success: false, message: "Migration failed and retry limit was reached", migration: existingMigration });
+      }
+      if (existingMigration && existingMigration.destinationTarget === normalizedTarget) {
+        trackingMigration = existingMigration;
+      } else {
+        trackingMigration = await this.db.createPlatformMigration({
+          platformID,
+          direction: "system_basis",
+          status: "pending",
+          domain: station.name || station.mikrotikHost || "",
+          requestedPlan: normalizedTarget,
+          sourcePlan: station.systemBasis || "API",
+          targetPlan: normalizedTarget,
+          sourceTarget: station.systemBasis || "API",
+          destinationTarget: normalizedTarget,
+          request: this.buildSystemBasisMigrationRequest(auth, station, normalizedTarget),
+        });
+      }
+      const requestMeta = trackingMigration?.request || this.buildSystemBasisMigrationRequest(auth, station, normalizedTarget);
+      const retryCount = Number(requestMeta.retryCount || 0) + 1;
+      trackingMigration = await this.db.updatePlatformMigration(trackingMigration.id, {
+        status: "running",
+        startedAt: trackingMigration.startedAt || new Date(),
+        error: null,
+        request: {
+          ...requestMeta,
+          retryCount,
+          retryable: false,
+          nextRetryAt: null,
+          lastAttemptAt: new Date().toISOString(),
+        },
+      });
 
       const summary = {
         target: normalizedTarget,
@@ -11000,7 +11090,7 @@ class Controller {
         if (routerResult.success) {
           summary.routerConfigured = true;
         } else {
-          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
+          throw new Error(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
         }
 
         for (const user of activeUsers) {
@@ -11068,7 +11158,7 @@ class Controller {
         if (routerResult.success) {
           summary.routerConfigured = true;
         } else {
-          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
+          throw new Error(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
         }
 
         for (const user of users) {
@@ -11189,9 +11279,51 @@ class Controller {
       }
 
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
-      return res.json({ success: true, message: `Migration to ${normalizedTarget} completed`, summary });
+      const completedMigration = trackingMigration
+        ? await this.db.updatePlatformMigration(trackingMigration.id, {
+          status: "completed",
+          completedAt: new Date(),
+          records: {
+            usersMigrated: summary.usersMigrated,
+            pppoeMigrated: summary.pppoeMigrated,
+            packagesUpdated: summary.packagesUpdated,
+          },
+          response: summary,
+          error: null,
+        })
+        : null;
+      return res.json({ success: true, message: `Migration to ${normalizedTarget} completed`, summary, migration: completedMigration });
     } catch (error) {
-      return res.status(500).json({ success: false, message: "Migration failed", error: error?.message || error });
+      if (trackingMigration) {
+        const requestMeta = trackingMigration.request || {};
+        const maxRetries = Number(requestMeta.maxRetries || 3);
+        const retryCount = Number(requestMeta.retryCount || 1);
+        const retryable = this.isRetryableMigrationError(error) && retryCount < maxRetries;
+        const nextRetryAt = retryable ? new Date(Date.now() + Math.min(15 * 60 * 1000, retryCount * 2 * 60 * 1000)).toISOString() : null;
+        trackingMigration = await this.db.updatePlatformMigration(trackingMigration.id, {
+          status: "failed",
+          error: error?.message || String(error),
+          request: {
+            ...requestMeta,
+            retryCount,
+            maxRetries,
+            retryable,
+            nextRetryAt,
+            lastErrorAt: new Date().toISOString(),
+          },
+        });
+        if (trackingPlatformID) {
+          await this.db.upsertPlatformNotification(trackingPlatformID, "System migration failed", {
+            message: retryable
+              ? `Migration failed due to router connectivity and can be retried. Attempt ${retryCount}/${maxRetries}.`
+              : error?.message || "Migration failed.",
+            status: "error",
+            actionLabel: "View Stations",
+            actionUrl: "/admin/stations",
+          });
+        }
+      }
+      return res.status(500).json({ success: false, message: "Migration failed", error: error?.message || error, migration: trackingMigration });
     }
   }
 }
