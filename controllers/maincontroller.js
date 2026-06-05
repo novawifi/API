@@ -10988,13 +10988,14 @@ class Controller {
       const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
       const existingMigration = await this.db.getLatestSystemBasisMigration(platformID, station.id, ["pending", "running", "failed"]);
       const existingRequest = existingMigration?.request || {};
+      const isSameTargetMigration = existingMigration?.destinationTarget === normalizedTarget;
       if (existingMigration?.status === "running") {
         return res.json({ success: true, message: "Migration already running", migration: existingMigration });
       }
-      if (existingMigration?.status === "failed" && Number(existingRequest.retryCount || 0) >= Number(existingRequest.maxRetries || 3)) {
+      if (isSameTargetMigration && existingMigration?.status === "failed" && Number(existingRequest.retryCount || 0) >= Number(existingRequest.maxRetries || 3)) {
         return res.json({ success: false, message: "Migration failed and retry limit was reached", migration: existingMigration });
       }
-      if (existingMigration && existingMigration.destinationTarget === normalizedTarget) {
+      if (existingMigration && isSameTargetMigration) {
         trackingMigration = existingMigration;
       } else {
         trackingMigration = await this.db.createPlatformMigration({

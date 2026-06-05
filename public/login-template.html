@@ -13,7 +13,7 @@
   .support-bar{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:14px;background:rgba(255,255,255,.12);border-radius:10px;padding:9px 16px;max-width:320px;margin-left:auto;margin-right:auto}
   .support-bar span{color:#c8f0dc;font-size:12px;font-weight:600}
   .support-bar a{color:#fff;font-size:15px;font-weight:800;text-decoration:none}
-  .page-body{padding:0 14px}
+  .page-body{width:100%;max-width:480px;margin:0 auto;padding:0 14px}
   .section-label{color:#007A3D;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin:0 0 10px 2px}
   .packages-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
   .pkg-card{background:#fff;border:1.5px solid #e2f0e8;border-radius:16px;padding:14px 12px;display:flex;flex-direction:column;align-items:center;text-align:center;gap:4px;transition:border-color .2s,box-shadow .2s;cursor:pointer}
@@ -60,6 +60,14 @@
   @keyframes spin{to{transform:rotate(360deg)}}
   .footer{text-align:center;color:#a0bfad;font-size:11px;font-weight:600;margin-top:24px;letter-spacing:.5px}
   .mpesa-logo{display:inline-block;background:#007A3D;color:#fff;font-size:9px;font-weight:800;letter-spacing:1px;padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:4px}
+  @media (min-width:520px){
+    .header{max-width:480px;margin-left:auto;margin-right:auto}
+  }
+  @media (max-width:360px){
+    .packages-grid{grid-template-columns:1fr}
+    .brand{font-size:21px;letter-spacing:2px}
+    .pkg-card{padding:12px 10px}
+  }
 </style>
 </head>
 <body>
@@ -86,7 +94,7 @@
     <button class="btn-main" id="btnConnect" onclick="handleAlreadyPaid()">CONNECT</button>
   </div>
 
-  <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span> &mdash; WiFi Solutions</div>
+  <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span></div>
 
 </div>
 
