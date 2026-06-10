@@ -337,9 +337,12 @@ class Controller {
 
   async updateBillCardAutopay(bill, cardAutopay) {
     const meta = bill?.meta && typeof bill.meta === "object" ? { ...bill.meta } : {};
+    const cleanCardAutopay = Object.fromEntries(
+      Object.entries(cardAutopay || {}).filter(([, value]) => value !== undefined)
+    );
     meta.cardAutopay = {
       ...(meta.cardAutopay || {}),
-      ...cardAutopay,
+      ...cleanCardAutopay,
       updatedAt: new Date().toISOString(),
     };
     return this.db.updatePlatformBilling(bill.id, { meta });
@@ -357,15 +360,71 @@ class Controller {
     return process.env.CLIENT_URL || process.env.NEXT_PUBLIC_CLIENT_URL || "https://novawifi.online";
   }
 
+  getServerBaseUrl() {
+    return process.env.SERVER_URL || process.env.NEXT_PUBLIC_SERVER_URL || "https://api.novawifi.online";
+  }
+
+  getPaystackSecretKey() {
+    return process.env.PAYSTACK_SECRET_KEY || "";
+  }
+
+  async paystackRequest(method, resource, data = null) {
+    const secretKey = this.getPaystackSecretKey();
+    if (!secretKey) {
+      throw new Error("Paystack secret key is not configured.");
+    }
+    const response = await axios({
+      method,
+      url: `https://api.paystack.co${resource}`,
+      data,
+      timeout: 20000,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        Authorization: `Bearer ${secretKey}`,
+      },
+    });
+    return response.data;
+  }
+
   buildCardBillingReference(platformID, billID) {
     return `nc:${platformID}:${String(billID || "").replace(/-/g, "")}`;
   }
 
+  buildPaystackBillReference(platformID, billID) {
+    return `ncp.${platformID}.${String(billID || "").replace(/-/g, "")}.${Date.now()}`;
+  }
+
   parseCardBillingReference(reference) {
-    const parts = String(reference || "").split(":");
-    if (parts.length !== 3) return null;
+    const referenceText = String(reference || "");
+    const paystackParts = referenceText.split(".");
+    if (paystackParts.length === 4 && ["ncp", "ncr"].includes(paystackParts[0])) {
+      const compactBillID = paystackParts[2];
+      const uuidMatch = compactBillID.match(/^([a-f0-9]{8})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{12})$/i);
+      if (!uuidMatch) return null;
+      return {
+        provider: "paystack",
+        type: paystackParts[0] === "ncr" ? "retry" : "checkout",
+        platformID: paystackParts[1],
+        billID: uuidMatch.slice(1).join("-"),
+      };
+    }
+
+    const parts = referenceText.split(":");
+    if (parts.length !== 3 && parts.length !== 4) return null;
+    if (["ncp", "ncr"].includes(parts[0])) {
+      const compactBillID = parts[2];
+      const uuidMatch = compactBillID.match(/^([a-f0-9]{8})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{12})$/i);
+      if (!uuidMatch) return null;
+      return {
+        provider: "paystack",
+        type: parts[0] === "ncr" ? "retry" : "checkout",
+        platformID: parts[1],
+        billID: uuidMatch.slice(1).join("-"),
+      };
+    }
     if (parts[0] === "nova-card") {
-      return { platformID: parts[1], billID: parts[2] };
+      return { provider: "intasend", platformID: parts[1], billID: parts[2] };
     }
     if (parts[0] !== "nc") return null;
 
@@ -373,9 +432,112 @@ class Controller {
     const uuidMatch = compactBillID.match(/^([a-f0-9]{8})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{12})$/i);
     if (!uuidMatch) return null;
     return {
+      provider: "intasend",
       platformID: parts[1],
       billID: uuidMatch.slice(1).join("-"),
     };
+  }
+
+  mapPaystackTransactionStatus(status) {
+    const normalized = String(status || "").toLowerCase();
+    if (normalized === "success") return "COMPLETE";
+    if (["failed", "reversed", "abandoned"].includes(normalized)) return "FAILED";
+    return "PENDING";
+  }
+
+  getPaystackCardMask(transaction) {
+    const auth = transaction?.authorization || {};
+    const last4 = auth.last4 ? String(auth.last4) : "";
+    const brand = auth.card_type || auth.brand || "Card";
+    return last4 ? `${brand} **** ${last4}` : "";
+  }
+
+  verifyPaystackWebhook(req) {
+    const secretKey = this.getPaystackSecretKey();
+    const signature = req.headers["x-paystack-signature"];
+    if (!secretKey || !signature) return false;
+    const body = req.rawBody || JSON.stringify(req.body || {});
+    const hash = crypto.createHmac("sha512", secretKey).update(body).digest("hex");
+    try {
+      return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(String(signature)));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async settlePaystackBillTransaction(transaction) {
+    const reference = transaction?.reference;
+    const parsedReference = this.parseCardBillingReference(reference);
+    if (!parsedReference || parsedReference.provider !== "paystack") {
+      return { success: true, ignored: true, message: "Ignored unrelated transaction." };
+    }
+
+    const { platformID, billID } = parsedReference;
+    const bill = await this.db.getPlatformBillingByID(billID);
+    if (!bill || bill.platformID !== platformID) {
+      return { success: false, message: "Bill not found." };
+    }
+
+    const status = this.mapPaystackTransactionStatus(transaction.status);
+    const amount = Number(transaction.amount || 0) / 100;
+    const fees = Number(transaction.fees || 0) / 100;
+    const customer = transaction.customer || {};
+    const authorization = transaction.authorization || {};
+    const paymentData = {
+      platformID,
+      amount: String(amount || bill.amount || bill.price || "0"),
+      code: reference,
+      reqcode: reference,
+      phone: customer.email || customer.phone || "card",
+      status,
+      service: "bill",
+      paymentMethod: "PAYSTACK-CARD",
+      reason: null,
+      referenceID: billID,
+      type: "deposit",
+      charges: fees ? fees.toFixed(2) : "0.00",
+      failed_reason: transaction.gateway_response || transaction.message || "null",
+      FirstName: customer.first_name || "N/A",
+      LastName: customer.last_name || "N/A",
+      verified: status === "COMPLETE",
+    };
+
+    let payment = await this.db.getMpesaCode(reference);
+    const wasComplete = String(payment?.status || "").toUpperCase() === "COMPLETE";
+    if (!payment) {
+      payment = await this.db.addMpesaCode(paymentData);
+    } else if (payment.status !== status || payment.verified !== paymentData.verified) {
+      payment = await this.db.updateMpesaCodeByID(payment.id, {
+        status,
+        charges: paymentData.charges,
+        failed_reason: paymentData.failed_reason,
+        verified: paymentData.verified,
+      });
+    }
+
+    await this.updateBillCardAutopay(bill, {
+      provider: "paystack",
+      status,
+      reference,
+      setupUrl: null,
+      paymentMethod: "PAYSTACK-CARD",
+      cardMask: this.getPaystackCardMask(transaction),
+      cardType: authorization.card_type || authorization.brand,
+      cardExpiry: authorization.exp_month && authorization.exp_year ? `${authorization.exp_month}/${authorization.exp_year}` : undefined,
+      authorizationCode: authorization.authorization_code,
+      authorizationReusable: authorization.reusable,
+      customerEmail: customer.email,
+      amount: paymentData.amount,
+      currency: transaction.currency || bill.currency || "KES",
+      paidAt: status === "COMPLETE" ? new Date().toISOString() : undefined,
+      paystackTransactionID: transaction.id,
+    });
+
+    if (status === "COMPLETE" && payment && !wasComplete) {
+      await this.mpesa.completePaymentForService(payment);
+    }
+
+    return { success: true, status, payment };
   }
 
   async fetchCardBilling(req, res) {
@@ -415,72 +577,80 @@ class Controller {
       }
 
       const existing = this.getBillCardAutopay(bill);
-      if (existing?.subscriptionID && ["PENDING", "ACTIVE", "PROCESSING"].includes(String(existing.status || "").toUpperCase())) {
+      if (existing?.provider === "paystack" && existing?.setupUrl && ["PENDING", "PROCESSING"].includes(String(existing.status || "").toUpperCase())) {
         return res.json({
           success: true,
-          message: "Card billing setup already exists.",
+          message: "Paystack card checkout already exists.",
           cardAutopay: existing,
           setupUrl: existing.setupUrl,
         });
       }
 
-      const amount = Number(bill.price || bill.amount || 0);
+      const amount = Number(bill.amount || 0);
+      const billIsPaid = ["PAID", "COMPLETE", "COMPLETED"].includes(String(bill.status || "").toUpperCase());
+      if (billIsPaid || amount <= 0) {
+        return res.json({ success: false, message: "This bill is already paid. There is no amount due for card payment." });
+      }
       if (!Number.isFinite(amount) || amount <= 0) {
-        return res.json({ success: false, message: "Bill amount is invalid." });
+        return res.json({ success: false, message: "Bill amount due is invalid." });
       }
 
-      const reference = this.buildCardBillingReference(platformID, bill.id);
-      const plan = await this.intasendRequest("post", "/api/v1/subscriptions-plans/", {
+      const reference = this.buildPaystackBillReference(platformID, bill.id);
+      const email = auth.admin.email || platform.email || `billing-${platformID}@novawifi.local`;
+      const transaction = await this.paystackRequest("post", "/transaction/initialize", {
+        amount: String(Math.round(amount * 100)),
+        email,
         currency: bill.currency || "KES",
-        name: String(bill.name || "Nova Billing").slice(0, 32),
-        frequency: 1,
-        frequency_unit: "M",
-        billing_cycles: Number(process.env.INTASEND_CARD_BILLING_CYCLES || 120),
-        amount: amount.toFixed(2),
         reference,
-        redirect_url: `${this.getClientBaseUrl()}/admin/bills`,
+        callback_url: `${this.getServerBaseUrl()}/req/paystack/cardBilling/callback`,
+        channels: ["card"],
+        metadata: {
+          platformID,
+          billID: bill.id,
+          billName: bill.name || "Nova Billing",
+          custom_fields: [
+            {
+              display_name: "Bill",
+              variable_name: "bill",
+              value: bill.name || "Nova Billing",
+            },
+          ],
+        },
       });
-
-      const name = this.splitCustomerName(auth.admin.name || platform.name, auth.admin.email);
-      const customer = await this.intasendRequest("post", "/api/v1/subscriptions-customers/", {
-        email: auth.admin.email || platform.email || `billing-${platformID}@novawifi.local`,
-        ...name,
-        reference: platformID,
-        address: "Nairobi",
-        city: "Nairobi",
-        state: "Nairobi",
-        zipcode: "00100",
-        country: "KE",
-      });
-
-      const startDate = new Date().toISOString().slice(0, 10);
-      const subscription = await this.intasendRequest("post", "/api/v1/subscriptions/", {
-        customer_id: customer.customer_id,
-        plan_id: plan.plan_id,
-        reference,
-        start_date: startDate,
-        redirect_url: `${this.getClientBaseUrl()}/admin/bills`,
-      });
+      const paystackData = transaction?.data || {};
 
       const cardAutopay = {
-        provider: "intasend",
-        status: subscription.status || "PENDING",
+        provider: "paystack",
+        status: "PENDING",
         reference,
-        planID: plan.plan_id,
-        customerID: customer.customer_id,
-        subscriptionID: subscription.subscription_id,
-        setupUrl: subscription.setup_url,
-        paymentMethod: "CARD-PAYMENT",
+        accessCode: paystackData.access_code,
+        setupUrl: paystackData.authorization_url,
+        paymentMethod: "PAYSTACK-CARD",
         amount: amount.toFixed(2),
         currency: bill.currency || "KES",
-        startDate,
+        initializedAt: new Date().toISOString(),
       };
       await this.updateBillCardAutopay(bill, cardAutopay);
+      await this.db.addMpesaCode({
+        platformID,
+        amount: amount.toFixed(2),
+        code: reference,
+        reqcode: reference,
+        phone: email,
+        status: "PENDING",
+        service: "bill",
+        paymentMethod: "PAYSTACK-CARD",
+        reason: null,
+        referenceID: bill.id,
+        type: "deposit",
+        charges: "0.00",
+        failed_reason: "null",
+      });
 
       return res.json({
         success: true,
-        message: "Card billing setup created.",
-        setupUrl: subscription.setup_url,
+        message: "Paystack card checkout created.",
+        setupUrl: paystackData.authorization_url,
         cardAutopay,
       });
     } catch (error) {
@@ -502,6 +672,14 @@ class Controller {
         return res.json({ success: false, message: "Bill not found." });
       }
       const cardAutopay = this.getBillCardAutopay(bill);
+      if (cardAutopay?.provider === "paystack") {
+        await this.updateBillCardAutopay(bill, {
+          status: "CANCELED",
+          setupUrl: null,
+          canceledAt: new Date().toISOString(),
+        });
+        return res.json({ success: true, message: "Paystack card checkout canceled." });
+      }
       if (!cardAutopay?.subscriptionID) {
         return res.json({ success: false, message: "No card billing subscription found." });
       }
@@ -595,6 +773,62 @@ class Controller {
     } catch (error) {
       console.error("IntaSend subscription webhook error:", error);
       return res.status(500).json({ success: false, message: "Webhook processing failed." });
+    }
+  }
+
+  async verifyPaystackCardBilling(req, res) {
+    const { token, reference } = req.body || {};
+    if (!token || !reference) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success || !auth.admin) return res.json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
+
+      const parsedReference = this.parseCardBillingReference(reference);
+      if (!parsedReference || parsedReference.provider !== "paystack" || parsedReference.platformID !== auth.admin.platformID) {
+        return res.json({ success: false, message: "Invalid Paystack bill reference." });
+      }
+
+      const verification = await this.paystackRequest("get", `/transaction/verify/${encodeURIComponent(reference)}`);
+      const result = await this.settlePaystackBillTransaction(verification?.data);
+      return res.json({
+        success: Boolean(result.success),
+        message: result.success ? "Paystack payment verified." : result.message || "Paystack payment verification failed.",
+        status: result.status,
+      });
+    } catch (error) {
+      console.error("Paystack card billing verify error:", error?.response?.data || error);
+      return res.json({ success: false, message: error?.response?.data?.message || "Failed to verify Paystack payment." });
+    }
+  }
+
+  async paystackCardBillingCallback(req, res) {
+    const reference = req.query?.reference || req.query?.trxref;
+    try {
+      if (reference) {
+        const verification = await this.paystackRequest("get", `/transaction/verify/${encodeURIComponent(reference)}`);
+        await this.settlePaystackBillTransaction(verification?.data);
+      }
+    } catch (error) {
+      console.error("Paystack card billing callback error:", error?.response?.data || error);
+    }
+    return res.redirect(`${this.getClientBaseUrl()}/admin/bills`);
+  }
+
+  async paystackCardBillingWebhook(req, res) {
+    try {
+      if (!this.verifyPaystackWebhook(req)) {
+        return res.status(401).json({ success: false, message: "Invalid Paystack signature." });
+      }
+      const payload = req.body || {};
+      if (payload.event !== "charge.success") {
+        return res.json({ success: true, message: "Ignored Paystack event." });
+      }
+      const result = await this.settlePaystackBillTransaction(payload.data);
+      return res.json({ success: Boolean(result.success), message: result.message || "Paystack webhook processed." });
+    } catch (error) {
+      console.error("Paystack card billing webhook error:", error?.response?.data || error);
+      return res.status(500).json({ success: false, message: "Paystack webhook processing failed." });
     }
   }
 

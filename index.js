@@ -26,7 +26,12 @@ const server = http.createServer(app);
 // Middlewares
 app.use(cors({ origin: "*" }));
 app.use(compression());
-app.use(express.json({ limit: "200kb" }));
+app.use(express.json({
+  limit: "200kb",
+  verify: (req, _res, buf) => {
+    req.rawBody = buf.toString("utf8");
+  },
+}));
 app.use(express.urlencoded({ extended: true, limit: "200kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 

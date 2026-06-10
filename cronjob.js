@@ -1,5 +1,6 @@
 
 const cron = require("node-cron");
+const axios = require("axios");
 const { NodeSSH } = require('node-ssh');
 const dayjs = require('dayjs');
 const fs = require('fs');
@@ -1322,6 +1323,245 @@ Price: KSH ${service.price}</p>
         }
     }
 
+    getPaystackSecretKey() {
+        return process.env.PAYSTACK_SECRET_KEY || "";
+    }
+
+    buildPaystackRetryReference(platformID, billID) {
+        return `ncr.${platformID}.${String(billID || "").replace(/-/g, "")}.${Date.now()}`;
+    }
+
+    getBillCardAutopay(bill) {
+        const meta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
+        return meta.cardAutopay && typeof meta.cardAutopay === "object" ? meta.cardAutopay : null;
+    }
+
+    async updateBillCardAutopay(bill, cardAutopay) {
+        const meta = bill?.meta && typeof bill.meta === "object" ? { ...bill.meta } : {};
+        const cleanCardAutopay = Object.fromEntries(
+            Object.entries(cardAutopay || {}).filter(([, value]) => value !== undefined)
+        );
+        meta.cardAutopay = {
+            ...(meta.cardAutopay || {}),
+            ...cleanCardAutopay,
+            updatedAt: new Date().toISOString(),
+        };
+        return this.db.updatePlatformBilling(bill.id, { meta });
+    }
+
+    getPaystackRetryState(cardAutopay, invoiceKey) {
+        const retries = cardAutopay?.retries && typeof cardAutopay.retries === "object" ? cardAutopay.retries : {};
+        const current = retries[invoiceKey] && typeof retries[invoiceKey] === "object" ? retries[invoiceKey] : {};
+        return { retries, current };
+    }
+
+    canRunPaystackRetry(cardAutopay, invoiceKey, now) {
+        const maxAttempts = Math.max(1, Number(process.env.PAYSTACK_CARD_RETRY_MAX_DAILY_ATTEMPTS || 3));
+        const minHoursBetweenAttempts = Math.max(1, Number(process.env.PAYSTACK_CARD_RETRY_INTERVAL_HOURS || 8));
+        const { current } = this.getPaystackRetryState(cardAutopay, invoiceKey);
+        const today = now.toISOString().slice(0, 10);
+        const lastDate = current.lastAttemptAt ? new Date(current.lastAttemptAt).toISOString().slice(0, 10) : null;
+        const attemptsToday = lastDate === today ? Number(current.attemptsToday || 0) : 0;
+        if (attemptsToday >= maxAttempts) return { allowed: false, reason: "daily_attempt_limit" };
+        if (current.lastAttemptAt) {
+            const lastAttemptAt = new Date(current.lastAttemptAt);
+            if (!Number.isNaN(lastAttemptAt.getTime())) {
+                const elapsedHours = (now.getTime() - lastAttemptAt.getTime()) / 36e5;
+                if (elapsedHours < minHoursBetweenAttempts) return { allowed: false, reason: "retry_interval" };
+            }
+        }
+        return { allowed: true, attemptsToday, maxAttempts };
+    }
+
+    async chargePaystackAuthorization({ email, amount, authorizationCode, currency, reference }) {
+        const secretKey = this.getPaystackSecretKey();
+        if (!secretKey) throw new Error("Paystack secret key is not configured.");
+        const response = await axios.post(
+            "https://api.paystack.co/transaction/charge_authorization",
+            {
+                email,
+                amount: String(Math.round(Number(amount) * 100)),
+                authorization_code: authorizationCode,
+                reference,
+                currency: currency || "KES",
+            },
+            {
+                timeout: 20000,
+                headers: {
+                    accept: "application/json",
+                    "content-type": "application/json",
+                    Authorization: `Bearer ${secretKey}`,
+                },
+            }
+        );
+        return response.data;
+    }
+
+    mapPaystackTransactionStatus(status) {
+        const normalized = String(status || "").toLowerCase();
+        if (normalized === "success") return "COMPLETE";
+        if (["failed", "reversed", "abandoned"].includes(normalized)) return "FAILED";
+        return "PENDING";
+    }
+
+    async recordPaystackRetryResult(platformID, bill, reference, transaction, fallback) {
+        const status = this.mapPaystackTransactionStatus(transaction?.status || fallback?.status);
+        const amount = Number(transaction?.amount || 0) / 100 || Number(fallback?.amount || bill.amount || bill.price || 0);
+        const fees = Number(transaction?.fees || 0) / 100;
+        const customer = transaction?.customer || {};
+        const authorization = transaction?.authorization || {};
+        const existing = await this.db.getMpesaCode(reference);
+        let payment = existing;
+        const data = {
+            platformID,
+            amount: String(amount),
+            code: reference,
+            reqcode: reference,
+            phone: customer.email || fallback?.email || "card",
+            status,
+            service: "bill",
+            paymentMethod: "PAYSTACK-CARD-RETRY",
+            reason: null,
+            referenceID: bill.id,
+            type: "deposit",
+            charges: fees ? fees.toFixed(2) : "0.00",
+            failed_reason: transaction?.gateway_response || transaction?.message || fallback?.message || "null",
+            FirstName: customer.first_name || "N/A",
+            LastName: customer.last_name || "N/A",
+            verified: status === "COMPLETE",
+        };
+
+        if (!payment) {
+            payment = await this.db.addMpesaCode(data);
+        } else {
+            payment = await this.db.updateMpesaCodeByID(payment.id, {
+                status,
+                charges: data.charges,
+                failed_reason: data.failed_reason,
+                verified: data.verified,
+            });
+        }
+
+        await this.updateBillCardAutopay(bill, {
+            provider: "paystack",
+            status,
+            reference,
+            setupUrl: null,
+            paymentMethod: "PAYSTACK-CARD-RETRY",
+            cardMask: authorization.last4 ? `${authorization.card_type || authorization.brand || "Card"} **** ${authorization.last4}` : undefined,
+            cardType: authorization.card_type || authorization.brand,
+            cardExpiry: authorization.exp_month && authorization.exp_year ? `${authorization.exp_month}/${authorization.exp_year}` : undefined,
+            authorizationCode: authorization.authorization_code,
+            authorizationReusable: authorization.reusable,
+            customerEmail: customer.email || fallback?.email,
+            amount: String(amount),
+            currency: transaction?.currency || fallback?.currency || bill.currency || "KES",
+            paidAt: status === "COMPLETE" ? new Date().toISOString() : undefined,
+            paystackTransactionID: transaction?.id,
+        });
+
+        if (status === "COMPLETE" && payment) {
+            await this.mpesa.completePaymentForService(payment);
+        }
+
+        return { status, payment };
+    }
+
+    async retryPaystackCardBillingForPlatform(platform) {
+        const platformID = platform.platformID;
+        if (!this.getPaystackSecretKey()) return;
+
+        const bills = await this.db.getUnpaidPlatformBilling(platformID);
+        if (!Array.isArray(bills) || bills.length === 0) return;
+
+        const now = new Date();
+        for (const bill of bills) {
+            const amount = Number(bill.amount || 0);
+            if (!Number.isFinite(amount) || amount <= 0) continue;
+
+            const cardAutopay = this.getBillCardAutopay(bill);
+            if (cardAutopay?.provider !== "paystack") continue;
+            if (!cardAutopay.authorizationCode || !cardAutopay.customerEmail) continue;
+            if (cardAutopay.authorizationReusable === false) continue;
+
+            const invoiceKey = `${bill.id}:${bill.dueDate ? new Date(bill.dueDate).toISOString().slice(0, 10) : "open"}:${amount}`;
+            const retryGate = this.canRunPaystackRetry(cardAutopay, invoiceKey, now);
+            if (!retryGate.allowed) continue;
+
+            const { retries, current } = this.getPaystackRetryState(cardAutopay, invoiceKey);
+            const today = now.toISOString().slice(0, 10);
+            const lastDate = current.lastAttemptAt ? new Date(current.lastAttemptAt).toISOString().slice(0, 10) : null;
+            const attemptsToday = lastDate === today ? Number(current.attemptsToday || 0) : 0;
+            const reference = this.buildPaystackRetryReference(platformID, bill.id);
+
+            retries[invoiceKey] = {
+                ...current,
+                attempts: Number(current.attempts || 0) + 1,
+                attemptsToday: attemptsToday + 1,
+                lastAttemptAt: now.toISOString(),
+                lastReference: reference,
+                lastStatus: "PROCESSING",
+            };
+
+            await this.updateBillCardAutopay(bill, {
+                retries,
+                lastRetryReference: reference,
+                lastRetryAt: now.toISOString(),
+                status: "PROCESSING",
+            });
+
+            try {
+                const response = await this.chargePaystackAuthorization({
+                    email: cardAutopay.customerEmail,
+                    amount,
+                    authorizationCode: cardAutopay.authorizationCode,
+                    currency: bill.currency || cardAutopay.currency || "KES",
+                    reference,
+                });
+                const transaction = response?.data || {};
+                const result = await this.recordPaystackRetryResult(platformID, bill, reference, transaction, {
+                    amount,
+                    email: cardAutopay.customerEmail,
+                    currency: bill.currency || cardAutopay.currency || "KES",
+                    message: response?.message,
+                });
+                retries[invoiceKey] = {
+                    ...retries[invoiceKey],
+                    lastStatus: result.status,
+                    lastMessage: response?.message || transaction?.gateway_response || result.status,
+                };
+                await this.updateBillCardAutopay(bill, { retries });
+                socketManager.log(platformID, `Paystack card retry ${result.status} for ${bill.name || "bill"} (ref ${reference})`, {
+                    context: "payments",
+                    level: result.status === "COMPLETE" ? "success" : "warn",
+                });
+            } catch (error) {
+                const message = error?.response?.data?.message || error?.message || "Paystack retry failed";
+                retries[invoiceKey] = {
+                    ...retries[invoiceKey],
+                    lastStatus: "FAILED",
+                    lastMessage: message,
+                };
+                await this.updateBillCardAutopay(bill, {
+                    retries,
+                    status: "FAILED",
+                    failedReason: message,
+                });
+                await this.recordPaystackRetryResult(platformID, bill, reference, null, {
+                    amount,
+                    email: cardAutopay.customerEmail,
+                    currency: bill.currency || cardAutopay.currency || "KES",
+                    status: "failed",
+                    message,
+                });
+                socketManager.log(platformID, `Paystack card retry failed for ${bill.name || "bill"}: ${message}`, {
+                    context: "payments",
+                    level: "warn",
+                });
+            }
+        }
+    }
+
     async managePluginBillsForPlatform(platform) {
         const platformID = platform.platformID;
         const bills = await this.db.getPlatformBilling(platformID);
@@ -2079,6 +2319,7 @@ Price: KSH ${service.price}</p>
             () => this.reconcileDashboardStatsForPlatform(platform),
             () => this.checkUsersViolatingSystemThroughPayments(platform),
             () => this.manageBillingForPlatform(platform),
+            () => this.retryPaystackCardBillingForPlatform(platform),
             () => this.managePluginBillsForPlatform(platform),
         ];
 
