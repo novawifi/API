@@ -90,6 +90,22 @@ class WebdockService {
     return this.request("GET", "/profiles", null, { params: { locationId } });
   }
 
+  async listAccountScripts() {
+    this.assertConfigured();
+    return this.request("GET", "/account/scripts");
+  }
+
+  async createAccountScript({ name, filename, content }) {
+    this.assertConfigured();
+    return this.request("POST", "/account/scripts", { name, filename, content });
+  }
+
+  async updateAccountScript(scriptId, { name, filename, content }) {
+    this.assertConfigured();
+    if (!scriptId) throw new Error("scriptId is required");
+    return this.request("PATCH", `/account/scripts/${encodeURIComponent(scriptId)}`, { name, filename, content });
+  }
+
   async createCustomProfile({ platform, cpuThreads, ramGb, diskGb, networkBandwidth }) {
     this.assertConfigured();
     return this.request("POST", "/profiles", {

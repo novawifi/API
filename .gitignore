@@ -90,3 +90,8 @@ Thumbs.db
 # TypeScript build outputs
 *.tsbuildinfo
 scripts/
+!scripts/
+scripts/*
+!scripts/dedicated-server-bootstrap.sh
+!scripts/sync-dedicated-provision-script.js
+!scripts/README-dedicated-server.md

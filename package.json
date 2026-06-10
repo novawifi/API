@@ -16,7 +16,8 @@
     "seed:redirect-online-to-co-ke": "node scripts/seed-redirect-online-to-co-ke.js",
     "seed:router-walled-garden": "node scripts/seed-router-walled-garden.js",
     "seed:cleanup-expired-hotspot": "node scripts/seed-cleanup-expired-hotspot.js",
-    "seed:auto-backup-script": "node scripts/seed-auto-backup-script.js"
+    "seed:auto-backup-script": "node scripts/seed-auto-backup-script.js",
+    "webdock:sync-dedicated-script": "node scripts/sync-dedicated-provision-script.js"
   },
   "keywords": [],
   "author": "",

@@ -191,11 +191,25 @@ class CronJob {
                     if (action.serverSlug) {
                         try {
                             const server = await this.webdock.getServer(action.serverSlug);
-                            await this.db.upsertPlatformServer(action.platformID, {
+                            const update = {
                                 ...this.webdock.normalizeServer(server.data),
                                 webdockStatus: action.type === "delete" ? "deleted" : (server.data?.status || "active"),
                                 lastSyncedAt: new Date(),
-                            });
+                            };
+                            if (action.type === "provision" && action.request?.userScriptId) {
+                                update.sshStatus = "ready";
+                                update.nginxStatus = "active";
+                                update.providerData = {
+                                    ...(update.providerData || server.data || {}),
+                                    novaSetup: {
+                                        status: "complete",
+                                        scriptId: action.request.userScriptId,
+                                        completedAt: new Date().toISOString(),
+                                        healthCommand: "nova-dedicated-check",
+                                    },
+                                };
+                            }
+                            await this.db.upsertPlatformServer(action.platformID, update);
                         } catch (err) {
                             if (action.type === "delete") {
                                 await this.db.upsertPlatformServer(action.platformID, {

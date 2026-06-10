@@ -79,13 +79,14 @@ class MpesaController {
         if (!profileSlug) throw new Error("Webdock did not return a profile slug");
 
         const suggestedSlug = this.webdock.makeSlug(platformID);
+        const userScriptId = process.env.WEBDOCK_PROVISION_SCRIPT_ID || undefined;
         const provision = await this.webdock.provisionServer({
             name: `${platform?.name || "Nova"} Dedicated`,
             slug: suggestedSlug,
             profileSlug,
             imageSlug: process.env.WEBDOCK_IMAGE_SLUG || this.webdock.defaultImageSlug,
             locationId: process.env.WEBDOCK_LOCATION_ID || this.webdock.defaultLocationId,
-            userScriptId: process.env.WEBDOCK_PROVISION_SCRIPT_ID || undefined,
+            userScriptId,
         });
         const normalized = this.webdock.normalizeServer(provision.data);
         const server = await this.db.upsertPlatformServer(platformID, {
@@ -109,7 +110,7 @@ class MpesaController {
             type: "provision",
             status: provision.callbackId ? "pending" : "processing",
             callbackId: provision.callbackId,
-            request: { resources, profileSlug },
+            request: { resources, profileSlug, userScriptId },
             response: { server: provision.data, callbackSequence: provision.callbackSequence },
         });
         await this.db.upsertPlatformNotification(platformID, "Dedicated server provisioning", {
