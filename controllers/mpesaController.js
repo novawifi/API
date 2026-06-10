@@ -672,7 +672,7 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -772,7 +772,7 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -865,7 +865,7 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -1974,8 +1974,7 @@ class MpesaController {
                     const isMoreThanOneDevice = Number(pkg.devices) > 1;
                     const isData = pkg.category === "Data";
 
-                    const baseCode = transactionDetails.mpesaReceiptNumber || transactionDetails.checkoutRequestId;
-
+                    const baseCode = String(transactionDetails.mpesaReceiptNumber || transactionDetails.checkoutRequestId || CheckoutRequestID).trim();
                     const loginIdentifier = baseCode;
 
                     const tokenPayload = {
@@ -1995,7 +1994,7 @@ class MpesaController {
 	                        package: pkg,
 	                        routerHost: pkg.routerHost,
 	                        code: baseCode,
-	                        mac: mpesaCode?.mac ? String(mpesaCode.mac) : "null",
+	                        mac: "null",
 	                    };
 
 	                    const code_data = {
@@ -2003,7 +2002,7 @@ class MpesaController {
 	                        packageID: pkg.id,
 	                        platformID: mpesaCode.platformID,
 	                        code: baseCode,
-	                        mac: mpesaCode?.mac ? String(mpesaCode.mac) : "null",
+	                        mac: "null",
 	                        token: "null",
 	                    }
 
@@ -2301,8 +2300,8 @@ class MpesaController {
             }
 
             const platformCredentials = await this.db.getPlatformConfig(platformID);
-            const isB2B = platformCredentials.IsB2B;
-            if (!isB2B && Number(checkFundsAccount.balance) <= 0) {
+            const isB2B = Boolean(platformCredentials?.IsB2B);
+            if (!isB2B) {
                 return res.status(400).json({
                     success: false,
                     message: "Invalid operation for withdrawal, configure B2B payments on the Settings Tab first!",
@@ -2320,13 +2319,26 @@ class MpesaController {
                 }
             }
 
-            const paymentType = platformCredentials.mpesaShortCodeType;
-            const shortCode = platformCredentials.mpesaShortCode;
-            const accountReference = platformCredentials.mpesaAccountNumber;
-            if (!["Till", "Paybill"].includes(String(paymentType))) {
+            const paymentType = String(platformCredentials.mpesaShortCodeType || "");
+            const normalizedPaymentType = paymentType.toLowerCase() === "paybill" ? "Paybill" : paymentType.toLowerCase() === "till" ? "Till" : "";
+            const shortCode = String(platformCredentials.mpesaShortCode || "").trim();
+            const accountReference = String(platformCredentials.mpesaAccountNumber || "").trim();
+            if (!["Till", "Paybill"].includes(normalizedPaymentType)) {
                 return res.status(400).json({
                     success: false,
                     message: "Configure withdrawal destination as Till or Paybill.",
+                });
+            }
+            if (!shortCode) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Configure withdrawal destination shortcode on the Settings Tab.",
+                });
+            }
+            if (normalizedPaymentType === "Paybill" && !accountReference) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Configure withdrawal Paybill account number on the Settings Tab.",
                 });
             }
 
@@ -2340,15 +2352,12 @@ class MpesaController {
                 });
             }
 
-            const IsTill = paymentType === "Till";
-            const IsPaybill = paymentType === "Paybill";
-            let phone = "null";
             let till = "null";
             let PayBill = "null";
 
-            if (paymentType === "Till") {
+            if (normalizedPaymentType === "Till") {
                 till = shortCode;
-            } else if (paymentType === "Paybill") {
+            } else if (normalizedPaymentType === "Paybill") {
                 PayBill = shortCode;
             }
 
@@ -2356,10 +2365,10 @@ class MpesaController {
             const ref = `WD-${platformID}-${Date.now()}`;
             const darajaResponse = await this.sendC2BB2BTransferToDestination({
                 platformID,
-                amount: netAmount,
+                amount,
                 reference: ref,
                 destinationShortCode: shortCode,
-                destinationType: paymentType,
+                destinationType: normalizedPaymentType,
                 destinationAccount: accountReference,
                 remarks: "Nova WiFi Withdrawal",
             });
@@ -3940,7 +3949,7 @@ class MpesaController {
 	                SecurityCredential: securityCredential,
 	                CommandID: commandId,
 	                SenderIdentifierType: senderIdentifierType,
-	                ReceiverIdentifierType: receiverIdentifierType,
+	                RecieverIdentifierType: receiverIdentifierType,
 	                Amount: transferAmount,
 	                PartyA: config.mpesaShortCode,
 	                PartyB: String(destinationShortCode),
@@ -4622,28 +4631,6 @@ class MpesaController {
             await this.db.updatePlatform(bill.platformID, {
                 status: "active"
             })
-            if (
-                bill.meta?.serviceKey === "billing" &&
-                String(bill.meta?.plan || "").toLowerCase() === "professional"
-            ) {
-                const server = await this.db.getPlatformServer(bill.platformID);
-                const providerData = server?.providerData && typeof server.providerData === "object"
-                    ? { ...server.providerData }
-                    : {};
-                providerData.dedicatedBillingGrace = {
-                    ...(providerData.dedicatedBillingGrace || {}),
-                    status: "paid",
-                    failureCount: 0,
-                    billID,
-                    resolvedAt: new Date().toISOString(),
-                    updatedAt: new Date().toISOString(),
-                };
-                await this.db.upsertPlatformServer(bill.platformID, {
-                    provider: server?.provider || "dedicated",
-                    providerData,
-                    ...(String(server?.webdockStatus || "").toLowerCase() === "inactive" ? { webdockStatus: "active" } : {}),
-                });
-            }
             try {
                 await this.applyPaidDedicatedServerResize(bill.platformID, billId);
                 if (bill.meta?.serviceKey === "billing" && bill.meta?.plan === "professional") {

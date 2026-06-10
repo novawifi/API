@@ -120,8 +120,87 @@ class Mikrotikcontroller {
         });
     }
 
-    async uploadHotspotLoginTemplate(platformID, stationHost) {
-        const loginHtml = await this.buildOfflineLoginTemplateHtml(platformID, stationHost);
+    async buildOnlineLoginTemplateHtml(platformID, stationHost) {
+        const platform = await this.db.getPlatform(platformID);
+        const config = await this.db.getPlatformConfig(platformID);
+        if (!platform || !config) {
+            throw new Error("Platform data not found");
+        }
+
+        const host = String(stationHost || config?.mikrotikHost || "").trim();
+        const hash = getHotspotHash(host);
+        const portalBase = String(
+            platform.domain ||
+            platform.url ||
+            process.env.NEXT_PUBLIC_DOMAIN ||
+            process.env.DOMAIN ||
+            ""
+        ).trim();
+        if (!portalBase) {
+            throw new Error("Platform portal URL is not configured");
+        }
+        const portalUrl = /^https?:\/\//i.test(portalBase)
+            ? portalBase.replace(/\/+$/, "")
+            : `https://${portalBase.replace(/\/+$/, "")}`;
+        const loginUrl = `${portalUrl}/login?hash=${encodeURIComponent(hash)}&mac=$(mac)`;
+
+        return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="pragma" content="no-cache">
+<meta http-equiv="expires" content="-1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WiFi Login</title>
+<script src="/md5.js"></script>
+<script>
+function autoLogin() {
+  var params = new URLSearchParams(window.location.search);
+  var username = params.get("username");
+  var password = params.get("password");
+  if (username && password) {
+    var form = document.createElement("form");
+    form.action = "$(link-login-only)";
+    form.method = "post";
+    var user = document.createElement("input");
+    user.type = "hidden";
+    user.name = "username";
+    user.value = username;
+    form.appendChild(user);
+    var pass = document.createElement("input");
+    pass.type = "hidden";
+    pass.name = "password";
+    pass.value = hexMD5("$(chap-id)" + password + "$(chap-challenge)");
+    form.appendChild(pass);
+    var dst = document.createElement("input");
+    dst.type = "hidden";
+    dst.name = "dst";
+    dst.value = "$(link-orig)";
+    form.appendChild(dst);
+    var popup = document.createElement("input");
+    popup.type = "hidden";
+    popup.name = "popup";
+    popup.value = "true";
+    form.appendChild(popup);
+    document.body.appendChild(form);
+    form.submit();
+    return;
+  }
+  window.location.replace("${loginUrl}");
+}
+</script>
+</head>
+<body onload="autoLogin()">
+<noscript><a href="${loginUrl}">Open WiFi login</a></noscript>
+</body>
+</html>`;
+    }
+
+    async uploadHotspotLoginTemplate(platformID, stationHost, options = {}) {
+        const mode = String(options.mode || "offline").toLowerCase() === "online" ? "online" : "offline";
+        const loginHtml = mode === "online"
+            ? await this.buildOnlineLoginTemplateHtml(platformID, stationHost)
+            : await this.buildOfflineLoginTemplateHtml(platformID, stationHost);
         const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, stationHost);
         if (!apiConnection?.api) {
             return { success: false, message: "Failed to open low-level API connection" };

@@ -64,13 +64,6 @@ function replaceElementText(html, id, value) {
   return html.replace(pattern, `$1${escapeHtmlText(value)}$3`);
 }
 
-function commentMd5ImportForPreview(html) {
-  return html.replace(
-    /<script\s+src=(["'])\/md5\.js\1\s*>\s*<\/script>/i,
-    "<!-- <script src=\"/md5.js\"></script> -->"
-  );
-}
-
 function normalizePackage(pkg) {
   return {
     id: String(pkg?.id || ""),
@@ -122,9 +115,6 @@ function renderOfflineBoxLoginTemplate(options = {}) {
   html = replaceElementText(html, "footerBrandName", brandName);
   html = replaceJsVar(html, "SUPPORT_PHONE", supportPhone);
   html = replaceJsVar(html, "PACKAGES", normalizePackages(options.packages));
-  if (options.preview) {
-    html = commentMd5ImportForPreview(html);
-  }
   return html;
 }
 

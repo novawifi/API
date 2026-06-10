@@ -1,4 +1,3 @@
-//@ts-check
 
 const cron = require("node-cron");
 const { NodeSSH } = require('node-ssh');
@@ -247,10 +246,8 @@ class CronJob {
                 ]);
                 const normalized = this.webdock.normalizeServer(webdockServer.data);
                 const providerHealth = this.webdock.normalizeInstantMetrics(instantMetrics.data, webdockServer.data);
-                const billingDeactivated = this.isDedicatedPaymentDeactivated(server);
                 await this.db.upsertPlatformServer(server.platformID, {
                     ...normalized,
-                    webdockStatus: billingDeactivated ? "inactive" : normalized.webdockStatus,
                     instantMetrics: providerHealth,
                     metrics: metrics.data,
                     lastSyncedAt: new Date(),
@@ -266,24 +263,6 @@ class CronJob {
                 });
             }
         }
-    }
-
-    getDedicatedCardGracePolicy() {
-        return {
-            retryLimit: Number(process.env.DEDICATED_CARD_RETRY_LIMIT || 5),
-            graceMs: Number(process.env.DEDICATED_CARD_GRACE_MS || 2 * 24 * 60 * 60 * 1000),
-        };
-    }
-
-    isDedicatedPaymentDeactivated(server) {
-        const providerData = server?.providerData && typeof server.providerData === "object" ? server.providerData : {};
-        const grace = providerData.dedicatedBillingGrace || {};
-        return grace.status === "deactivated" || String(server?.webdockStatus || "").toLowerCase() === "inactive";
-    }
-
-    isProfessionalBillingBill(bill) {
-        const meta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
-        return meta.serviceKey === "billing" && String(meta.plan || "").toLowerCase() === "professional";
     }
 
     async createWebdockHealthNotifications(platformID, health) {
@@ -327,50 +306,38 @@ class CronJob {
         }
     }
 
-    async deactivateOverdueDedicatedServers() {
+    async deleteOverdueDedicatedServers() {
+        if (!this.webdock.isConfigured()) return;
         const platforms = await this.db.getAllPlatforms();
-        const policy = this.getDedicatedCardGracePolicy();
+        const cutoffMs = 30 * 24 * 60 * 60 * 1000;
         for (const platform of platforms) {
             try {
                 const server = await this.db.getPlatformServer(platform.platformID);
-                if (!server || ["deleted", "deleting"].includes(String(server.webdockStatus || "").toLowerCase())) continue;
+                if (!server?.webdockSlug || ["deleted", "deleting"].includes(String(server.webdockStatus || "").toLowerCase())) continue;
                 const unpaid = await this.db.getUnpaidPlatformBilling(platform.platformID);
-                const bill = unpaid.find((item) => this.isProfessionalBillingBill(item) && Number(item.amount || 0) > 0);
-                if (!bill) continue;
-
-                const providerData = server.providerData && typeof server.providerData === "object" ? { ...server.providerData } : {};
-                const existingGrace = providerData.dedicatedBillingGrace || {};
-                if (existingGrace.status === "deactivated" || String(server.webdockStatus || "").toLowerCase() === "inactive") continue;
-                const graceStart = existingGrace.firstFailedAt || bill.dueDate || bill.createdAt;
-                if (!graceStart) continue;
-                const graceEndsAt = existingGrace.graceEndsAt || new Date(new Date(graceStart).getTime() + policy.graceMs).toISOString();
-                const failureCount = Number(existingGrace.failureCount || 0);
-                const overdue = failureCount >= policy.retryLimit || Date.now() >= new Date(graceEndsAt).getTime();
+                const overdue = unpaid.some((bill) => Number(bill.amount || 0) > 0 && bill.dueDate && Date.now() - new Date(bill.dueDate).getTime() > cutoffMs);
                 if (!overdue) continue;
-
-                providerData.dedicatedBillingGrace = {
-                    ...existingGrace,
-                    status: "deactivated",
-                    retryLimit: policy.retryLimit,
-                    graceEndsAt,
-                    billID: bill.id,
-                    deactivatedAt: existingGrace.deactivatedAt || new Date().toISOString(),
-                    updatedAt: new Date().toISOString(),
-                };
-
+                const response = await this.webdock.deleteServer(server.webdockSlug);
                 await this.db.upsertPlatformServer(platform.platformID, {
-                    webdockStatus: "inactive",
-                    providerData,
+                    webdockStatus: "deleting",
+                    pendingDeletionAt: new Date(),
                 });
-                await this.db.updatePlatform(platform.platformID, { status: "inactive" });
-                await this.db.upsertPlatformNotification(platform.platformID, "Dedicated server deactivated: payment required", {
-                    message: "The dedicated server was deactivated after the payment grace period. Resources were not deleted.",
+                await this.db.createDedicatedServerAction({
+                    platformID: platform.platformID,
+                    serverSlug: server.webdockSlug,
+                    type: "delete",
+                    status: response.callbackId ? "pending" : "processing",
+                    callbackId: response.callbackId,
+                    response: { callbackSequence: response.callbackSequence },
+                });
+                await this.db.upsertPlatformNotification(platform.platformID, "Dedicated server deleted for unpaid bill", {
+                    message: "Dedicated server deletion was queued because a bill has been unpaid for more than 30 days.",
                     status: "error",
                     actionLabel: "View Bills",
                     actionUrl: "/admin/bills",
                 });
             } catch (error) {
-                console.error("[cron] overdue dedicated server deactivation failed", error?.message || error);
+                console.error("[cron] overdue Webdock deletion failed", error?.message || error);
             }
         }
     }
@@ -2234,9 +2201,9 @@ Price: KSH ${service.price}</p>
                 console.log("[cron] Running hourly cleanup...");
                 try {
                     await withTimeout(
-                        this.deactivateOverdueDedicatedServers(),
+                        this.deleteOverdueDedicatedServers(),
                         120_000,
-                        "dedicated overdue deactivation"
+                        "webdock overdue deletion"
                     );
 
                     await withTimeout(

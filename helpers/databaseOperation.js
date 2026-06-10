@@ -4578,39 +4578,6 @@ class DataBase {
         }
     }
 
-    async getSystemBasisMigrations(platformID, limit = 50) {
-        if (!platformID) return [];
-        try {
-            return prisma.platformMigration.findMany({
-                where: { platformID, direction: "system_basis" },
-                orderBy: { createdAt: "desc" },
-                take: limit,
-            });
-        } catch (error) {
-            console.error("Error getting system basis migrations:", error);
-            throw error;
-        }
-    }
-
-    async getLatestSystemBasisMigration(platformID, stationId, statuses = []) {
-        if (!platformID || !stationId) return null;
-        try {
-            const migrations = await prisma.platformMigration.findMany({
-                where: {
-                    platformID,
-                    direction: "system_basis",
-                    ...(statuses.length ? { status: { in: statuses } } : {}),
-                },
-                orderBy: { createdAt: "desc" },
-                take: 25,
-            });
-            return migrations.find((migration) => migration?.request?.stationId === stationId) || null;
-        } catch (error) {
-            console.error("Error getting latest system basis migration:", error);
-            throw error;
-        }
-    }
-
     async getLatestPlatformMigration(platformID, statuses = []) {
         if (!platformID) return null;
         try {

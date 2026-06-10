@@ -378,113 +378,6 @@ class Controller {
     };
   }
 
-  getDedicatedCardGracePolicy() {
-    return {
-      retryLimit: Number(process.env.DEDICATED_CARD_RETRY_LIMIT || 5),
-      graceMs: Number(process.env.DEDICATED_CARD_GRACE_MS || 2 * 24 * 60 * 60 * 1000),
-    };
-  }
-
-  isDedicatedBillingBill(bill) {
-    const meta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
-    return meta.serviceKey === "billing" && this.normalizePlatformPlan(meta.plan) === "professional";
-  }
-
-  isDedicatedPaymentDeactivated(server) {
-    const providerData = server?.providerData && typeof server.providerData === "object" ? server.providerData : {};
-    const grace = providerData.dedicatedBillingGrace || {};
-    return grace.status === "deactivated" || String(server?.webdockStatus || "").toLowerCase() === "inactive";
-  }
-
-  async updateDedicatedBillingGrace(platformID, data) {
-    if (!platformID) return null;
-    const existing = await this.db.getPlatformServer(platformID);
-    const providerData = existing?.providerData && typeof existing.providerData === "object"
-      ? { ...existing.providerData }
-      : {};
-    providerData.dedicatedBillingGrace = {
-      ...(providerData.dedicatedBillingGrace || {}),
-      ...data,
-      updatedAt: new Date().toISOString(),
-    };
-    return this.db.upsertPlatformServer(platformID, {
-      provider: existing?.provider || "dedicated",
-      providerData,
-      ...(data.status === "deactivated" ? { webdockStatus: "inactive" } : {}),
-      ...(data.status === "paid" && String(existing?.webdockStatus || "").toLowerCase() === "inactive" ? { webdockStatus: "active" } : {}),
-    });
-  }
-
-  async applyDedicatedCardPaymentGrace(bill, paymentStatus, reason = "") {
-    if (!bill || !this.isDedicatedBillingBill(bill)) return;
-
-    const normalizedStatus = String(paymentStatus || "").toUpperCase();
-    if (normalizedStatus === "COMPLETE") {
-      await this.updateBillCardAutopay(bill, {
-        dedicatedGrace: {
-          status: "paid",
-          failureCount: 0,
-          resolvedAt: new Date().toISOString(),
-        },
-      });
-      await this.updateDedicatedBillingGrace(bill.platformID, {
-        status: "paid",
-        failureCount: 0,
-        billID: bill.id,
-        resolvedAt: new Date().toISOString(),
-      });
-      await this.db.updatePlatform(bill.platformID, { status: "active" });
-      return;
-    }
-
-    if (normalizedStatus !== "FAILED") return;
-
-    const policy = this.getDedicatedCardGracePolicy();
-    const cardAutopay = this.getBillCardAutopay(bill) || {};
-    const currentGrace = cardAutopay.dedicatedGrace && typeof cardAutopay.dedicatedGrace === "object"
-      ? cardAutopay.dedicatedGrace
-      : {};
-    const now = Date.now();
-    const firstFailedAt = currentGrace.firstFailedAt || new Date(now).toISOString();
-    const graceEndsAt = currentGrace.graceEndsAt || new Date(new Date(firstFailedAt).getTime() + policy.graceMs).toISOString();
-    const failureCount = Number(currentGrace.failureCount || 0) + 1;
-    const shouldDeactivate = failureCount >= policy.retryLimit || now >= new Date(graceEndsAt).getTime();
-    const grace = {
-      status: shouldDeactivate ? "deactivated" : "grace",
-      failureCount,
-      retryLimit: policy.retryLimit,
-      firstFailedAt,
-      lastFailedAt: new Date(now).toISOString(),
-      graceEndsAt,
-      reason,
-      deactivatedAt: shouldDeactivate ? new Date(now).toISOString() : currentGrace.deactivatedAt || null,
-    };
-
-    await this.updateBillCardAutopay(bill, { dedicatedGrace: grace });
-    await this.updateDedicatedBillingGrace(bill.platformID, {
-      ...grace,
-      billID: bill.id,
-    });
-
-    if (shouldDeactivate) {
-      await this.db.updatePlatform(bill.platformID, { status: "inactive" });
-      await this.notifyPlatform(bill.platformID, "Dedicated server deactivated: payment required", {
-        message: `Card payment failed ${failureCount} time(s). The dedicated server is deactivated until the bill is paid. Resources were not deleted.`,
-        status: "error",
-        actionLabel: "Pay Bill",
-        actionUrl: "/admin/bills",
-      });
-      return;
-    }
-
-    await this.notifyPlatform(bill.platformID, "Dedicated server payment retry failed", {
-      message: `Card payment failed. Retry ${failureCount}/${policy.retryLimit}; grace ends in 2 days from first failure.`,
-      status: "warning",
-      actionLabel: "Pay Bill",
-      actionUrl: "/admin/bills",
-    });
-  }
-
   async fetchCardBilling(req, res) {
     const { token } = req.body || {};
     if (!token) return res.json({ success: false, message: "Missing credentials required!" });
@@ -616,7 +509,6 @@ class Controller {
       await this.intasendRequest("post", `/api/v1/subscriptions/${cardAutopay.subscriptionID}/unsubscribe/`, {});
       await this.updateBillCardAutopay(bill, {
         status: "CANCELED",
-        setupUrl: null,
         canceledAt: new Date().toISOString(),
       });
       return res.json({ success: true, message: "Card billing canceled." });
@@ -665,7 +557,6 @@ class Controller {
         lastInvoiceID: invoiceID,
       });
 
-      let shouldApplyDedicatedGrace = !invoiceID && ["COMPLETE", "FAILED"].includes(status);
       if (invoiceID) {
         const existingPayment = await this.db.getMpesaCode(invoiceID);
         if (!existingPayment) {
@@ -688,7 +579,6 @@ class Controller {
           if (status === "COMPLETE") {
             await this.mpesa.completePaymentForService(payment);
           }
-          shouldApplyDedicatedGrace = ["COMPLETE", "FAILED"].includes(status);
         } else if (existingPayment.status !== status) {
           const payment = await this.db.updateMpesaCodeByID(existingPayment.id, {
             status,
@@ -698,16 +588,7 @@ class Controller {
           if (status === "COMPLETE") {
             await this.mpesa.completePaymentForService(payment);
           }
-          shouldApplyDedicatedGrace = ["COMPLETE", "FAILED"].includes(status);
         }
-      }
-
-      if (shouldApplyDedicatedGrace) {
-        await this.applyDedicatedCardPaymentGrace(
-          bill,
-          status,
-          invoice.failed_reason || payload.fail_reason || payload.status || ""
-        );
       }
 
       return res.json({ success: true });
@@ -3123,9 +3004,6 @@ class Controller {
         platform_id = platform.id;
         domain = platform.domain;
       }
-      const subscriptionPlan = this.normalizePlatformPlan(platform?.subscriptionPlan);
-      const isDedicatedPlan = subscriptionPlan === "professional";
-      const domainTargetIp = await this.getPlatformDomainTargetIp(platformID, platform);
 
       if (auth.admin.role !== "superuser") {
         const limitedResponse = {
@@ -3136,9 +3014,6 @@ class Controller {
           url,
           settings: { name },
           platform_id,
-          subscriptionPlan,
-          isDedicatedPlan,
-          domainTargetIp,
         };
         return res.json(limitedResponse);
       }
@@ -3182,10 +3057,7 @@ class Controller {
         name,
         url,
         settings: platformSettings,
-        platform_id,
-        subscriptionPlan,
-        isDedicatedPlan,
-        domainTargetIp,
+        platform_id
       };
       return res.json(response);
     } catch (error) {
@@ -3280,6 +3152,10 @@ class Controller {
       }
       const payload = {
         ...data,
+        adminID,
+        IsC2B: IsC2B === true,
+        IsAPI: IsAPI === true,
+        IsB2B: IsB2B === true,
         mpesaShortCodeType: b2bShortCodeType,
         mpesaC2BShortCodeType: c2bShortCodeType,
       };
@@ -3287,6 +3163,10 @@ class Controller {
         const add = await this.db.createPlatformConfig(platformID, payload);
         await this.refreshDashboardStats(platformID, { role: auth.admin.role });
         this.cache.del(`main:settings:${platformID}`);
+        this.syncHotspotLoginTemplates(
+          platformID,
+          String(payload.template || "Default").toLowerCase() === "offlinebox" ? "offline" : "online"
+        ).catch((error) => this.logPlatform(platformID, `login.html sync failed: ${error?.message || error}`, { context: "templates", level: "warn" }));
         return res.json({
           success: true,
           message: "Platform Settings created.",
@@ -3296,6 +3176,10 @@ class Controller {
       const updatedConfig = await this.db.updatePlatformConfig(platformID, payload);
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
       this.cache.del(`main:settings:${platformID}`);
+      this.syncHotspotLoginTemplates(
+        platformID,
+        String(updatedConfig?.template || payload.template || existingConfig?.template || "Default").toLowerCase() === "offlinebox" ? "offline" : "online"
+      ).catch((error) => this.logPlatform(platformID, `login.html sync failed: ${error?.message || error}`, { context: "templates", level: "warn" }));
       return res.json({
         success: true,
         message: "Platform Settings updated.",
@@ -6000,6 +5884,42 @@ class Controller {
 
   }
 
+  async syncHotspotLoginTemplates(platformID, mode) {
+    const stations = await this.db.getMikrotikPlatformConfig(platformID);
+    const targets = (Array.isArray(stations) ? stations : [])
+      .filter((station) => station?.mikrotikHost)
+      .filter((station) => ["API", "RADIUS", ""].includes(String(station?.systemBasis || "API").toUpperCase()));
+
+    const results = [];
+    for (const station of targets) {
+      const host = station.mikrotikHost;
+      try {
+        const upload = await this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode });
+        results.push({
+          stationId: station.id,
+          host,
+          success: Boolean(upload?.success),
+          message: upload?.message || "login.html uploaded",
+        });
+      } catch (error) {
+        results.push({
+          stationId: station.id,
+          host,
+          success: false,
+          message: error?.message || "Failed to upload login.html",
+        });
+      }
+    }
+
+    return {
+      mode,
+      total: results.length,
+      success: results.filter((result) => result.success).length,
+      failed: results.filter((result) => !result.success).length,
+      results,
+    };
+  }
+
   async updateTemplate(req, res) {
 
     const { token, name, mode } = req.body;
@@ -6046,12 +5966,22 @@ class Controller {
       const data = { template: nextTemplate };
       const upd = await this.db.updatePlatformConfig(platformID, data);
       this.cache.del(`main:templates:${platformID}`);
+      const uploadSummary = await this.syncHotspotLoginTemplates(
+        platformID,
+        templateMode === "offline" ? "offline" : "online"
+      );
+      const uploadFailed = uploadSummary.failed > 0;
 
       return res.status(200).json({
         success: true,
-        message: templateMode === "offline" ? "Offline template selected successfully" : "Template updated successfully",
+        message: uploadFailed
+          ? `${templateMode === "offline" ? "Offline template selected" : "Template updated"}, but login.html failed on ${uploadSummary.failed}/${uploadSummary.total} router(s).`
+          : templateMode === "offline"
+            ? "Offline template selected and login.html uploaded successfully"
+            : "Template updated and login.html uploaded successfully",
         template: nextTemplate,
         templateMode: templateMode === "offline" ? "offline" : "online",
+        uploadSummary,
       });
 
     } catch (error) {
@@ -6612,31 +6542,9 @@ class Controller {
 
   }
 
-  extractDedicatedServerIp(server) {
-    const providerData = server?.providerData && typeof server.providerData === "object" ? server.providerData : {};
-    return String(
-      server?.ipAddress ||
-      providerData.ipAddress ||
-      providerData.ip ||
-      providerData.ipv4 ||
-      providerData.publicIp ||
-      providerData.publicIP ||
-      ""
-    ).trim();
-  }
-
-  async getPlatformDomainTargetIp(platformID, platform = null) {
-    const activePlatform = platform || (platformID ? await this.db.getPlatform(platformID) : null);
-    if (this.normalizePlatformPlan(activePlatform?.subscriptionPlan) === "professional") {
-      const server = await this.db.getPlatformServer(platformID);
-      return this.extractDedicatedServerIp(server);
-    }
-    return String(process.env.SERVER_IP || "").trim();
-  }
-
   async checkIfDomainResolvesToServer(req, res) {
 
-    const { url, token } = req.body;
+    const { url } = req.body;
     if (!url) {
       return res.json({
         success: false,
@@ -6647,21 +6555,12 @@ class Controller {
     try {
       const hostname = url.replace(/^https?:\/\//, "").split("/")[0];
       const addresses = await dns.lookup(hostname);
-      let targetIp = String(process.env.SERVER_IP || "").trim();
-      if (token) {
-        const auth = await this.auth.AuthenticateRequest(token);
-        if (!auth.success) {
-          return res.json({ success: false, message: auth.message });
-        }
-        targetIp = await this.getPlatformDomainTargetIp(auth.admin?.platformID);
-      }
-      const valid = Boolean(targetIp) && addresses.address === targetIp;
+      const valid = addresses.address === process.env.SERVER_IP;
 
       return res.json({
         success: true,
         valid,
         ip: addresses.address,
-        targetIp,
         message: "URL resolves successfully.",
       });
     } catch (err) {
@@ -7025,7 +6924,6 @@ class Controller {
       platformID,
       host,
       hash: options.hash || getHotspotHash(host),
-      preview: Boolean(options.preview),
     });
   }
 
@@ -7048,7 +6946,7 @@ class Controller {
     }
 
     try {
-      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req, preview: true });
+      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req });
       return res
         .status(200)
         .set("Content-Type", "text/html; charset=utf-8")
@@ -7376,7 +7274,7 @@ class Controller {
               package: pkg,
               routerHost: pkg.routerHost,
               code: payment.code.trim(),
-              mac: payment.code.trim(),
+              mac: "null",
               token: "null"
             };
             const addcodetorouter = await this.mikrotik.addManualCode(data);
@@ -7791,12 +7689,6 @@ class Controller {
         message: "Invalid platform URL. Use letters, numbers, dots, and hyphens only.",
       });
     }
-    if (this.isReservedPlatformSubdomain(sanitizedUrl)) {
-      return res.status(400).json({
-        success: false,
-        message: "Choose a different DNS subdomain name.",
-      });
-    }
 
     try {
       const checkplatform = await this.db.getPlatformByURLData(sanitizedUrl);
@@ -7987,38 +7879,6 @@ class Controller {
     if (!/^[a-z0-9.-]+$/.test(normalized)) return null;
     if (normalized.includes("..") || normalized.includes("/") || normalized.startsWith(".") || normalized.endsWith(".")) return null;
     return normalized;
-  }
-
-  getReservedPlatformSubdomains() {
-    return new Set([
-      "admin", "administrator", "api", "app", "apps", "assets", "auth", "billing", "blog", "cdn",
-      "console", "cpanel", "dashboard", "db", "demo", "dev", "docs", "download", "downloads",
-      "email", "faq", "faqs", "files", "ftp", "gateway", "git", "help", "host", "hosting",
-      "imap", "internal", "jobs", "login", "mail", "manage", "manager", "metrics", "monitor",
-      "monitoring", "mx", "new", "news", "nova", "novawifi", "ns", "ns1", "ns2", "panel",
-      "pay", "payments", "pop", "pop3", "portal", "privacy", "prod", "production", "radius",
-      "register", "reports", "root", "router", "routers", "server", "servers", "service",
-      "services", "smtp", "ssh", "ssl", "staging", "status", "support", "sys", "system",
-      "terms", "test", "testing", "updates", "vps", "web", "webfig", "webmail", "www",
-    ]);
-  }
-
-  getPlatformDnsSubdomain(domain) {
-    const normalized = this.sanitizeDomain(domain);
-    if (!normalized) return "";
-    const baseDomain = this.sanitizeDomain(process.env.DOMAIN || "novawifi.co.ke");
-    if (baseDomain && normalized === baseDomain) return normalized.split(".")[0] || "";
-    if (baseDomain && normalized.endsWith(`.${baseDomain}`)) {
-      const subdomain = normalized.slice(0, -(`.${baseDomain}`).length);
-      return subdomain.split(".")[0] || "";
-    }
-    if (!normalized.includes(".")) return normalized;
-    return "";
-  }
-
-  isReservedPlatformSubdomain(domain) {
-    const subdomain = this.getPlatformDnsSubdomain(domain);
-    return Boolean(subdomain && this.getReservedPlatformSubdomains().has(subdomain));
   }
 
   buildNginxConfig(domain, targetUrl) {
@@ -9010,7 +8870,6 @@ class Controller {
       let providerHealth = null;
       if (server?.webdockSlug && this.webdock.token) {
         try {
-          const billingDeactivated = this.isDedicatedPaymentDeactivated(server);
           const [webdockServer, instantMetrics, metrics] = await Promise.all([
             this.webdock.getServer(server.webdockSlug),
             this.webdock.getInstantMetrics(server.webdockSlug),
@@ -9020,7 +8879,6 @@ class Controller {
           providerHealth = this.webdock.normalizeInstantMetrics(instantMetrics.data, webdockServer.data);
           liveServer = await this.db.upsertPlatformServer(platformID, {
             ...normalized,
-            webdockStatus: billingDeactivated ? "inactive" : normalized.webdockStatus,
             instantMetrics: providerHealth,
             metrics: metrics.data,
             lastSyncedAt: new Date(),
@@ -9094,294 +8952,6 @@ class Controller {
     } catch (error) {
       console.error("Dedicated server service restart error:", error);
       return res.json({ success: false, message: "Failed to restart service" });
-    }
-  }
-
-  getDedicatedAgentToken(req) {
-    const authHeader = String(req.headers?.authorization || "").replace(/^Bearer\s+/i, "").trim();
-    return String(
-      req.headers?.["x-nova-agent-token"] ||
-      req.body?.agentToken ||
-      req.query?.agentToken ||
-      authHeader ||
-      ""
-    ).trim();
-  }
-
-  safeCompareSecret(left, right) {
-    const a = Buffer.from(String(left || ""));
-    const b = Buffer.from(String(right || ""));
-    if (!a.length || !b.length || a.length !== b.length) return false;
-    return crypto.timingSafeEqual(a, b);
-  }
-
-  hashDedicatedAgentToken(token) {
-    return crypto.createHash("sha256").update(String(token || "")).digest("hex");
-  }
-
-  async authenticateDedicatedAgent(req) {
-    const platformID = String(
-      req.headers?.["x-nova-platform-id"] ||
-      req.body?.platformID ||
-      req.query?.platformID ||
-      ""
-    ).trim();
-    if (!platformID) return { success: false, message: "Missing platformID." };
-
-    const platform = await this.db.getPlatformByplatformID(platformID);
-    if (!platform) return { success: false, message: "Platform not found." };
-    if (this.normalizePlatformPlan(platform.subscriptionPlan) !== "professional") {
-      return { success: false, message: "Dedicated server plan not active." };
-    }
-
-    const token = this.getDedicatedAgentToken(req);
-    const server = await this.db.getPlatformServer(platformID);
-    const agent = server?.providerData?.dedicatedAgent || {};
-    const tokenHash = agent?.tokenHash || "";
-    const tokenMatchesPlatform = tokenHash
-      ? this.safeCompareSecret(this.hashDedicatedAgentToken(token), tokenHash)
-      : false;
-    const fallbackSecret = process.env.DEDICATED_AGENT_SECRET || "";
-    const tokenMatchesFallback = fallbackSecret ? this.safeCompareSecret(token, fallbackSecret) : false;
-
-    if (!tokenMatchesPlatform && !tokenMatchesFallback) {
-      return { success: false, message: "Unauthorised dedicated agent." };
-    }
-
-    return { success: true, platformID, platform, server };
-  }
-
-  async generateDedicatedAgentToken(req, res) {
-    const { token } = req.body || {};
-    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
-    try {
-      const access = await this.getDedicatedServerAuth(token);
-      if (!access.success) return res.json({ success: false, message: access.message });
-      if (this.normalizePlatformPlan(access.platform.subscriptionPlan) !== "professional") {
-        return res.json({ success: false, message: "Dedicated server plan not active." });
-      }
-
-      const agentToken = `nova_da_${access.platformID}_${crypto.randomBytes(32).toString("hex")}`;
-      const existing = await this.db.getPlatformServer(access.platformID);
-      const providerData = existing?.providerData && typeof existing.providerData === "object"
-        ? { ...existing.providerData }
-        : {};
-      providerData.dedicatedAgent = {
-        ...(providerData.dedicatedAgent || {}),
-        tokenHash: this.hashDedicatedAgentToken(agentToken),
-        tokenCreatedAt: providerData.dedicatedAgent?.tokenCreatedAt || new Date().toISOString(),
-        tokenRotatedAt: new Date().toISOString(),
-      };
-
-      await this.db.upsertPlatformServer(access.platformID, {
-        provider: existing?.provider || "dedicated",
-        providerData,
-      });
-
-      return res.json({
-        success: true,
-        message: "Dedicated agent token generated.",
-        platformID: access.platformID,
-        agentToken,
-        env: {
-          PLATFORM_ID: access.platformID,
-          DEDICATED_AGENT_TOKEN: agentToken,
-          MAIN_API_URL: process.env.PUBLIC_API_URL || process.env.SERVER_URL || "https://api.novawifi.co.ke",
-        },
-      });
-    } catch (error) {
-      console.error("Dedicated agent token generation error:", error);
-      return res.json({ success: false, message: "Failed to generate dedicated agent token." });
-    }
-  }
-
-  getPublicPlatformConfig(config) {
-    if (!config) return {};
-    return {
-      IsC2B: Boolean(config.IsC2B),
-      IsAPI: Boolean(config.IsAPI),
-      IsB2B: Boolean(config.IsB2B),
-      supportPhone: config.supportPhone || "",
-      brandingImage: config.brandingImage || "",
-      template: config.template || "",
-      sms: Boolean(config.sms),
-      mpesaShortCodeType: config.mpesaShortCodeType || "",
-      mpesaC2BShortCodeType: config.mpesaC2BShortCodeType || "",
-    };
-  }
-
-  async dedicatedAgentConfig(req, res) {
-    try {
-      const access = await this.authenticateDedicatedAgent(req);
-      if (!access.success) return res.status(401).json(access);
-
-      const [config, server] = await Promise.all([
-        this.db.getPlatformConfig(access.platformID),
-        this.db.getPlatformServer(access.platformID),
-      ]);
-
-      return res.json({
-        success: true,
-        platform: {
-          platformID: access.platform.platformID,
-          name: access.platform.name,
-          url: access.platform.url,
-          domain: access.platform.domain,
-          status: access.platform.status,
-          subscriptionPlan: this.normalizePlatformPlan(access.platform.subscriptionPlan),
-        },
-        settings: this.getPublicPlatformConfig(config),
-        server,
-        billingDeactivated: this.isDedicatedPaymentDeactivated(server),
-        centralServices: {
-          baseUrl: process.env.PUBLIC_API_URL || process.env.SERVER_URL || "https://api.novawifi.co.ke",
-          allowed: ["mpesa", "mail", "sms", "notification"],
-        },
-      });
-    } catch (error) {
-      console.error("Dedicated agent config error:", error);
-      return res.status(500).json({ success: false, message: "Failed to load dedicated config." });
-    }
-  }
-
-  async dedicatedAgentHeartbeat(req, res) {
-    try {
-      const access = await this.authenticateDedicatedAgent(req);
-      if (!access.success) return res.status(401).json(access);
-
-      const payload = req.body || {};
-      const health = payload.health && typeof payload.health === "object" ? payload.health : {};
-      const services = payload.services && typeof payload.services === "object" ? payload.services : {};
-      const metrics = payload.metrics && typeof payload.metrics === "object" ? payload.metrics : {};
-      const remoteAddress = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "")
-        .split(",")[0]
-        .replace(/^::ffff:/, "")
-        .trim();
-      const existing = await this.db.getPlatformServer(access.platformID);
-      const providerData = existing?.providerData && typeof existing.providerData === "object"
-        ? { ...existing.providerData }
-        : {};
-      providerData.dedicatedAgent = {
-        ...(providerData.dedicatedAgent || {}),
-        hostname: payload.hostname || "",
-        version: payload.version || "",
-        platformID: access.platformID,
-        services,
-        remoteAddress,
-        lastHeartbeatAt: new Date().toISOString(),
-      };
-      const billingDeactivated = this.isDedicatedPaymentDeactivated(existing);
-
-      const server = await this.db.upsertPlatformServer(access.platformID, {
-        provider: existing?.provider || "dedicated",
-        webdockStatus: billingDeactivated ? "inactive" : (payload.status || "active"),
-        ipAddress: payload.ipAddress || existing?.ipAddress || remoteAddress,
-        sshStatus: health.ssh || existing?.sshStatus || "",
-        nginxStatus: health.nginx || existing?.nginxStatus || "",
-        databaseName: health.databaseName || existing?.databaseName || "",
-        instantMetrics: metrics,
-        metrics: health,
-        providerData,
-        lastSyncedAt: new Date(),
-      });
-
-      return res.json({ success: true, message: "Heartbeat received.", server });
-    } catch (error) {
-      console.error("Dedicated agent heartbeat error:", error);
-      return res.status(500).json({ success: false, message: "Failed to save heartbeat." });
-    }
-  }
-
-  async dedicatedAgentEvent(req, res) {
-    try {
-      const access = await this.authenticateDedicatedAgent(req);
-      if (!access.success) return res.status(401).json(access);
-
-      const title = String(req.body?.title || "Dedicated server event").slice(0, 120);
-      const message = String(req.body?.message || "").slice(0, 600);
-      const status = String(req.body?.status || "info").toLowerCase();
-      const safeStatus = ["info", "success", "warning", "error"].includes(status) ? status : "info";
-
-      await this.notifyPlatform(access.platformID, title, {
-        message,
-        status: safeStatus,
-        actionLabel: "View Server",
-        actionUrl: "/admin/server",
-      });
-
-      return res.json({ success: true, message: "Event received." });
-    } catch (error) {
-      console.error("Dedicated agent event error:", error);
-      return res.status(500).json({ success: false, message: "Failed to save event." });
-    }
-  }
-
-  async dedicatedAgentService(req, res) {
-    try {
-      const access = await this.authenticateDedicatedAgent(req);
-      if (!access.success) return res.status(401).json(access);
-      if (this.isDedicatedPaymentDeactivated(access.server)) {
-        return res.status(402).json({
-          success: false,
-          message: "Dedicated server is deactivated until the outstanding bill is paid.",
-        });
-      }
-
-      const service = String(req.body?.service || "").toLowerCase();
-      const action = String(req.body?.action || "").trim();
-      const payload = req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : {};
-
-      if (service === "mpesa") {
-        const allowed = {
-          stkPush: "stkPush",
-          payPPPoE: "payPPPoE",
-          payBill: "payBill",
-          paySMS: "paySMS",
-          checkPayment: "checkPayment",
-          verifyTransaction: "verifyTransaction",
-        };
-        const method = allowed[action];
-        if (!method || typeof this.mpesa[method] !== "function") {
-          return res.status(400).json({ success: false, message: "Unsupported MPESA action." });
-        }
-        const forwardedReq = { ...req, body: payload };
-        return this.mpesa[method].call(this.mpesa, forwardedReq, res);
-      }
-
-      if (service === "mail") {
-        if (action === "sendInternalEmail") {
-          const result = await this.mailer.sendInternalEmail(payload);
-          return res.json(result);
-        }
-        if (action === "EmailTemplate") {
-          const result = await this.mailer.EmailTemplate(payload);
-          return res.json(result);
-        }
-        return res.status(400).json({ success: false, message: "Unsupported mail action." });
-      }
-
-      if (service === "sms") {
-        if (action !== "sendInternalSMS") {
-          return res.status(400).json({ success: false, message: "Unsupported SMS action." });
-        }
-        const result = await this.sms.sendInternalSMS(payload.phone, payload.message);
-        return res.json(result);
-      }
-
-      if (service === "notification") {
-        const result = await this.notifyPlatform(access.platformID, payload.title, {
-          message: payload.message || "",
-          status: payload.status || "info",
-          actionLabel: payload.actionLabel,
-          actionUrl: payload.actionUrl,
-        });
-        return res.json({ success: true, notification: result });
-      }
-
-      return res.status(400).json({ success: false, message: "Unsupported central service." });
-    } catch (error) {
-      console.error("Dedicated agent service error:", error);
-      return res.status(500).json({ success: false, message: "Central service request failed." });
     }
   }
 
@@ -10978,59 +10548,8 @@ class Controller {
     }
   }
 
-  isRetryableMigrationError(error) {
-    const message = String(error?.message || error || "").toLowerCase();
-    return [
-      "mikrotik",
-      "router",
-      "connection",
-      "timeout",
-      "disconnected",
-      "no valid",
-      "econn",
-      "socket",
-    ].some((term) => message.includes(term));
-  }
-
-  buildSystemBasisMigrationRequest(auth, station, target, extra = {}) {
-    return {
-      type: "system_basis",
-      stationId: station.id,
-      stationName: station.name || station.mikrotikHost || "",
-      stationHost: station.mikrotikHost || "",
-      from: station.systemBasis || "API",
-      to: target,
-      requestedBy: {
-        id: auth.admin?.id || "",
-        adminID: auth.admin?.adminID || "",
-        name: auth.admin?.name || "",
-        email: auth.admin?.email || "",
-        role: auth.admin?.role || "",
-      },
-      retryCount: Number(extra.retryCount || 0),
-      maxRetries: Number(extra.maxRetries || 3),
-      retryable: Boolean(extra.retryable),
-      nextRetryAt: extra.nextRetryAt || null,
-    };
-  }
-
-  async fetchSystemBasisMigrations(req, res) {
-    const { token } = req.body || {};
-    if (!token) return res.status(400).json({ success: false, message: "Missing token" });
-    try {
-      const auth = await this.auth.AuthenticateRequest(token);
-      if (!auth.success || !auth.admin) return res.status(401).json({ success: false, message: auth.message });
-      const migrations = await this.db.getSystemBasisMigrations(auth.admin.platformID);
-      return res.json({ success: true, migrations });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: "Failed to fetch migration history" });
-    }
-  }
-
   async migrateSystemBasis(req, res) {
     const { token, target, stationId } = req.body || {};
-    let trackingMigration = null;
-    let trackingPlatformID = "";
     if (!token || !target || !stationId) {
       return res.status(400).json({ success: false, message: "Missing token, target, or stationId" });
     }
@@ -11044,7 +10563,6 @@ class Controller {
       }
 
       const platformID = auth.admin.platformID;
-      trackingPlatformID = platformID;
       const normalizedTarget = String(target).toUpperCase();
       if (!["API", "RADIUS"].includes(normalizedTarget)) {
         return res.status(400).json({ success: false, message: "Invalid target basis" });
@@ -11064,45 +10582,6 @@ class Controller {
       const planMap = new Map(plans.map((p) => [p.id, p]));
       const packageMap = new Map(stationPackages.map((p) => [p.id, p]));
       const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
-      const existingMigration = await this.db.getLatestSystemBasisMigration(platformID, station.id, ["pending", "running", "failed"]);
-      const existingRequest = existingMigration?.request || {};
-      const isSameTargetMigration = existingMigration?.destinationTarget === normalizedTarget;
-      if (existingMigration?.status === "running") {
-        return res.json({ success: true, message: "Migration already running", migration: existingMigration });
-      }
-      if (isSameTargetMigration && existingMigration?.status === "failed" && Number(existingRequest.retryCount || 0) >= Number(existingRequest.maxRetries || 3)) {
-        return res.json({ success: false, message: "Migration failed and retry limit was reached", migration: existingMigration });
-      }
-      if (existingMigration && isSameTargetMigration) {
-        trackingMigration = existingMigration;
-      } else {
-        trackingMigration = await this.db.createPlatformMigration({
-          platformID,
-          direction: "system_basis",
-          status: "pending",
-          domain: station.name || station.mikrotikHost || "",
-          requestedPlan: normalizedTarget,
-          sourcePlan: station.systemBasis || "API",
-          targetPlan: normalizedTarget,
-          sourceTarget: station.systemBasis || "API",
-          destinationTarget: normalizedTarget,
-          request: this.buildSystemBasisMigrationRequest(auth, station, normalizedTarget),
-        });
-      }
-      const requestMeta = trackingMigration?.request || this.buildSystemBasisMigrationRequest(auth, station, normalizedTarget);
-      const retryCount = Number(requestMeta.retryCount || 0) + 1;
-      trackingMigration = await this.db.updatePlatformMigration(trackingMigration.id, {
-        status: "running",
-        startedAt: trackingMigration.startedAt || new Date(),
-        error: null,
-        request: {
-          ...requestMeta,
-          retryCount,
-          retryable: false,
-          nextRetryAt: null,
-          lastAttemptAt: new Date().toISOString(),
-        },
-      });
 
       const summary = {
         target: normalizedTarget,
@@ -11169,7 +10648,7 @@ class Controller {
         if (routerResult.success) {
           summary.routerConfigured = true;
         } else {
-          throw new Error(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
+          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
         }
 
         for (const user of activeUsers) {
@@ -11237,7 +10716,7 @@ class Controller {
         if (routerResult.success) {
           summary.routerConfigured = true;
         } else {
-          throw new Error(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
+          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: ${routerResult.message}`);
         }
 
         for (const user of users) {
@@ -11358,51 +10837,9 @@ class Controller {
       }
 
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
-      const completedMigration = trackingMigration
-        ? await this.db.updatePlatformMigration(trackingMigration.id, {
-          status: "completed",
-          completedAt: new Date(),
-          records: {
-            usersMigrated: summary.usersMigrated,
-            pppoeMigrated: summary.pppoeMigrated,
-            packagesUpdated: summary.packagesUpdated,
-          },
-          response: summary,
-          error: null,
-        })
-        : null;
-      return res.json({ success: true, message: `Migration to ${normalizedTarget} completed`, summary, migration: completedMigration });
+      return res.json({ success: true, message: `Migration to ${normalizedTarget} completed`, summary });
     } catch (error) {
-      if (trackingMigration) {
-        const requestMeta = trackingMigration.request || {};
-        const maxRetries = Number(requestMeta.maxRetries || 3);
-        const retryCount = Number(requestMeta.retryCount || 1);
-        const retryable = this.isRetryableMigrationError(error) && retryCount < maxRetries;
-        const nextRetryAt = retryable ? new Date(Date.now() + Math.min(15 * 60 * 1000, retryCount * 2 * 60 * 1000)).toISOString() : null;
-        trackingMigration = await this.db.updatePlatformMigration(trackingMigration.id, {
-          status: "failed",
-          error: error?.message || String(error),
-          request: {
-            ...requestMeta,
-            retryCount,
-            maxRetries,
-            retryable,
-            nextRetryAt,
-            lastErrorAt: new Date().toISOString(),
-          },
-        });
-        if (trackingPlatformID) {
-          await this.db.upsertPlatformNotification(trackingPlatformID, "System migration failed", {
-            message: retryable
-              ? `Migration failed due to router connectivity and can be retried. Attempt ${retryCount}/${maxRetries}.`
-              : error?.message || "Migration failed.",
-            status: "error",
-            actionLabel: "View Stations",
-            actionUrl: "/admin/stations",
-          });
-        }
-      }
-      return res.status(500).json({ success: false, message: "Migration failed", error: error?.message || error, migration: trackingMigration });
+      return res.status(500).json({ success: false, message: "Migration failed", error: error?.message || error });
     }
   }
 }
