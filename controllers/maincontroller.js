@@ -6125,7 +6125,84 @@ class Controller {
 
   }
 
-  async syncHotspotLoginTemplates(platformID, mode) {
+  async resolveTemplateUploadStation(platformID, stationId, host) {
+    const normalizedHost = String(host || "").trim();
+    const invalidHostSelections = new Set(["all", "all routers", "*"]);
+
+    if (!stationId && (!normalizedHost || invalidHostSelections.has(normalizedHost.toLowerCase()))) {
+      return { success: false, status: 400, message: "Please select one MikroTik router before saving a template." };
+    }
+
+    let station = null;
+    if (stationId) {
+      station = await this.db.getStation(stationId);
+      if (!station || station.platformID !== platformID) {
+        return { success: false, status: 404, message: "Selected MikroTik router was not found." };
+      }
+      if (normalizedHost && station.mikrotikHost !== normalizedHost) {
+        return { success: false, status: 400, message: "Selected router does not match the submitted host." };
+      }
+    } else {
+      const stations = await this.db.getStations(platformID);
+      station = (Array.isArray(stations) ? stations : []).find((item) => item.mikrotikHost === normalizedHost);
+      if (!station) {
+        return { success: false, status: 404, message: "Selected MikroTik router was not found." };
+      }
+    }
+
+    if (!station?.mikrotikHost) {
+      return { success: false, status: 400, message: "Selected MikroTik router is missing its host address." };
+    }
+    if (!["API", "RADIUS", ""].includes(String(station?.systemBasis || "API").toUpperCase())) {
+      return { success: false, status: 400, message: "Selected router does not support hotspot template uploads." };
+    }
+
+    return { success: true, station };
+  }
+
+  withTimeout(promise, timeoutMs, message) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+  }
+
+  async syncHotspotLoginTemplates(platformID, mode, options = {}) {
+    if (options.station) {
+      const station = options.station;
+      const host = station.mikrotikHost;
+      const results = [];
+      try {
+        const upload = await this.withTimeout(
+          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
+          15000,
+          "login.html upload timed out on selected router"
+        );
+        results.push({
+          stationId: station.id,
+          host,
+          success: Boolean(upload?.success),
+          message: upload?.message || "login.html uploaded",
+        });
+      } catch (error) {
+        results.push({
+          stationId: station.id,
+          host,
+          success: false,
+          message: error?.message || "Failed to upload login.html",
+        });
+      }
+
+      return {
+        mode,
+        total: results.length,
+        success: results.filter((result) => result.success).length,
+        failed: results.filter((result) => !result.success).length,
+        results,
+      };
+    }
+
     const stations = await this.db.getMikrotikPlatformConfig(platformID);
     const targets = (Array.isArray(stations) ? stations : [])
       .filter((station) => station?.mikrotikHost)
@@ -6135,7 +6212,11 @@ class Controller {
     for (const station of targets) {
       const host = station.mikrotikHost;
       try {
-        const upload = await this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode });
+        const upload = await this.withTimeout(
+          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
+          15000,
+          "login.html upload timed out on router"
+        );
         results.push({
           stationId: station.id,
           host,
@@ -6163,7 +6244,7 @@ class Controller {
 
   async updateTemplate(req, res) {
 
-    const { token, name, mode } = req.body;
+    const { token, name, mode, stationId, host, station } = req.body;
     if (!token) {
       return res.json({
         success: false,
@@ -6196,6 +6277,14 @@ class Controller {
         });
       }
 
+      const selectedRouter = await this.resolveTemplateUploadStation(platformID, stationId, host || station);
+      if (!selectedRouter.success) {
+        return res.status(selectedRouter.status || 400).json({
+          success: false,
+          message: selectedRouter.message,
+        });
+      }
+
       const existingPlatform = await this.db.getPlatformConfig(platformID);
       if (!existingPlatform) {
         return res.status(404).json({
@@ -6209,7 +6298,8 @@ class Controller {
       this.cache.del(`main:templates:${platformID}`);
       const uploadSummary = await this.syncHotspotLoginTemplates(
         platformID,
-        templateMode === "offline" ? "offline" : "online"
+        templateMode === "offline" ? "offline" : "online",
+        { station: selectedRouter.station }
       );
       const uploadFailed = uploadSummary.failed > 0;
 
