@@ -106,8 +106,7 @@ class Mikrotikcontroller {
         let packages = [];
         if (host) {
             packages = await this.db.getPackagesByHost(platformID, host);
-        }
-        if (!packages || packages.length === 0) {
+        } else {
             packages = await this.db.getPackages(platformID);
         }
         return renderOfflineBoxLoginTemplate({
@@ -196,6 +195,72 @@ function autoLogin() {
 </html>`;
     }
 
+    normalizeHotspotHtmlDirectory(value) {
+        const directory = String(value || "hotspot")
+            .trim()
+            .replace(/\\/g, "/")
+            .replace(/^\/+|\/+$/g, "")
+            .replace(/\/+/g, "/");
+        const withoutLoginFile = directory.replace(/\/?login\.html$/i, "").replace(/^\/+|\/+$/g, "");
+        return withoutLoginFile || "hotspot";
+    }
+
+    async resolveHotspotLoginFilePath(channel) {
+        const fallbackDirectory = "hotspot";
+        let hotspotServers = [];
+        let profiles = [];
+
+        try {
+            hotspotServers = await channel.write(["/ip/hotspot/print"]);
+        } catch (error) {
+            hotspotServers = [];
+        }
+
+        try {
+            profiles = await channel.write(["/ip/hotspot/profile/print"]);
+        } catch (error) {
+            profiles = [];
+        }
+
+        const profileByNameOrId = new Map();
+        for (const profile of Array.isArray(profiles) ? profiles : []) {
+            if (profile?.name) profileByNameOrId.set(String(profile.name), profile);
+            if (profile?.[".id"]) profileByNameOrId.set(String(profile[".id"]), profile);
+        }
+
+        const activeServer = (Array.isArray(hotspotServers) ? hotspotServers : [])
+            .find((server) => String(server?.disabled || "").toLowerCase() !== "true" && server?.profile);
+        const profileRef = activeServer?.profile ? String(activeServer.profile) : "";
+        const selectedProfile = profileByNameOrId.get(profileRef) || (Array.isArray(profiles) ? profiles[0] : null);
+        const htmlDirectoryOverride = String(selectedProfile?.["html-directory-override"] || "").trim();
+        const profileDirectory = htmlDirectoryOverride && htmlDirectoryOverride.toLowerCase() !== "none"
+            ? htmlDirectoryOverride
+            : selectedProfile?.["html-directory"];
+        const htmlDirectory = this.normalizeHotspotHtmlDirectory(profileDirectory || fallbackDirectory);
+
+        return `${htmlDirectory}/login.html`;
+    }
+
+    async writeHotspotLoginFile(channel, path, contents) {
+        const safePath = `${this.normalizeHotspotHtmlDirectory(path)}/login.html`;
+        const existingFiles = await channel.write(["/file/print", `?name=${safePath}`]);
+        if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+            await channel.write([
+                "/file/set",
+                `=.id=${existingFiles[0][".id"]}`,
+                `=contents=${contents}`,
+            ]);
+            return safePath;
+        }
+
+        await channel.write([
+            "/file/add",
+            `=name=${safePath}`,
+            `=contents=${contents}`,
+        ]);
+        return safePath;
+    }
+
     async uploadHotspotLoginTemplate(platformID, stationHost, options = {}) {
         const mode = String(options.mode || "offline").toLowerCase() === "online" ? "online" : "offline";
         const loginHtml = mode === "online"
@@ -211,24 +276,227 @@ function autoLogin() {
             await apiConnection.api.connect();
             const rawApi = apiConnection.api.api().rosApi;
             rawChannel = await rawApi.openChannel();
-            const existingFiles = await rawChannel.write(["/file/print", "?name=hotspot/login.html"]);
-            if (Array.isArray(existingFiles) && existingFiles.length > 0) {
-                await rawChannel.write([
-                    "/file/set",
-                    `=.id=${existingFiles[0][".id"]}`,
-                    `=contents=${loginHtml}`,
-                ]);
-            } else {
-                await rawChannel.write([
-                    "/file/add",
-                    "=name=hotspot/login.html",
-                    `=contents=${loginHtml}`,
-                ]);
-            }
-            return { success: true };
+            const loginFilePath = await this.resolveHotspotLoginFilePath(rawChannel);
+            const writtenPath = await this.writeHotspotLoginFile(rawChannel, loginFilePath, loginHtml);
+            return { success: true, path: writtenPath, message: `login.html uploaded to ${writtenPath}` };
         } finally {
             try { await rawChannel?.close(); } catch (err) { }
             try { await apiConnection.api.close(); } catch (err) { }
+        }
+    }
+
+    sanitizeRouterFilePath(value) {
+        const normalized = String(value || "")
+            .trim()
+            .replace(/\\/g, "/")
+            .replace(/^\/+/, "")
+            .replace(/\/+/g, "/");
+        if (!normalized || normalized.includes("..") || /[\x00-\x1f]/.test(normalized)) {
+            return "";
+        }
+        return normalized;
+    }
+
+    async authenticateStationRequest(req) {
+        const token = req.body?.token || req.query?.token;
+        const stationId = req.body?.stationId || req.query?.stationId;
+        const stationHost = req.body?.host || req.query?.host || req.body?.station || req.query?.station;
+        if (!token) return { success: false, status: 401, message: "Missing token" };
+
+        const auth = await this.auth.AuthenticateRequest(token);
+        if (!auth.success) {
+            return { success: false, status: 401, message: auth.message || "Unauthorised" };
+        }
+        if (auth.admin?.role !== "superuser") {
+            return { success: false, status: 403, message: "Unauthorised" };
+        }
+
+        const platformID = auth.admin.platformID;
+        let station = null;
+        if (stationId) {
+            station = await this.db.getStation(stationId);
+            if (!station || station.platformID !== platformID) {
+                return { success: false, status: 404, message: "Selected station not found" };
+            }
+        } else if (stationHost) {
+            const stations = await this.db.getStations(platformID);
+            station = (Array.isArray(stations) ? stations : []).find((item) => item.mikrotikHost === stationHost);
+            if (!station) {
+                return { success: false, status: 404, message: "Selected station not found" };
+            }
+        }
+
+        if (!station?.mikrotikHost) {
+            return { success: false, status: 400, message: "Please select a MikroTik station" };
+        }
+
+        return { success: true, platformID, station, host: station.mikrotikHost };
+    }
+
+    async withRouterFileChannel(platformID, host, callback) {
+        const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, host);
+        if (!apiConnection?.api) {
+            return { success: false, message: "Failed to open low-level API connection" };
+        }
+
+        let rawChannel = null;
+        try {
+            await apiConnection.api.connect();
+            const rawApi = apiConnection.api.api().rosApi;
+            rawChannel = await rawApi.openChannel();
+            return await callback(rawChannel);
+        } finally {
+            try { await rawChannel?.close(); } catch (err) { }
+            try { await apiConnection.api.close(); } catch (err) { }
+        }
+    }
+
+    mapRouterFile(file) {
+        const name = String(file?.name || "");
+        const size = Number(file?.size || 0);
+        const type = String(file?.type || "").toLowerCase();
+        const isDirectory = type === "directory" || (!name.includes(".") && file?.contents === undefined && size === 0);
+        return {
+            id: file?.[".id"] || "",
+            name,
+            type: type || (isDirectory ? "directory" : "file"),
+            size,
+            creationTime: file?.["creation-time"] || "",
+            lastModified: file?.["last-modified"] || file?.["creation-time"] || "",
+            isDirectory,
+        };
+    }
+
+    async writeRouterFile(channel, path, contents) {
+        const safePath = this.sanitizeRouterFilePath(path);
+        if (!safePath) throw new Error("Invalid file path");
+        const existingFiles = await channel.write(["/file/print", `?name=${safePath}`]);
+        if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+            await channel.write([
+                "/file/set",
+                `=.id=${existingFiles[0][".id"]}`,
+                `=contents=${contents}`,
+            ]);
+            return safePath;
+        }
+
+        await channel.write([
+            "/file/add",
+            `=name=${safePath}`,
+            `=contents=${contents}`,
+        ]);
+        return safePath;
+    }
+
+    async listMikrotikFiles(req, res) {
+        try {
+            const auth = await this.authenticateStationRequest(req);
+            if (!auth.success) return res.status(auth.status).json({ success: false, message: auth.message });
+
+            const result = await this.withRouterFileChannel(auth.platformID, auth.host, async (channel) => {
+                const files = await channel.write(["/file/print"]);
+                const hotspotPath = await this.resolveHotspotLoginFilePath(channel).catch(() => "hotspot/login.html");
+                return {
+                    success: true,
+                    files: (Array.isArray(files) ? files : []).map((file) => this.mapRouterFile(file)),
+                    hotspotDirectory: hotspotPath.replace(/\/login\.html$/i, ""),
+                };
+            });
+            return res.json(result);
+        } catch (error) {
+            console.error("List MikroTik files error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to list MikroTik files" });
+        }
+    }
+
+    async readMikrotikFile(req, res) {
+        try {
+            const auth = await this.authenticateStationRequest(req);
+            if (!auth.success) return res.status(auth.status).json({ success: false, message: auth.message });
+            const filePath = this.sanitizeRouterFilePath(req.body?.path || req.query?.path);
+            if (!filePath) return res.status(400).json({ success: false, message: "Invalid file path" });
+
+            const result = await this.withRouterFileChannel(auth.platformID, auth.host, async (channel) => {
+                const matches = await channel.write(["/file/print", `?name=${filePath}`]);
+                const file = Array.isArray(matches) ? matches[0] : null;
+                if (!file?.[".id"]) return { success: false, message: "File not found" };
+                const details = await channel.write(["/file/print", `=.proplist=.id,name,type,size,contents,creation-time,last-modified`, `?.id=${file[".id"]}`]);
+                const record = Array.isArray(details) && details[0] ? details[0] : file;
+                return {
+                    success: true,
+                    file: this.mapRouterFile(record),
+                    content: String(record?.contents || ""),
+                };
+            });
+            return res.status(result.success ? 200 : 404).json(result);
+        } catch (error) {
+            console.error("Read MikroTik file error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to read MikroTik file" });
+        }
+    }
+
+    async uploadMikrotikFile(req, res) {
+        try {
+            const auth = await this.authenticateStationRequest(req);
+            if (!auth.success) return res.status(auth.status).json({ success: false, message: auth.message });
+            const filePath = this.sanitizeRouterFilePath(req.body?.path);
+            const content = req.body?.content ?? "";
+            if (!filePath) return res.status(400).json({ success: false, message: "Invalid upload path" });
+            if (String(content).length > 1024 * 1024) {
+                return res.status(413).json({ success: false, message: "File is too large for MikroTik API upload" });
+            }
+
+            const result = await this.withRouterFileChannel(auth.platformID, auth.host, async (channel) => {
+                const writtenPath = await this.writeRouterFile(channel, filePath, String(content));
+                return { success: true, message: "File uploaded successfully", path: writtenPath };
+            });
+            return res.json(result);
+        } catch (error) {
+            console.error("Upload MikroTik file error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to upload MikroTik file" });
+        }
+    }
+
+    async moveMikrotikFile(req, res) {
+        try {
+            const auth = await this.authenticateStationRequest(req);
+            if (!auth.success) return res.status(auth.status).json({ success: false, message: auth.message });
+            const from = this.sanitizeRouterFilePath(req.body?.from);
+            const to = this.sanitizeRouterFilePath(req.body?.to);
+            if (!from || !to) return res.status(400).json({ success: false, message: "Invalid source or destination path" });
+
+            const result = await this.withRouterFileChannel(auth.platformID, auth.host, async (channel) => {
+                const matches = await channel.write(["/file/print", `?name=${from}`]);
+                const file = Array.isArray(matches) ? matches[0] : null;
+                if (!file?.[".id"]) return { success: false, message: "File not found" };
+                await channel.write(["/file/set", `=.id=${file[".id"]}`, `=name=${to}`]);
+                return { success: true, message: "File moved successfully", path: to };
+            });
+            return res.status(result.success ? 200 : 404).json(result);
+        } catch (error) {
+            console.error("Move MikroTik file error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to move MikroTik file" });
+        }
+    }
+
+    async deleteMikrotikFile(req, res) {
+        try {
+            const auth = await this.authenticateStationRequest(req);
+            if (!auth.success) return res.status(auth.status).json({ success: false, message: auth.message });
+            const filePath = this.sanitizeRouterFilePath(req.body?.path);
+            if (!filePath) return res.status(400).json({ success: false, message: "Invalid file path" });
+
+            const result = await this.withRouterFileChannel(auth.platformID, auth.host, async (channel) => {
+                const matches = await channel.write(["/file/print", `?name=${filePath}`]);
+                const file = Array.isArray(matches) ? matches[0] : null;
+                if (!file?.[".id"]) return { success: false, message: "File not found" };
+                await channel.write(["/file/remove", `=.id=${file[".id"]}`]);
+                return { success: true, message: "File deleted successfully" };
+            });
+            return res.status(result.success ? 200 : 404).json(result);
+        } catch (error) {
+            console.error("Delete MikroTik file error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to delete MikroTik file" });
         }
     }
 

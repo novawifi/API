@@ -110,6 +110,7 @@ function renderOfflineBoxLoginTemplate(options = {}) {
   html = replaceJsVar(html, "API_BASE_URL", resolveApiBaseUrl(options.req));
   html = replaceJsVar(html, "PLATFORM_ID", options.platformID || platform.platformID || "");
   html = replaceJsVar(html, "HASH", options.hash || getHotspotHash(options.host));
+  html = replaceJsVar(html, "ROUTER_HOST", options.host || "");
   html = replaceJsVar(html, "MAC", "$(mac)");
   html = replaceJsVar(html, "BRAND_NAME", brandName);
   html = replaceElementText(html, "footerBrandName", brandName);

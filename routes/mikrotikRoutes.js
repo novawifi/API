@@ -61,6 +61,11 @@ router.post("/seed-auto-backup-script", use("seedAutoBackupScript"));
 router.get("/seed/auto-backup-script.rsc", use("getAutoBackupSeedScript"));
 router.get("/seed/auto-backup-script/:platformID/:host/:token.rsc", use("getAutoBackupSeedScript"));
 router.post("/station-seed-scripts", use("getStationSeedScripts"));
+router.post("/files/list", use("listMikrotikFiles"));
+router.post("/files/read", use("readMikrotikFile"));
+router.post("/files/upload", use("uploadMikrotikFile"));
+router.post("/files/move", use("moveMikrotikFile"));
+router.post("/files/delete", use("deleteMikrotikFile"));
 router.post("/router-backup/notify", use("notifyRouterBackupUploaded"));
 router.get("/router-backup/notify", use("notifyRouterBackupUploaded"));
 router.put(

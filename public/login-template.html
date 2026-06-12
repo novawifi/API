@@ -482,6 +482,7 @@
     var API_BASE_URL = "https://api.example.com";
     var PLATFORM_ID = "your-platform-id";
     var HASH = "";
+    var ROUTER_HOST = "";
     var MAC = "$(mac)";
     var BRAND_NAME = "OFFLINEBOX";
     var SUPPORT_PHONE = "0700 000 000";
@@ -584,7 +585,7 @@
       fetch(API_BASE_URL + "/req/packages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platformID: PLATFORM_ID, hash: HASH })
+        body: JSON.stringify({ platformID: PLATFORM_ID, hash: HASH, host: ROUTER_HOST, station: ROUTER_HOST })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {

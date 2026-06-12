@@ -4711,7 +4711,7 @@ class Controller {
               }
             }
 
-            const stationPackages = await this.db.getPackagesByHost(routerHost);
+            const stationPackages = await this.db.getPackagesByHost(station.platformID, routerHost);
             const packageIds = new Set(
               Array.isArray(stationPackages) ? stationPackages.map((pkg) => pkg.id) : []
             );
@@ -7152,8 +7152,7 @@ class Controller {
     let packages = [];
     if (host) {
       packages = await this.db.getPackagesByHost(platformID, host);
-    }
-    if (!packages || packages.length === 0) {
+    } else {
       packages = await this.db.getPackages(platformID);
     }
 
@@ -7172,7 +7171,8 @@ class Controller {
   async hotspotLoginTemplate(req, res) {
     const token = req.body?.token || req.query?.token;
     let platformID = req.body?.platformID || req.params?.platformID || req.query?.platformID;
-    const station = req.body?.station || req.query?.station || req.body?.host || req.query?.host;
+    let station = req.body?.station || req.query?.station || req.body?.host || req.query?.host;
+    const stationId = req.body?.stationId || req.query?.stationId;
     const hash = req.body?.hash || req.query?.hash;
     const preview = req.body?.preview === true || req.body?.preview === "true" || req.query?.preview === "true";
 
@@ -7189,6 +7189,12 @@ class Controller {
     }
 
     try {
+      if (!station && stationId) {
+        const stationRecord = await this.db.getStation(stationId);
+        if (stationRecord?.platformID === platformID) {
+          station = stationRecord.mikrotikHost;
+        }
+      }
       const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req, preview });
       return res
         .status(200)
@@ -7202,6 +7208,8 @@ class Controller {
 
   async Packages(req, res) {
     const { platformID, hash } = req.body;
+    let station = req.body?.station || req.query?.station || req.body?.host || req.query?.host || req.body?.routerHost || req.query?.routerHost;
+    const stationId = req.body?.stationId || req.query?.stationId;
 
     if (!platformID) {
       return res.status(400).json({ type: "error", message: "Platform ID is required." });
@@ -7209,32 +7217,21 @@ class Controller {
 
     try {
       let packages;
-      const platform = await this.db.getPlatform(platformID);
-      const platformUrl = String(platform?.url || "").trim();
-      const platformHost = platformUrl
-        ? platformUrl.replace(/^https?:\/\//, "").split("/")[0]
-        : "";
-      let host = "";
-      if (hash) {
-        try {
-          const decoded = Utils.decodeHashedIP(hash);
-          if (Utils.isValidIP(decoded) && decoded.startsWith("10.10.10.")) {
-            host = decoded;
-          }
-        } catch (error) {
-          host = "";
+      const config = await this.db.getPlatformConfig(platformID);
+      if (!station && stationId) {
+        const stationRecord = await this.db.getStation(stationId);
+        if (stationRecord?.platformID === platformID) {
+          station = stationRecord.mikrotikHost;
         }
       }
-      if (!host && platformHost) {
-        host = platformHost;
-      }
+      const host = this.resolveHotspotTemplateHost({ hash, station, config });
       if (host) {
         packages = await this.db.getPackagesByHost(platformID, host);
       } else {
         packages = await this.db.getPackages(platformID);
       }
+      packages = Array.isArray(packages) ? packages : [];
 
-      const config = await this.db.getPlatformConfig(platformID);
       if (config?.mpesaShortCodeType?.toLowerCase() === "paybill" && Array.isArray(packages)) {
         for (const pkg of packages) {
           if (!pkg.accountNumber) {
