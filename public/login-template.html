@@ -1,488 +1,858 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WiFi Login</title>
-<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#f0f4f0;font-family:'Nunito','Segoe UI',sans-serif;min-height:100vh;padding:0 0 40px}
-  .header{background:#007A3D;padding:28px 16px 20px;text-align:center;border-radius:0 0 24px 24px;margin-bottom:20px}
-  .brand{color:#fff;font-size:24px;font-weight:800;letter-spacing:3px;text-transform:uppercase}
-  .support-bar{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:14px;background:rgba(255,255,255,.12);border-radius:10px;padding:9px 16px;max-width:320px;margin-left:auto;margin-right:auto}
-  .support-bar span{color:#c8f0dc;font-size:12px;font-weight:600}
-  .support-bar a{color:#fff;font-size:15px;font-weight:800;text-decoration:none}
-  .page-body{padding:0 14px}
-  .section-label{color:#007A3D;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin:0 0 10px 2px}
-  .packages-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
-  .pkg-card{background:#fff;border:1.5px solid #e2f0e8;border-radius:16px;padding:14px 12px;display:flex;flex-direction:column;align-items:center;text-align:center;gap:4px;transition:border-color .2s,box-shadow .2s;cursor:pointer}
-  .pkg-card:hover{border-color:#007A3D;box-shadow:0 2px 12px rgba(0,122,61,.12)}
-  .pkg-name{color:#1a3d2a;font-size:13px;font-weight:700;line-height:1.2}
-  .pkg-usage{color:#007A3D;font-size:11px;font-weight:600;background:#e8f5ee;border-radius:6px;padding:2px 8px;margin:2px 0}
-  .pkg-price{color:#007A3D;font-size:22px;font-weight:800;line-height:1.1;margin:4px 0 0}
-  .pkg-price-sub{color:#6b8c7a;font-size:10px;font-weight:600}
-  .pkg-period{color:#6b8c7a;font-size:11px;font-weight:600;margin-bottom:6px}
-  .btn-connect-pkg{width:100%;background:#007A3D;color:#fff;border:none;border-radius:9px;padding:10px 0;font-size:13px;font-weight:800;cursor:pointer;letter-spacing:.5px;transition:background .15s,transform .1s;font-family:'Nunito',sans-serif;margin-top:auto}
-  .btn-connect-pkg:hover{background:#005c2e}
-  .btn-connect-pkg:active{transform:scale(.97)}
-  .already-card{background:#fff;border:1.5px solid #e2f0e8;border-radius:16px;padding:18px;margin-bottom:20px}
-  .already-title{color:#007A3D;font-size:15px;font-weight:800;margin-bottom:3px}
-  .already-sub{color:#6b8c7a;font-size:12px;font-weight:600;margin-bottom:14px;line-height:1.5}
-  .input-field{width:100%;background:#f7faf8;border:1.5px solid #c8e6d4;border-radius:10px;color:#1a3d2a;font-size:14px;font-weight:600;padding:12px 14px;outline:none;transition:border-color .2s;margin-bottom:10px;font-family:'Nunito',sans-serif}
-  .input-field:focus{border-color:#007A3D;background:#fff}
-  .input-field::placeholder{color:#a0bfad;font-weight:400}
-  .btn-main{width:100%;background:#007A3D;color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:800;cursor:pointer;letter-spacing:.5px;transition:background .15s;font-family:'Nunito',sans-serif}
-  .btn-main:hover{background:#005c2e}
-  .btn-main:disabled{background:#a8d4bc;cursor:not-allowed}
-  .toast{display:none;background:#fff;border:1.5px solid #e2f0e8;border-left:4px solid #007A3D;border-radius:10px;color:#1a3d2a;font-size:13px;font-weight:600;padding:12px 14px;margin-bottom:14px;line-height:1.5}
-  .toast.error{border-left-color:#e53935;color:#c62828}
-  .toast.show{display:block}
-  .overlay{display:none;position:fixed;inset:0;background:rgba(0,40,20,.6);z-index:100;align-items:flex-end;justify-content:center;padding:0}
-  .overlay.open{display:flex}
-  .modal{background:#fff;border-radius:24px 24px 0 0;padding:28px 20px 32px;width:100%;max-width:480px}
-  .modal-handle{width:36px;height:4px;background:#c8e6d4;border-radius:2px;margin:0 auto 20px}
-  .modal-title{color:#1a3d2a;font-size:17px;font-weight:800;margin-bottom:3px}
-  .modal-sub{color:#6b8c7a;font-size:13px;font-weight:600;margin-bottom:16px}
-  .modal-pkg-badge{background:#f0faf4;border:1.5px solid #c8e6d4;border-radius:10px;padding:10px 14px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
-  .modal-pkg-badge span:first-child{color:#1a3d2a;font-size:14px;font-weight:700}
-  .modal-pkg-badge span:last-child{color:#007A3D;font-size:17px;font-weight:800}
-  .modal-note{color:#6b8c7a;font-size:12px;font-weight:600;margin-top:10px;line-height:1.6}
-  .modal-note.success{color:#007A3D}
-  .modal-note.error{color:#e53935}
-  .modal-actions{display:flex;gap:10px;margin-top:16px}
-  .btn-cancel{flex:1;background:#f0faf4;border:1.5px solid #c8e6d4;color:#6b8c7a;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:'Nunito',sans-serif}
-  .btn-cancel:hover{border-color:#007A3D;color:#007A3D}
-  .btn-pay{flex:2;background:#007A3D;color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:800;cursor:pointer;font-family:'Nunito',sans-serif}
-  .btn-pay:hover{background:#005c2e}
-  .btn-pay:disabled{background:#a8d4bc;cursor:not-allowed}
-  .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .footer{text-align:center;color:#a0bfad;font-size:11px;font-weight:600;margin-top:24px;letter-spacing:.5px}
-  .mpesa-logo{display:inline-block;background:#007A3D;color:#fff;font-size:9px;font-weight:800;letter-spacing:1px;padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:4px}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WiFi Login</title>
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    body {
+      background: #f0f4f0;
+      font-family: 'Nunito', 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      padding: 0 0 40px
+    }
+
+    .header {
+      background: #007A3D;
+      padding: 28px 16px 20px;
+      text-align: center;
+      border-radius: 0 0 24px 24px;
+      margin-bottom: 20px
+    }
+
+    .brand {
+      color: #fff;
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 3px;
+      text-transform: uppercase
+    }
+
+    .support-bar {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 14px;
+      background: rgba(255, 255, 255, .12);
+      border-radius: 10px;
+      padding: 9px 16px;
+      max-width: 320px;
+      margin-left: auto;
+      margin-right: auto
+    }
+
+    .support-bar span {
+      color: #c8f0dc;
+      font-size: 12px;
+      font-weight: 600
+    }
+
+    .support-bar a {
+      color: #fff;
+      font-size: 15px;
+      font-weight: 800;
+      text-decoration: none
+    }
+
+    .page-body {
+      padding: 0 14px
+    }
+
+    .section-label {
+      color: #007A3D;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin: 0 0 10px 2px
+    }
+
+    .packages-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 20px
+    }
+
+    .pkg-card {
+      background: #fff;
+      border: 1.5px solid #e2f0e8;
+      border-radius: 16px;
+      padding: 14px 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 4px;
+      transition: border-color .2s, box-shadow .2s;
+      cursor: pointer
+    }
+
+    .pkg-card:hover {
+      border-color: #007A3D;
+      box-shadow: 0 2px 12px rgba(0, 122, 61, .12)
+    }
+
+    .pkg-name {
+      color: #1a3d2a;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.2
+    }
+
+    .pkg-usage {
+      color: #007A3D;
+      font-size: 11px;
+      font-weight: 600;
+      background: #e8f5ee;
+      border-radius: 6px;
+      padding: 2px 8px;
+      margin: 2px 0
+    }
+
+    .pkg-price {
+      color: #007A3D;
+      font-size: 22px;
+      font-weight: 800;
+      line-height: 1.1;
+      margin: 4px 0 0
+    }
+
+    .pkg-price-sub {
+      color: #6b8c7a;
+      font-size: 10px;
+      font-weight: 600
+    }
+
+    .pkg-period {
+      color: #6b8c7a;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 6px
+    }
+
+    .btn-connect-pkg {
+      width: 100%;
+      background: #007A3D;
+      color: #fff;
+      border: none;
+      border-radius: 9px;
+      padding: 10px 0;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      letter-spacing: .5px;
+      transition: background .15s, transform .1s;
+      font-family: 'Nunito', sans-serif;
+      margin-top: auto
+    }
+
+    .btn-connect-pkg:hover {
+      background: #005c2e
+    }
+
+    .btn-connect-pkg:active {
+      transform: scale(.97)
+    }
+
+    .already-card {
+      background: #fff;
+      border: 1.5px solid #e2f0e8;
+      border-radius: 16px;
+      padding: 18px;
+      margin-bottom: 20px
+    }
+
+    .already-title {
+      color: #007A3D;
+      font-size: 15px;
+      font-weight: 800;
+      margin-bottom: 3px
+    }
+
+    .already-sub {
+      color: #6b8c7a;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 14px;
+      line-height: 1.5
+    }
+
+    .input-field {
+      width: 100%;
+      background: #f7faf8;
+      border: 1.5px solid #c8e6d4;
+      border-radius: 10px;
+      color: #1a3d2a;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 12px 14px;
+      outline: none;
+      transition: border-color .2s;
+      margin-bottom: 10px;
+      font-family: 'Nunito', sans-serif
+    }
+
+    .input-field:focus {
+      border-color: #007A3D;
+      background: #fff
+    }
+
+    .input-field::placeholder {
+      color: #a0bfad;
+      font-weight: 400
+    }
+
+    .btn-main {
+      width: 100%;
+      background: #007A3D;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 14px;
+      font-size: 15px;
+      font-weight: 800;
+      cursor: pointer;
+      letter-spacing: .5px;
+      transition: background .15s;
+      font-family: 'Nunito', sans-serif
+    }
+
+    .btn-main:hover {
+      background: #005c2e
+    }
+
+    .btn-main:disabled {
+      background: #a8d4bc;
+      cursor: not-allowed
+    }
+
+    .toast {
+      display: none;
+      background: #fff;
+      border: 1.5px solid #e2f0e8;
+      border-left: 4px solid #007A3D;
+      border-radius: 10px;
+      color: #1a3d2a;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      line-height: 1.5
+    }
+
+    .toast.error {
+      border-left-color: #e53935;
+      color: #c62828
+    }
+
+    .toast.show {
+      display: block
+    }
+
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 40, 20, .6);
+      z-index: 100;
+      align-items: flex-end;
+      justify-content: center;
+      padding: 0
+    }
+
+    .overlay.open {
+      display: flex
+    }
+
+    .modal {
+      background: #fff;
+      border-radius: 24px 24px 0 0;
+      padding: 28px 20px 32px;
+      width: 100%;
+      max-width: 480px
+    }
+
+    .modal-handle {
+      width: 36px;
+      height: 4px;
+      background: #c8e6d4;
+      border-radius: 2px;
+      margin: 0 auto 20px
+    }
+
+    .modal-title {
+      color: #1a3d2a;
+      font-size: 17px;
+      font-weight: 800;
+      margin-bottom: 3px
+    }
+
+    .modal-sub {
+      color: #6b8c7a;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px
+    }
+
+    .modal-pkg-badge {
+      background: #f0faf4;
+      border: 1.5px solid #c8e6d4;
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center
+    }
+
+    .modal-pkg-badge span:first-child {
+      color: #1a3d2a;
+      font-size: 14px;
+      font-weight: 700
+    }
+
+    .modal-pkg-badge span:last-child {
+      color: #007A3D;
+      font-size: 17px;
+      font-weight: 800
+    }
+
+    .modal-note {
+      color: #6b8c7a;
+      font-size: 12px;
+      font-weight: 600;
+      margin-top: 10px;
+      line-height: 1.6
+    }
+
+    .modal-note.success {
+      color: #007A3D
+    }
+
+    .modal-note.error {
+      color: #e53935
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px
+    }
+
+    .btn-cancel {
+      flex: 1;
+      background: #f0faf4;
+      border: 1.5px solid #c8e6d4;
+      color: #6b8c7a;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      font-family: 'Nunito', sans-serif
+    }
+
+    .btn-cancel:hover {
+      border-color: #007A3D;
+      color: #007A3D
+    }
+
+    .btn-pay {
+      flex: 2;
+      background: #007A3D;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 800;
+      cursor: pointer;
+      font-family: 'Nunito', sans-serif
+    }
+
+    .btn-pay:hover {
+      background: #005c2e
+    }
+
+    .btn-pay:disabled {
+      background: #a8d4bc;
+      cursor: not-allowed
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 13px;
+      height: 13px;
+      border: 2px solid rgba(255, 255, 255, .35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    .footer {
+      text-align: center;
+      color: #a0bfad;
+      font-size: 11px;
+      font-weight: 600;
+      margin-top: 24px;
+      letter-spacing: .5px
+    }
+
+    .mpesa-logo {
+      display: inline-block;
+      background: #007A3D;
+      color: #fff;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      vertical-align: middle;
+      margin-left: 4px
+    }
+  </style>
 </head>
+
 <body>
 
-<div class="header">
-  <div class="brand" id="brandName">OFFLINEBOX</div>
-  <div class="support-bar">
-    <span>Customer Care</span>
-    <a id="supportLink" href="#">0700 000 000</a>
-  </div>
-</div>
-
-<div class="page-body">
-
-  <div id="toast" class="toast"></div>
-
-  <div class="section-label">Choose a Package</div>
-  <div class="packages-grid" id="packagesGrid"></div>
-
-  <div class="already-card">
-    <div class="already-title">Already Paid?</div>
-    <div class="already-sub">Enter your phone number, M-PESA code, or paste the full M-PESA SMS message</div>
-    <input id="alreadyInput" class="input-field" type="text" placeholder="07XX XXX XXX · QK12ABC3DE · or paste SMS">
-    <button class="btn-main" id="btnConnect" onclick="handleAlreadyPaid()">CONNECT</button>
-  </div>
-
-  <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span></div>
-
-</div>
-
-<div class="overlay" id="buyOverlay">
-  <div class="modal">
-    <div class="modal-handle"></div>
-    <div class="modal-title">Complete Purchase</div>
-    <div class="modal-sub">Enter your Safaricom M-PESA number<span class="mpesa-logo">M-PESA</span></div>
-    <div class="modal-pkg-badge">
-      <span id="modalPkgName">-</span>
-      <span id="modalPkgPrice">KSH -</span>
-    </div>
-    <input id="buyPhone" class="input-field" type="tel" placeholder="07XX XXX XXX" maxlength="10">
-    <div class="modal-note" id="modalNote"></div>
-    <div class="modal-actions">
-      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
-      <button class="btn-pay" id="btnPay" onclick="submitBuy()">SEND REQUEST</button>
+  <div class="header">
+    <div class="brand" id="brandName">OFFLINEBOX</div>
+    <div class="support-bar">
+      <span>Customer Care</span>
+      <a id="supportLink" href="#">0700 000 000</a>
     </div>
   </div>
-</div>
 
-<script src="/md5.js"></script>
-<script>
-var API_BASE_URL = "https://api.example.com";
-var PLATFORM_ID = "your-platform-id";
-var HASH = "";
-var MAC = "$(mac)";
-var BRAND_NAME = "OFFLINEBOX";
-var SUPPORT_PHONE = "0700 000 000";
-var PACKAGES = [];
-var PREVIEW_MODE = false;
-var selectedPlan = null;
-var paymentSocket = null;
-var currentCheckoutRequestId = null;
-var pollTimer = null;
+  <div class="page-body">
 
-function init(){
-  var displayBrandName = BRAND_NAME || "WIFI";
-  document.getElementById("brandName").textContent = displayBrandName.toUpperCase();
-  var footerBrand = document.getElementById("footerBrandName");
-  if(footerBrand) footerBrand.textContent = displayBrandName;
-  var el = document.getElementById("supportLink");
-  el.textContent = SUPPORT_PHONE || "Customer Care";
-  el.href = SUPPORT_PHONE ? "tel:" + SUPPORT_PHONE.replace(/\s/g,"") : "#";
+    <div id="toast" class="toast"></div>
 
-  if(PACKAGES && PACKAGES.length > 0){
-    renderPackages(PACKAGES);
-  } else {
-    renderPackages(PACKAGES, "Loading packages...");
-  }
-  if(!PREVIEW_MODE) fetchPackages();
+    <div class="section-label">Choose a Package</div>
+    <div class="packages-grid" id="packagesGrid"></div>
 
-  var saved = localStorage.getItem("wifiPhone");
-  if(saved) document.getElementById("alreadyInput").value = saved;
-}
+    <div class="already-card">
+      <div class="already-title">Already Paid?</div>
+      <div class="already-sub">Enter your phone number, M-PESA code, or paste the full M-PESA SMS message</div>
+      <input id="alreadyInput" class="input-field" type="text" placeholder="07XX XXX XXX · QK12ABC3DE · or paste SMS">
+      <button class="btn-main" id="btnConnect" onclick="handleAlreadyPaid()">CONNECT</button>
+    </div>
 
-function escapeHtml(value){
-  return String(value || "").replace(/[&<>"']/g,function(c){
-    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
-  });
-}
+    <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span></div>
 
-function normalizePackage(pkg){
-  return {
-    id: String(pkg.id || ""),
-    name: String(pkg.name || "WiFi Package"),
-    price: Number(pkg.price || 0),
-    period: String(pkg.period || ""),
-    usage: String(pkg.usage || ""),
-    speed: String(pkg.speed || ""),
-    devices: pkg.devices || "",
-    category: String(pkg.category || ""),
-    accountNumber: String(pkg.accountNumber || ""),
-    routerHost: String(pkg.routerHost || "")
-  };
-}
+  </div>
 
-function formatPeriod(period, usage){
-  var label = String(period || "").trim();
-  var data = String(usage || "").trim();
-  if(label && data) return label + " / " + data;
-  return label || data || "WiFi access";
-}
+  <div class="overlay" id="buyOverlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-title">Complete Purchase</div>
+      <div class="modal-sub">Enter your Safaricom M-PESA number<span class="mpesa-logo">M-PESA</span></div>
+      <div class="modal-pkg-badge">
+        <span id="modalPkgName">-</span>
+        <span id="modalPkgPrice">KSH -</span>
+      </div>
+      <input id="buyPhone" class="input-field" type="tel" placeholder="07XX XXX XXX" maxlength="10">
+      <div class="modal-note" id="modalNote"></div>
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+        <button class="btn-pay" id="btnPay" onclick="submitBuy()">SEND REQUEST</button>
+      </div>
+    </div>
+  </div>
 
-function renderPackages(packages, emptyText){
-  var grid = document.getElementById("packagesGrid");
-  grid.innerHTML = "";
-  packages = Array.isArray(packages)
-    ? packages.slice().sort(function(a,b){ return Number(a.price || 0) - Number(b.price || 0); })
-    : packages;
+  <script src="/md5.js"></script>
+  <script>
+    var API_BASE_URL = "https://api.example.com";
+    var PLATFORM_ID = "your-platform-id";
+    var HASH = "";
+    var MAC = "$(mac)";
+    var BRAND_NAME = "OFFLINEBOX";
+    var SUPPORT_PHONE = "0700 000 000";
+    var PACKAGES = [];
+    var PREVIEW_MODE = false;
+    var selectedPlan = null;
+    var paymentSocket = null;
+    var currentCheckoutRequestId = null;
+    var pollTimer = null;
 
-  if(!packages || packages.length === 0){
-    var empty = document.createElement("div");
-    empty.className = "pkg-card";
-    empty.style.gridColumn = "1 / -1";
-    empty.textContent = emptyText || "No packages available. Please contact customer care.";
-    grid.appendChild(empty);
-    return;
-  }
+    function init() {
+      var displayBrandName = BRAND_NAME || "WIFI";
+      document.getElementById("brandName").textContent = displayBrandName.toUpperCase();
+      var footerBrand = document.getElementById("footerBrandName");
+      if (footerBrand) footerBrand.textContent = displayBrandName;
+      var el = document.getElementById("supportLink");
+      el.textContent = SUPPORT_PHONE || "Customer Care";
+      el.href = SUPPORT_PHONE ? "tel:" + SUPPORT_PHONE.replace(/\s/g, "") : "#";
 
-  packages.forEach(function(pkg){
-    var card = document.createElement("div");
-    var button = document.createElement("button");
-    card.className = "pkg-card";
-    card.innerHTML =
-      '<div class="pkg-name">'+escapeHtml(pkg.name)+'</div>'
-      +'<div class="pkg-usage">'+escapeHtml(pkg.usage || pkg.speed || "WiFi")+'</div>'
-      +'<div class="pkg-price">KSH '+escapeHtml(pkg.price)+'</div>'
-      +'<div class="pkg-period">'+escapeHtml(formatPeriod(pkg.period, ""))+'</div>';
-    button.className = "btn-connect-pkg";
-    button.type = "button";
-    button.textContent = "CONNECT";
-    button.onclick = function(e){ e.stopPropagation(); openBuyModal(pkg.id); };
-    card.onclick = function(){ openBuyModal(pkg.id); };
-    card.appendChild(button);
-    grid.appendChild(card);
-  });
-}
-
-function fetchPackages(){
-  if(!PLATFORM_ID || PLATFORM_ID === "your-platform-id"){
-    renderPackages(PACKAGES, "Platform not configured. Please contact customer care.");
-    return;
-  }
-
-  fetch(API_BASE_URL+"/req/packages",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ platformID: PLATFORM_ID, hash: HASH })
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(data){
-    if(data && data.type === "success" && Array.isArray(data.packages)){
-      PACKAGES = data.packages
-        .filter(function(pkg){ return String(pkg.category || "").toLowerCase() !== "homefibre"; })
-        .map(normalizePackage);
-      renderPackages(PACKAGES);
-    } else {
-      if(!PACKAGES || PACKAGES.length === 0){
-        renderPackages(PACKAGES, (data && data.message) || "Packages unavailable. Please contact customer care.");
+      if (PACKAGES && PACKAGES.length > 0) {
+        renderPackages(PACKAGES);
+      } else {
+        renderPackages(PACKAGES, "Loading packages...");
       }
-    }
-  })
-  .catch(function(){
-    if(!PACKAGES || PACKAGES.length === 0){
-      renderPackages(PACKAGES, "Could not load packages. Please contact customer care.");
-    }
-  });
-}
+      if (!PREVIEW_MODE) fetchPackages();
 
-function openBuyModal(pkgId){
-  selectedPlan = PACKAGES.find(function(p){ return p.id === pkgId; });
-  if(!selectedPlan) return;
-  document.getElementById("modalPkgName").textContent  = selectedPlan.name;
-  document.getElementById("modalPkgPrice").textContent = "KSH " + selectedPlan.price;
-  var note = document.getElementById("modalNote");
-  note.textContent = "";
-  note.className = "modal-note";
-  var saved = localStorage.getItem("wifiPhone");
-  document.getElementById("buyPhone").value = saved || "";
-  var btn = document.getElementById("btnPay");
-  btn.disabled = false;
-  btn.innerHTML = "PAY KSH " + selectedPlan.price;
-  document.getElementById("buyOverlay").classList.add("open");
-}
-
-function closeModal(){
-  document.getElementById("buyOverlay").classList.remove("open");
-  stopPaymentWatch();
-}
-
-function validPhone(p){ return /^(07|01)\d{8}$/.test(p.replace(/\s/g,"")); }
-
-function submitBuy(){
-  var raw   = document.getElementById("buyPhone").value.trim();
-  var phone = raw.replace(/\s/g,"");
-  if(!selectedPlan){ setModalNote("Select a package first.","error"); return; }
-  if(!validPhone(phone)){
-    setModalNote("Enter a valid number starting with 07 or 01","error"); return;
-  }
-  localStorage.setItem("wifiPhone", phone);
-  var btn = document.getElementById("btnPay");
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Sending...';
-
-  fetch(API_BASE_URL+"/mpesa/stkpush",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({phone:phone, amount:String(selectedPlan.price), package:selectedPlan, platformID:PLATFORM_ID, mac:MAC})
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(data){
-    if(!data || data.success === false){
-      throw new Error((data && data.message) || "Request failed. Please try again.");
+      var saved = localStorage.getItem("wifiPhone");
+      if (saved) document.getElementById("alreadyInput").value = saved;
     }
 
-    currentCheckoutRequestId = data.checkoutRequestId || (data.data && data.data.checkoutRequestId);
-    setModalNote("Check your phone and enter your M-PESA PIN. We will connect you after payment.","success");
-    btn.innerHTML = "WAITING";
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c];
+      });
+    }
 
-    if(currentCheckoutRequestId){
-      localStorage.setItem("wifiTransactionId", currentCheckoutRequestId);
-      startSocketWatch(currentCheckoutRequestId);
-      startPaymentPoll(currentCheckoutRequestId);
-    } else {
+    function normalizePackage(pkg) {
+      return {
+        id: String(pkg.id || ""),
+        name: String(pkg.name || "WiFi Package"),
+        price: Number(pkg.price || 0),
+        period: String(pkg.period || ""),
+        usage: String(pkg.usage || ""),
+        speed: String(pkg.speed || ""),
+        devices: pkg.devices || "",
+        category: String(pkg.category || ""),
+        accountNumber: String(pkg.accountNumber || ""),
+        routerHost: String(pkg.routerHost || "")
+      };
+    }
+
+    function formatPeriod(period, usage) {
+      var label = String(period || "").trim();
+      var data = String(usage || "").trim();
+      if (label && data) return label + " / " + data;
+      return label || data || "WiFi access";
+    }
+
+    function renderPackages(packages, emptyText) {
+      var grid = document.getElementById("packagesGrid");
+      grid.innerHTML = "";
+      packages = Array.isArray(packages)
+        ? packages.slice().sort(function (a, b) { return Number(a.price || 0) - Number(b.price || 0); })
+        : packages;
+
+      if (!packages || packages.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "pkg-card";
+        empty.style.gridColumn = "1 / -1";
+        empty.textContent = emptyText || "No packages available. Please contact customer care.";
+        grid.appendChild(empty);
+        return;
+      }
+
+      packages.forEach(function (pkg) {
+        var card = document.createElement("div");
+        var button = document.createElement("button");
+        card.className = "pkg-card";
+        card.innerHTML =
+          '<div class="pkg-name">' + escapeHtml(pkg.name) + '</div>'
+          + '<div class="pkg-usage">' + escapeHtml(pkg.usage || pkg.speed || "WiFi") + '</div>'
+          + '<div class="pkg-price">KSH ' + escapeHtml(pkg.price) + '</div>'
+          + '<div class="pkg-period">' + escapeHtml(formatPeriod(pkg.period, "")) + '</div>';
+        button.className = "btn-connect-pkg";
+        button.type = "button";
+        button.textContent = "CONNECT";
+        button.onclick = function (e) { e.stopPropagation(); openBuyModal(pkg.id); };
+        card.onclick = function () { openBuyModal(pkg.id); };
+        card.appendChild(button);
+        grid.appendChild(card);
+      });
+    }
+
+    function fetchPackages() {
+      if (!PLATFORM_ID || PLATFORM_ID === "your-platform-id") {
+        renderPackages(PACKAGES, "Platform not configured. Please contact customer care.");
+        return;
+      }
+
+      fetch(API_BASE_URL + "/req/packages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platformID: PLATFORM_ID, hash: HASH })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data && data.type === "success" && Array.isArray(data.packages)) {
+            PACKAGES = data.packages
+              .filter(function (pkg) { return String(pkg.category || "").toLowerCase() !== "homefibre"; })
+              .map(normalizePackage);
+            renderPackages(PACKAGES);
+          } else {
+            if (!PACKAGES || PACKAGES.length === 0) {
+              renderPackages(PACKAGES, (data && data.message) || "Packages unavailable. Please contact customer care.");
+            }
+          }
+        })
+        .catch(function () {
+          if (!PACKAGES || PACKAGES.length === 0) {
+            renderPackages(PACKAGES, "Could not load packages. Please contact customer care.");
+          }
+        });
+    }
+
+    function openBuyModal(pkgId) {
+      selectedPlan = PACKAGES.find(function (p) { return p.id === pkgId; });
+      if (!selectedPlan) return;
+      document.getElementById("modalPkgName").textContent = selectedPlan.name;
+      document.getElementById("modalPkgPrice").textContent = "KSH " + selectedPlan.price;
+      var note = document.getElementById("modalNote");
+      note.textContent = "";
+      note.className = "modal-note";
+      var saved = localStorage.getItem("wifiPhone");
+      document.getElementById("buyPhone").value = saved || "";
+      var btn = document.getElementById("btnPay");
       btn.disabled = false;
       btn.innerHTML = "PAY KSH " + selectedPlan.price;
+      document.getElementById("buyOverlay").classList.add("open");
     }
-  })
-  .catch(function(error){
-    setModalNote(error.message || "Request failed. Please try again.","error");
-    btn.disabled = false;
-    btn.innerHTML = "PAY KSH " + selectedPlan.price;
-  });
-}
 
-function loadSocketScript(done){
-  if(window.io){ done(); return; }
-  var script = document.createElement("script");
-  script.src = API_BASE_URL + "/socket.io/socket.io.js";
-  script.async = true;
-  script.onload = done;
-  script.onerror = function(){};
-  document.head.appendChild(script);
-}
+    function closeModal() {
+      document.getElementById("buyOverlay").classList.remove("open");
+      stopPaymentWatch();
+    }
 
-function startSocketWatch(checkoutRequestId){
-  loadSocketScript(function(){
-    if(!window.io) return;
-    if(paymentSocket) paymentSocket.disconnect();
-    paymentSocket = io(API_BASE_URL, { transports:["websocket","polling"] });
-    paymentSocket.on("connect", function(){
-      paymentSocket.emit("join-room", checkoutRequestId);
-    });
-    paymentSocket.on("deposit-success", handlePaymentEvent);
-    paymentSocket.on("deposit-status", handlePaymentEvent);
-  });
-}
+    function validPhone(p) { return /^(07|01)\d{8}$/.test(p.replace(/\s/g, "")); }
 
-function startPaymentPoll(checkoutRequestId){
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(function(){
-    fetch(API_BASE_URL+"/mpesa/confirm",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({ code: checkoutRequestId })
-    })
-    .then(function(r){ return r.json(); })
-    .then(function(data){
-      if(data && (data.success || data.status === "FAILED")){
-        data.checkoutRequestId = checkoutRequestId;
-        handlePaymentEvent(data);
+    function submitBuy() {
+      var raw = document.getElementById("buyPhone").value.trim();
+      var phone = raw.replace(/\s/g, "");
+      if (!selectedPlan) { setModalNote("Select a package first.", "error"); return; }
+      if (!validPhone(phone)) {
+        setModalNote("Enter a valid number starting with 07 or 01", "error"); return;
       }
-    })
-    .catch(function(){});
-  }, 3000);
-}
+      localStorage.setItem("wifiPhone", phone);
+      var btn = document.getElementById("btnPay");
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Sending...';
 
-function stopPaymentWatch(){
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer = null;
-  if(paymentSocket && currentCheckoutRequestId){
-    paymentSocket.emit("leave-room", currentCheckoutRequestId);
-    paymentSocket.disconnect();
-  }
-  paymentSocket = null;
-}
+      fetch(API_BASE_URL + "/mpesa/stkpush", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: phone, amount: String(selectedPlan.price), package: selectedPlan, platformID: PLATFORM_ID, mac: MAC })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data || data.success === false) {
+            throw new Error((data && data.message) || "Request failed. Please try again.");
+          }
 
-function handlePaymentEvent(data){
-  if(!data || (data.checkoutRequestId && data.checkoutRequestId !== currentCheckoutRequestId)) return;
-  var status = data.status || "";
-  var loginCode = data.loginCode || data.username || "";
-  var message = data.message || "";
-  var btn = document.getElementById("btnPay");
+          currentCheckoutRequestId = data.checkoutRequestId || (data.data && data.data.checkoutRequestId);
+          setModalNote("Check your phone and enter your M-PESA PIN. We will connect you after payment.", "success");
+          btn.innerHTML = "WAITING";
 
-  if(status === "COMPLETE"){
-    stopPaymentWatch();
-    localStorage.removeItem("wifiTransactionId");
-    setModalNote(message || "Payment successful. Connecting you...","success");
-    if(loginCode) doLogin(loginCode, loginCode);
-    return;
-  }
-
-  if(status === "COMPLETE_INACTIVE"){
-    stopPaymentWatch();
-    localStorage.removeItem("wifiTransactionId");
-    setModalNote("Payment received, connecting you...","success");
-    if(loginCode) doLogin(loginCode, loginCode);
-    return;
-  }
-
-  if(status === "INACTIVE"){
-    stopPaymentWatch();
-    setModalNote("Payment received but activation failed. Contact customer care " + (SUPPORT_PHONE || "") + ".","error");
-    btn.disabled = false;
-    btn.innerHTML = "PAY KSH " + (selectedPlan ? selectedPlan.price : "");
-    return;
-  }
-
-  if(status === "FAILED"){
-    stopPaymentWatch();
-    setModalNote(message || "Payment failed. Please try again.","error");
-    btn.disabled = false;
-    btn.innerHTML = "PAY KSH " + (selectedPlan ? selectedPlan.price : "");
-  }
-}
-
-function extractMpesaCode(text){
-  var m = text.match(/\b([A-Z]{2}[0-9A-Z]{7,10})\b/);
-  return m ? m[1] : null;
-}
-
-function handleAlreadyPaid(){
-  var raw = document.getElementById("alreadyInput").value.trim();
-  if(!raw){ showToast("Enter your phone, M-PESA code, or paste the message.","error"); return; }
-
-  var code  = extractMpesaCode(raw.toUpperCase());
-  var phone = "";
-  if(!code){
-    phone = raw.replace(/\s/g,"");
-    if(!validPhone(phone) && !/^[A-Z0-9]{8,12}$/.test(raw.toUpperCase())){
-      showToast("Could not find a valid M-PESA code or phone number.","error"); return;
+          if (currentCheckoutRequestId) {
+            localStorage.setItem("wifiTransactionId", currentCheckoutRequestId);
+            startSocketWatch(currentCheckoutRequestId);
+            startPaymentPoll(currentCheckoutRequestId);
+          } else {
+            btn.disabled = false;
+            btn.innerHTML = "PAY KSH " + selectedPlan.price;
+          }
+        })
+        .catch(function (error) {
+          setModalNote(error.message || "Request failed. Please try again.", "error");
+          btn.disabled = false;
+          btn.innerHTML = "PAY KSH " + selectedPlan.price;
+        });
     }
-  }
-  if(validPhone(phone)) localStorage.setItem("wifiPhone", phone);
 
-  var btn = document.getElementById("btnConnect");
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Checking...';
-
-  fetch(API_BASE_URL+"/req/code",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ phone: code || phone || raw, platformID: PLATFORM_ID })
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(data){
-    var list = data && data.foundcodes;
-    var active = Array.isArray(list)
-      ? (list.find(function(c){ return c && !c.expired; }) || list[0])
-      : null;
-    if(active && active.username && active.password && !active.expired){
-      showToast("Code found. Connecting you...","success");
-      doLogin(active.username, active.password);
-    } else {
-      showToast((data && data.message) || "No active session found. Please try again.","error");
-      btn.disabled = false;
-      btn.innerHTML = "CONNECT";
+    function loadSocketScript(done) {
+      if (window.io) { done(); return; }
+      var script = document.createElement("script");
+      script.src = API_BASE_URL + "/socket.io/socket.io.js";
+      script.async = true;
+      script.onload = done;
+      script.onerror = function () { };
+      document.head.appendChild(script);
     }
-  })
-  .catch(function(){
-    showToast("Connection check failed. Please try again.","error");
-    btn.disabled = false;
-    btn.innerHTML = "CONNECT";
-  });
-}
 
-function doLogin(username, password){
-  var chapId        = "$(chap-id)";
-  var chapChallenge = "$(chap-challenge)";
-  var loginUrl      = "$(link-login-only)";
-  var finalPass     = password;
+    function startSocketWatch(checkoutRequestId) {
+      loadSocketScript(function () {
+        if (!window.io) return;
+        if (paymentSocket) paymentSocket.disconnect();
+        paymentSocket = io(API_BASE_URL, { transports: ["websocket", "polling"] });
+        paymentSocket.on("connect", function () {
+          paymentSocket.emit("join-room", checkoutRequestId);
+        });
+        paymentSocket.on("deposit-success", handlePaymentEvent);
+        paymentSocket.on("deposit-status", handlePaymentEvent);
+      });
+    }
 
-  if(typeof hexMD5 === "function" && chapId && chapChallenge
-     && chapId.indexOf("$(") === -1 && chapChallenge.indexOf("$(") === -1){
-    finalPass = hexMD5(chapId + password + chapChallenge);
-  }
+    function startPaymentPoll(checkoutRequestId) {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(function () {
+        fetch(API_BASE_URL + "/mpesa/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: checkoutRequestId })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (data && (data.success || data.status === "FAILED")) {
+              data.checkoutRequestId = checkoutRequestId;
+              handlePaymentEvent(data);
+            }
+          })
+          .catch(function () { });
+      }, 3000);
+    }
 
-  if(loginUrl && loginUrl.indexOf("$(") === -1){
-    var form = document.createElement("form");
-    form.method = "POST";
-    form.action = loginUrl;
-    function addField(n,v){ var i=document.createElement("input"); i.type="hidden"; i.name=n; i.value=v; form.appendChild(i); }
-    addField("username", username);
-    addField("password", finalPass);
-    document.body.appendChild(form);
-    form.submit();
-  } else {
-    window.location.href = "http://local.wifi/login?username="+encodeURIComponent(username)+"&password="+encodeURIComponent(finalPass);
-  }
-}
+    function stopPaymentWatch() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+      if (paymentSocket && currentCheckoutRequestId) {
+        paymentSocket.emit("leave-room", currentCheckoutRequestId);
+        paymentSocket.disconnect();
+      }
+      paymentSocket = null;
+    }
 
-function showToast(msg, type){
-  var t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast show" + (type === "error" ? " error" : "");
-  setTimeout(function(){ t.className = "toast"; }, 5000);
-}
+    function handlePaymentEvent(data) {
+      if (!data || (data.checkoutRequestId && data.checkoutRequestId !== currentCheckoutRequestId)) return;
+      var status = data.status || "";
+      var loginCode = data.loginCode || data.username || "";
+      var message = data.message || "";
+      var btn = document.getElementById("btnPay");
 
-function setModalNote(msg, type){
-  var n = document.getElementById("modalNote");
-  n.textContent = msg;
-  n.className = "modal-note" + (type ? " "+type : "");
-}
+      if (status === "COMPLETE") {
+        stopPaymentWatch();
+        localStorage.removeItem("wifiTransactionId");
+        setModalNote(message || "Payment successful. Connecting you...", "success");
+        if (loginCode) doLogin(loginCode, loginCode);
+        return;
+      }
 
-init();
-</script>
+      if (status === "COMPLETE_INACTIVE") {
+        stopPaymentWatch();
+        localStorage.removeItem("wifiTransactionId");
+        setModalNote("Payment received, connecting you...", "success");
+        if (loginCode) doLogin(loginCode, loginCode);
+        return;
+      }
+
+      if (status === "INACTIVE") {
+        stopPaymentWatch();
+        setModalNote("Payment received but activation failed. Contact customer care " + (SUPPORT_PHONE || "") + ".", "error");
+        btn.disabled = false;
+        btn.innerHTML = "PAY KSH " + (selectedPlan ? selectedPlan.price : "");
+        return;
+      }
+
+      if (status === "FAILED") {
+        stopPaymentWatch();
+        setModalNote(message || "Payment failed. Please try again.", "error");
+        btn.disabled = false;
+        btn.innerHTML = "PAY KSH " + (selectedPlan ? selectedPlan.price : "");
+      }
+    }
+
+    function extractMpesaCode(text) {
+      var m = text.match(/\b([A-Z]{2}[0-9A-Z]{7,10})\b/);
+      return m ? m[1] : null;
+    }
+
+    function handleAlreadyPaid() {
+      var raw = document.getElementById("alreadyInput").value.trim();
+      if (!raw) { showToast("Enter your phone, M-PESA code, or paste the message.", "error"); return; }
+
+      var code = extractMpesaCode(raw.toUpperCase());
+      var phone = "";
+      if (!code) {
+        phone = raw.replace(/\s/g, "");
+        if (!validPhone(phone) && !/^[A-Z0-9]{8,12}$/.test(raw.toUpperCase())) {
+          showToast("Could not find a valid M-PESA code or phone number.", "error"); return;
+        }
+      }
+      if (validPhone(phone)) localStorage.setItem("wifiPhone", phone);
+
+      var btn = document.getElementById("btnConnect");
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Checking...';
+
+      fetch(API_BASE_URL + "/req/code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: code || phone || raw, platformID: PLATFORM_ID })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          var list = data && data.foundcodes;
+          var active = Array.isArray(list)
+            ? (list.find(function (c) { return c && !c.expired; }) || list[0])
+            : null;
+          if (active && active.username && active.password && !active.expired) {
+            showToast("Code found. Connecting you...", "success");
+            doLogin(active.username, active.password);
+          } else {
+            showToast((data && data.message) || "No active session found. Please try again.", "error");
+            btn.disabled = false;
+            btn.innerHTML = "CONNECT";
+          }
+        })
+        .catch(function () {
+          showToast("Connection check failed. Please try again.", "error");
+          btn.disabled = false;
+          btn.innerHTML = "CONNECT";
+        });
+    }
+
+    function doLogin(username, password) {
+      var chapId = "$(chap-id)";
+      var chapChallenge = "$(chap-challenge)";
+      var loginUrl = "$(link-login-only)";
+      var finalPass = password;
+
+      if (typeof hexMD5 === "function" && chapId && chapChallenge
+        && chapId.indexOf("$(") === -1 && chapChallenge.indexOf("$(") === -1) {
+        finalPass = hexMD5(chapId + password + chapChallenge);
+      }
+
+      if (loginUrl && loginUrl.indexOf("$(") === -1) {
+        var form = document.createElement("form");
+        form.method = "POST";
+        form.action = loginUrl;
+        function addField(n, v) { var i = document.createElement("input"); i.type = "hidden"; i.name = n; i.value = v; form.appendChild(i); }
+        addField("username", username);
+        addField("password", finalPass);
+        document.body.appendChild(form);
+        form.submit();
+      } else {
+        window.location.href = "http://local.wifi/login?username=" + encodeURIComponent(username) + "&password=" + encodeURIComponent(finalPass);
+      }
+    }
+
+    function showToast(msg, type) {
+      var t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "toast show" + (type === "error" ? " error" : "");
+      setTimeout(function () { t.className = "toast"; }, 5000);
+    }
+
+    function setModalNote(msg, type) {
+      var n = document.getElementById("modalNote");
+      n.textContent = msg;
+      n.className = "modal-note" + (type ? " " + type : "");
+    }
+
+    init();
+  </script>
 </body>
+
 </html>
