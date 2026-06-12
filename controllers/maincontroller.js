@@ -6176,7 +6176,7 @@ class Controller {
       try {
         const upload = await this.withTimeout(
           this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
-          15000,
+          45000,
           "login.html upload timed out on selected router"
         );
         results.push({
@@ -6214,7 +6214,7 @@ class Controller {
       try {
         const upload = await this.withTimeout(
           this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
-          15000,
+          45000,
           "login.html upload timed out on router"
         );
         results.push({

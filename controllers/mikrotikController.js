@@ -245,18 +245,53 @@ function autoLogin() {
         const safePath = `${this.normalizeHotspotHtmlDirectory(path)}/login.html`;
         const existingFiles = await channel.write(["/file/print", `?name=${safePath}`]);
         if (Array.isArray(existingFiles) && existingFiles.length > 0) {
-            await channel.write([
-                "/file/set",
-                `=.id=${existingFiles[0][".id"]}`,
-                `=contents=${contents}`,
-            ]);
-            return safePath;
+            for (const file of existingFiles) {
+                if (!file?.[".id"]) continue;
+                await channel.write([
+                    "/file/remove",
+                    `=.id=${file[".id"]}`,
+                ]);
+            }
         }
 
         await channel.write([
             "/file/add",
             `=name=${safePath}`,
             `=contents=${contents}`,
+        ]);
+        return safePath;
+    }
+
+    async removeHotspotLoginFile(channel, path) {
+        const safePath = `${this.normalizeHotspotHtmlDirectory(path)}/login.html`;
+        const existingFiles = await channel.write(["/file/print", `?name=${safePath}`]);
+        if (Array.isArray(existingFiles) && existingFiles.length > 0) {
+            for (const file of existingFiles) {
+                if (!file?.[".id"]) continue;
+                await channel.write([
+                    "/file/remove",
+                    `=.id=${file[".id"]}`,
+                ]);
+            }
+        }
+        return safePath;
+    }
+
+    createHotspotLoginDownload(loginHtml) {
+        const token = crypto.randomBytes(24).toString("hex");
+        this.cache.set(`mkt:hotspot-login:${token}`, loginHtml, 2 * 60 * 1000);
+        return `${resolveApiBaseUrl()}/mkt/hotspot/login-template/${token}.html`;
+    }
+
+    async fetchHotspotLoginFile(channel, path, contents) {
+        const safePath = await this.removeHotspotLoginFile(channel, path);
+        const url = this.createHotspotLoginDownload(contents);
+        await channel.write([
+            "/tool/fetch",
+            `=url=${url}`,
+            `=dst-path=${safePath}`,
+            "=keep-result=yes",
+            "=check-certificate=no",
         ]);
         return safePath;
     }
@@ -274,11 +309,23 @@ function autoLogin() {
         const channel = connection.channel;
         try {
             const loginFilePath = await this.resolveHotspotLoginFilePath(channel);
-            const writtenPath = await this.writeHotspotLoginFile(channel, loginFilePath, loginHtml);
-            return { success: true, path: writtenPath, message: `login.html uploaded to ${writtenPath}` };
+            const writtenPath = await this.fetchHotspotLoginFile(channel, loginFilePath, loginHtml);
+            return { success: true, path: writtenPath, message: `login.html fetched to ${writtenPath}` };
         } finally {
             try { await channel.close?.(); } catch (err) { }
         }
+    }
+
+    async downloadHotspotLoginTemplate(req, res) {
+        const token = String(req.params?.token || "").replace(/\.html$/i, "");
+        const html = this.cache.get(`mkt:hotspot-login:${token}`);
+        if (!html) {
+            return res.status(404).send("login.html expired");
+        }
+
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        return res.status(200).send(html);
     }
 
     sanitizeRouterFilePath(value) {
@@ -380,6 +427,43 @@ function autoLogin() {
         return safePath;
     }
 
+    async readRouterFileContents(channel, filePath, file = {}) {
+        const size = Number(file?.size || 0);
+        const details = await channel.write([
+            "/file/print",
+            `=.proplist=.id,name,type,size,contents,creation-time,last-modified`,
+            `?.id=${file[".id"]}`,
+        ]).catch(() => []);
+        const record = Array.isArray(details) && details[0] ? details[0] : file;
+        const printedContents = record?.contents;
+        if (typeof printedContents === "string" && (printedContents.length > 0 || size === 0)) {
+            return { record, content: printedContents };
+        }
+
+        const chunkSize = 32768;
+        const maxBytes = 2 * 1024 * 1024;
+        const targetBytes = size > 0 ? Math.min(size, maxBytes) : maxBytes;
+        let offset = 0;
+        let content = "";
+
+        while (offset < targetBytes) {
+            const response = await channel.write([
+                "/file/read",
+                `=file=${filePath}`,
+                `=offset=${offset}`,
+                `=chunk-size=${Math.min(chunkSize, targetBytes - offset)}`,
+            ]);
+            const chunkRecord = Array.isArray(response) ? response[0] : response;
+            const data = String(chunkRecord?.data ?? chunkRecord?.contents ?? "");
+            if (!data) break;
+            content += data;
+            offset += data.length;
+            if (data.length < chunkSize) break;
+        }
+
+        return { record, content };
+    }
+
     async listMikrotikFiles(req, res) {
         try {
             const auth = await this.authenticateStationRequest(req);
@@ -412,12 +496,11 @@ function autoLogin() {
                 const matches = await channel.write(["/file/print", `?name=${filePath}`]);
                 const file = Array.isArray(matches) ? matches[0] : null;
                 if (!file?.[".id"]) return { success: false, message: "File not found" };
-                const details = await channel.write(["/file/print", `=.proplist=.id,name,type,size,contents,creation-time,last-modified`, `?.id=${file[".id"]}`]);
-                const record = Array.isArray(details) && details[0] ? details[0] : file;
+                const { record, content } = await this.readRouterFileContents(channel, filePath, file);
                 return {
                     success: true,
                     file: this.mapRouterFile(record),
-                    content: String(record?.contents || ""),
+                    content,
                 };
             });
             return res.status(result.success ? 200 : 404).json(result);
