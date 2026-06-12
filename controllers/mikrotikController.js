@@ -1690,6 +1690,9 @@ function autoLogin() {
             if (!sourcePlan || sourcePlan.platformID !== platformID) {
                 return res.status(404).json({ success: false, message: "PPPoE plan not found" });
             }
+            if (sourcePlan.station !== station) {
+                return res.status(400).json({ success: false, message: "Selected plan belongs to a different station" });
+            }
             const stations = (await this.db.getStations(platformID)) || [];
             const stationRecord =
                 stations.find((s) => s.mikrotikHost === station) ||
@@ -1800,7 +1803,7 @@ function autoLogin() {
                             groupname: effectivePlan.name,
                             rateLimit,
                             dataLimitBytes: null,
-                            expireAt: expireAt || null,
+                            expireAt: normalizedStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
                             period: effectivePlan.period,
                             sessionTimeoutSeconds: null,
                         });
@@ -2129,15 +2132,55 @@ function autoLogin() {
             const platformID = auth.admin.platformID;
             const client = await this.db.getPPPoEById(id);
             if (!client) return res.status(404).json({ success: false, message: "PPPoE client not found" });
+            if (client.platformID !== platformID) {
+                return res.status(403).json({ success: false, message: "Unauthorised!" });
+            }
             const plan = planId ? await this.db.getPPPoEPlanById(planId) : null;
             if (planId && (!plan || plan.platformID !== platformID)) {
                 return res.status(404).json({ success: false, message: "PPPoE plan not found" });
+            }
+            if (plan && plan.station !== client.station) {
+                return res.status(400).json({ success: false, message: "Selected plan belongs to a different station" });
             }
 
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === client.station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
             const effectiveStatus = normalizedStatus || String(client.status || "active").toLowerCase();
+            const platformClients = (await this.db.getPPPoE(platformID)) || [];
+            const duplicateClient = platformClients.find(
+                (entry) => entry.id !== id && entry.station === client.station && entry.clientname === clientname
+            );
+            if (duplicateClient) {
+                return res.status(400).json({ success: false, message: "PPPoE user already exists on this station" });
+            }
+
+            let expireAt = client.expiresAt ? new Date(client.expiresAt) : null;
+            let overrideExpireAt = null;
+            if (expiresAt) {
+                const parsed = new Date(expiresAt);
+                if (Number.isNaN(parsed.getTime())) {
+                    return res.status(400).json({ success: false, message: "Invalid expiresAt value" });
+                }
+                overrideExpireAt = parsed;
+            }
+
+            if (overrideExpireAt && effectiveStatus === "active") {
+                expireAt = overrideExpireAt;
+            } else if (plan?.period) {
+                const match = plan.period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+                if (match && effectiveStatus === "active") {
+                    const value = parseInt(match[1]);
+                    const unit = match[2].toLowerCase();
+                    expireAt = Utils.addPeriod(new Date(), value, unit);
+                }
+            }
+            if (effectiveStatus === "expired") {
+                expireAt = new Date();
+            } else if (effectiveStatus === "inactive") {
+                expireAt = null;
+            }
+
             if (!isRadius) {
                 const connection = await this.config.createSingleMikrotikClient(platformID, client.station);
                 if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
@@ -2173,36 +2216,10 @@ function autoLogin() {
 	                    groupname: plan ? plan.name : client.name,
 	                    rateLimit,
 	                    dataLimitBytes: null,
-	                    expireAt: null,
+	                    expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
 	                    period: plan ? plan.period : client.period,
 	                    sessionTimeoutSeconds: null,
 	                });
-            }
-
-            let expireAt = client.expiresAt ? new Date(client.expiresAt) : null;
-            let overrideExpireAt = null;
-            if (expiresAt) {
-                const parsed = new Date(expiresAt);
-                if (Number.isNaN(parsed.getTime())) {
-                    return res.status(400).json({ success: false, message: "Invalid expiresAt value" });
-                }
-                overrideExpireAt = parsed;
-            }
-
-            if (overrideExpireAt && effectiveStatus === "active") {
-                expireAt = overrideExpireAt;
-            } else if (plan?.period) {
-                const match = plan.period.toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
-                if (match && effectiveStatus === "active") {
-                    const value = parseInt(match[1]);
-                    const unit = match[2].toLowerCase();
-                    expireAt = Utils.addPeriod(new Date(), value, unit);
-                }
-            }
-            if (effectiveStatus === "expired") {
-                expireAt = new Date();
-            } else if (effectiveStatus === "inactive") {
-                expireAt = null;
             }
             const price = plan ? plan.price : client.price;
             const amount = effectiveStatus === "active" ? "0" : String(price || "0");
@@ -2243,6 +2260,9 @@ function autoLogin() {
             if (!platformID) return res.status(400).json({ success: false, message: "Missing platform ID" });
             const client = await this.db.getPPPoEById(id);
             if (!client) return res.status(404).json({ success: false, message: "PPPoE not found" });
+            if (client.platformID !== platformID) {
+                return res.status(403).json({ success: false, message: "Unauthorised!" });
+            }
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === client.station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
@@ -2262,6 +2282,27 @@ function autoLogin() {
                 } finally {
                     await this.safeCloseChannel(channel);
                 }
+            } else {
+                const speedSource = client.profile || client.name || "";
+                const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
+                const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
+                let expireAt = null;
+                if (newStatus === "active" && client.period) {
+                    const match = String(client.period).toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+                    if (match) {
+                        expireAt = Utils.addPeriod(new Date(), parseInt(match[1]), match[2].toLowerCase());
+                    }
+                }
+                await this.db.upsertRadiusUser({
+                    username: client.clientname,
+                    password: client.clientpassword,
+                    groupname: client.name,
+                    rateLimit,
+                    dataLimitBytes: null,
+                    expireAt: newStatus === "active" ? expireAt : new Date(Date.now() - 60000),
+                    period: client.period,
+                    sessionTimeoutSeconds: null,
+                });
             }
             await this.db.updatePPPoE(id, { status: newStatus });
             return res.status(200).json({ success: true, message: `PPPoE ${newStatus} successfully` });
@@ -2312,6 +2353,16 @@ function autoLogin() {
             const client = id ? await this.db.getPPPoEById(id) : null;
             if (id && !client) {
                 return res.status(404).json({ success: false, message: "PPPoE client not found" });
+            }
+            if (client && client.platformID !== platformID) {
+                return res.status(403).json({ success: false, message: "Unauthorised!" });
+            }
+            const existingDb = (await this.db.getPPPoE(platformID)) || [];
+            const duplicateClient = existingDb.find(
+                (entry) => entry.id !== id && entry.station === station && entry.clientname === clientname
+            );
+            if (duplicateClient) {
+                return res.status(400).json({ success: false, message: "PPPoE user already exists on this station" });
             }
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === station);
@@ -2374,19 +2425,6 @@ function autoLogin() {
                 if (client?.clientname && client.clientname !== clientname) {
                     await this.db.deleteRadiusUser(client.clientname);
                 }
-                const speedSource = thisprofile || name || "";
-                const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
-                const rate = speedVal ? `${speedVal}M/${speedVal}M` : "";
-	                await this.db.upsertRadiusUser({
-	                    username: clientname,
-	                    password: clientpassword,
-	                    groupname: name,
-	                    rateLimit: rate,
-	                    dataLimitBytes: null,
-	                    expireAt: null,
-	                    period: period,
-	                    sessionTimeoutSeconds: null,
-	                });
             }
             let expireAt = null;
             if (period) {
@@ -2419,6 +2457,21 @@ function autoLogin() {
             } else if (effectiveStatus === "inactive") {
                 expireAt = null;
             }
+            if (isRadius) {
+                const speedSource = thisprofile || name || "";
+                const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
+                const rate = speedVal ? `${speedVal}M/${speedVal}M` : "";
+                await this.db.upsertRadiusUser({
+                    username: clientname,
+                    password: clientpassword,
+                    groupname: name,
+                    rateLimit: rate,
+                    dataLimitBytes: null,
+                    expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
+                    period: period,
+                    sessionTimeoutSeconds: null,
+                });
+            }
             let newamount = "0";
             if (!id) {
                 if (effectiveStatus === "active") newamount = "0";
@@ -2441,9 +2494,9 @@ function autoLogin() {
                     }
                 }
             }
-            let accountNumber = "";
+            let accountNumber = id ? (client?.accountNumber || "") : "";
             const config = await this.db.getPlatformConfig(platformID);
-            if (config) {
+            if (!id && config) {
                 if (config.mpesaShortCodeType && (config.mpesaShortCodeType).toLowerCase() === "paybill") {
                     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
                     accountNumber = Array.from({ length: 3 }, () => characters.charAt(Math.floor(Math.random() * characters.length))).join('');
@@ -2574,9 +2627,9 @@ function autoLogin() {
             if (!platform) return res.status(400).json({ success: false, message: "Platform does not exist!" });
             const client = await this.db.getPPPoEById(id);
             if (!client) return res.status(400).json({ success: false, message: "PPPoE does not exist!" });
-            await this.db.deletePPPoE(id);
-            this.cache.delPrefix(`main:pppoe:${platformID}:`);
-            this.cache.delPrefix(`main:search:${platformID}:pppoe`);
+            if (client.platformID !== platformID) {
+                return res.status(403).json({ success: false, message: "Unauthorised!" });
+            }
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === client.station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
@@ -2595,6 +2648,9 @@ function autoLogin() {
             } else {
                 await this.db.deleteRadiusUser(clientname);
             }
+            await this.db.deletePPPoE(id);
+            this.cache.delPrefix(`main:pppoe:${platformID}:`);
+            this.cache.delPrefix(`main:search:${platformID}:pppoe`);
             const email = client.email;
             const subject = `PPPoE Credentials deleted from ${platform.name}!`;
             const message = `<p>Your PPPoE credentials have been deleted by <strong>${platform.name}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${client.clientpassword}</p><p>For more status and information about this service, visit:<br /><a href="https://${platform.url}/pppoe?info=${client.paymentLink}">https://${platform.url}/pppoe?info=${client.paymentLink}</a></p>`;
@@ -4089,26 +4145,58 @@ function autoLogin() {
     }
 
     sanitizeDomain(domain) {
-        if (!domain || typeof domain !== "string") return null;
-        const safe = domain.trim().toLowerCase();
-        if (!safe || safe.includes("..") || safe.includes("/") || safe.includes(" ")) return null;
-        return safe;
+        const normalized = String(domain || "").trim().toLowerCase();
+        if (!/^[a-z0-9.-]+$/.test(normalized)) return null;
+        if (normalized.includes("..") || normalized.includes("/") || normalized.startsWith(".") || normalized.endsWith(".")) return null;
+        return normalized;
+    }
+
+    normalizeProxyTargetUrl(targetUrl) {
+        const text = String(targetUrl || "").trim();
+        if (!text) return null;
+        try {
+            const url = new URL(text);
+            if (!["http:", "https:"].includes(url.protocol)) return null;
+            url.hash = "";
+            return url.toString().replace(/\/$/, "");
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    normalizeMikrotikInternalHost(host) {
+        const normalized = String(host || "").trim().split("/")[0];
+        if (!/^10\.10\.10\.(?:[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/.test(normalized)) return "";
+        return normalized;
+    }
+
+    buildMikrotikWebfigTarget(host) {
+        const internalHost = this.normalizeMikrotikInternalHost(host);
+        return internalHost ? `http://${internalHost}` : null;
+    }
+
+    getWildcardCertificatePaths(domain) {
+        const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
+        const certDir = process.env.WILDCARD_CERT_DIR || `/etc/letsencrypt/live/${baseDomain}`;
+        const certPath = process.env.WILDCARD_CERT_PATH || `${certDir}/fullchain.pem`;
+        const keyPath = process.env.WILDCARD_KEY_PATH || `${certDir}/privkey.pem`;
+        return {
+            baseDomain,
+            certPath,
+            keyPath,
+            hasWildcardCert: domain.endsWith(baseDomain) && fs.existsSync(certPath) && fs.existsSync(keyPath),
+        };
     }
 
     buildNginxConfig(domain, targetUrl) {
-        const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
-        const sslCert = process.env.SSL_CERT_PATH || `/etc/letsencrypt/live/${baseDomain}/fullchain.pem`;
-        const sslKey = process.env.SSL_KEY_PATH || `/etc/letsencrypt/live/${baseDomain}/privkey.pem`;
+        const target = this.normalizeProxyTargetUrl(targetUrl);
+        if (!target) return null;
+        const { certPath, keyPath, hasWildcardCert } = this.getWildcardCertificatePaths(domain);
         const sslOptions = process.env.SSL_OPTIONS_PATH || "/etc/letsencrypt/options-ssl-nginx.conf";
         const sslDhParam = process.env.SSL_DHPARAM_PATH || "/etc/letsencrypt/ssl-dhparams.pem";
-
-        return [
-            "server {",
-            "    listen 80;",
-            `    server_name ${domain};`,
-            "",
+        const proxyLines = [
             "    location / {",
-            `        proxy_pass ${targetUrl};`,
+            `        proxy_pass ${target};`,
             "        proxy_http_version 1.1;",
             "",
             "        proxy_set_header Host $host;",
@@ -4119,29 +4207,38 @@ function autoLogin() {
             "        proxy_set_header Upgrade $http_upgrade;",
             "        proxy_set_header Connection \"upgrade\";",
             "    }",
+            "",
+        ];
+
+        if (!hasWildcardCert) {
+            return [
+                "server {",
+                "    listen 80;",
+                `    server_name ${domain};`,
+                "",
+                ...proxyLines,
+                "}",
+                "",
+            ].join("\n");
+        }
+
+        return [
+            "server {",
+            "    listen 80;",
+            `    server_name ${domain};`,
+            "    return 301 https://$host$request_uri;",
             "}",
             "",
             "server {",
             "    listen 443 ssl;",
             `    server_name ${domain};`,
             "",
-            `    ssl_certificate     ${sslCert};`,
-            `    ssl_certificate_key ${sslKey};`,
-            `    include ${sslOptions};`,
-            `    ssl_dhparam ${sslDhParam};`,
+            `    ssl_certificate     ${certPath};`,
+            `    ssl_certificate_key ${keyPath};`,
+            ...(fs.existsSync(sslOptions) ? [`    include ${sslOptions};`] : []),
+            ...(fs.existsSync(sslDhParam) ? [`    ssl_dhparam ${sslDhParam};`] : []),
             "",
-            "    location / {",
-            `        proxy_pass ${targetUrl};`,
-            "        proxy_http_version 1.1;",
-            "",
-            "        proxy_set_header Host $host;",
-            "        proxy_set_header X-Real-IP $remote_addr;",
-            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-            "        proxy_set_header X-Forwarded-Proto $scheme;",
-            "",
-            "        proxy_set_header Upgrade $http_upgrade;",
-            "        proxy_set_header Connection \"upgrade\";",
-            "    }",
+            ...proxyLines,
             "}",
             "",
         ].join("\n");
@@ -4153,7 +4250,15 @@ function autoLogin() {
             return { success: false, message: "Invalid domain provided." };
         }
 
-        const config = this.buildNginxConfig(safeDomain, targetUrl);
+        const target = this.normalizeProxyTargetUrl(targetUrl);
+        if (!target) {
+            return { success: false, message: "Invalid reverse proxy target URL." };
+        }
+
+        const config = this.buildNginxConfig(safeDomain, target);
+        if (!config) {
+            return { success: false, message: "Failed to build nginx config." };
+        }
         const tmpPath = `/tmp/nginx-${safeDomain}.conf`;
         const availablePath = `/etc/nginx/sites-available/${safeDomain}`;
         const enabledPath = `/etc/nginx/sites-enabled/${safeDomain}`;
@@ -4178,9 +4283,23 @@ function autoLogin() {
             await run("sudo", ["-n", "/usr/sbin/nginx", "-t"]);
             await run("sudo", ["-n", "/usr/bin/systemctl", "reload", "nginx"]);
 
+            let ssl = { success: true, message: "Using wildcard SSL certificate." };
+            const { hasWildcardCert } = this.getWildcardCertificatePaths(safeDomain);
+            if (!hasWildcardCert && process.env.SKIP_LETSENCRYPT !== "true") {
+                ssl = await this.installLetsEncryptCert(safeDomain);
+                if (!ssl.success) {
+                    return {
+                        success: false,
+                        message: `Nginx configured for ${safeDomain}, but Let's Encrypt SSL failed.`,
+                        error: ssl.error || ssl.message,
+                    };
+                }
+            }
+
             return {
                 success: true,
                 message: `Nginx reverse proxy configured for ${safeDomain}`,
+                ssl,
             };
         } catch (error) {
             return {
@@ -4387,6 +4506,12 @@ function autoLogin() {
             const name = sanitizeRouterName(payload.name) || `Mikrotik-${randomSuffix}`;
             const endpointHost = payload.ddns || payload.publicIp;
             if (!endpointHost) return { success: false, message: "Public router host is required." };
+            const internalHost = this.normalizeMikrotikInternalHost(payload.mikrotikHost);
+            const webfigTargetUrl = this.buildMikrotikWebfigTarget(internalHost);
+            if (!internalHost || !webfigTargetUrl) {
+                return { success: false, message: "MikroTik internal host must be a 10.10.10.x address." };
+            }
+            payload.mikrotikHost = internalHost;
 
             const existingHost = stations.find(s => s.mikrotikHost?.trim() === payload.mikrotikHost?.trim());
             const existingKey = stations.find(s => s.mikrotikPublicKey?.trim() === payload.publicKey?.trim());
@@ -4451,11 +4576,10 @@ function autoLogin() {
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || "") : null,
                 });
 
-                const proxy = await this.addReverseProxySite(mikrotikWebfigHost, `http://${payload.mikrotikHost}`);
+                const proxy = await this.addReverseProxySite(mikrotikWebfigHost, webfigTargetUrl);
                 if (!proxy.success) {
                     warnings.push(proxy.message || "Failed to create reverse proxy site");
                 }
-                // SSL handled via wildcard certificate; skip per-host install.
             } else {
                 stationResult = await this.db.updateStation(existing.id, {
                     name,

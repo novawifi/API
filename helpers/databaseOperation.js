@@ -4722,6 +4722,29 @@ class DataBase {
         }
     }
 
+    async clearUnpaidBillNotifications(platformID) {
+        if (!platformID) return null;
+        try {
+            return prisma.platformNotification.updateMany({
+                where: {
+                    platformID,
+                    dismissedAt: null,
+                    actionUrl: "/admin/bills",
+                    OR: [
+                        { title: "Platform disabled: payment required" },
+                        { title: "Trial payment due" },
+                        { title: "Dedicated server deleted for unpaid bill" },
+                        { title: "Dedicated resource upgrade payment" },
+                    ],
+                },
+                data: { dismissedAt: new Date() },
+            });
+        } catch (error) {
+            console.error("Error clearing unpaid bill notifications:", error);
+            throw error;
+        }
+    }
+
     async getTotalBills(platformID) {
         if (!platformID) return null;
         try {

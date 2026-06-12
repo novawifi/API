@@ -4337,6 +4337,16 @@ class Controller {
         }
       }
 
+      const targetInternalHost = this.normalizeMikrotikInternalHost(data.mikrotikHost || mikrotikHost);
+      const webfigTargetUrl = this.buildMikrotikWebfigTarget(targetInternalHost);
+      if (!targetInternalHost || !webfigTargetUrl) {
+        return res.json({
+          success: false,
+          message: "MikroTik internal host must be a 10.10.10.x address.",
+        });
+      }
+      data.mikrotikHost = targetInternalHost;
+
       let responseMessage;
       let stationResult;
       let WebfigHost;
@@ -4441,7 +4451,6 @@ class Controller {
         }
       }
 
-      const targetInternalHost = String(mikrotikHost || "").trim().split("/")[0];
       const targetPublicKey = String(mikrotikPublicKey || "").trim();
       const peerBlock = [
         "[Peer]",
@@ -4549,12 +4558,10 @@ class Controller {
                     return res.json({ success: false, message: "Internal configuration error" });
                   }
 
-                  const addProxy = await this.addReverseProxySite(WebfigHost, `http://${mikrotikHost}`);
+                  const addProxy = await this.addReverseProxySite(WebfigHost, webfigTargetUrl);
                   if (!addProxy.success) {
-                    return res.json({ success: false, message: "Reverse proxy creation failed." });
+                    return res.json({ success: false, message: addProxy.message || "Reverse proxy creation failed." });
                   }
-
-                  // SSL handled via wildcard certificate; skip per-host install.
                 }
 
                 const seedScripts = await this.mikrotik.seedStationScriptsOnConnect(platformID, {
@@ -8115,27 +8122,53 @@ class Controller {
     return normalized;
   }
 
-  buildNginxConfig(domain, targetUrl) {
+  normalizeProxyTargetUrl(targetUrl) {
+    const text = String(targetUrl || "").trim();
+    if (!text) return null;
+    try {
+      const url = new URL(text);
+      if (!["http:", "https:"].includes(url.protocol)) return null;
+      url.hash = "";
+      return url.toString().replace(/\/$/, "");
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  normalizeMikrotikInternalHost(host) {
+    const normalized = String(host || "").trim().split("/")[0];
+    if (!/^10\.10\.10\.(?:[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/.test(normalized)) return "";
+    return normalized;
+  }
+
+  buildMikrotikWebfigTarget(host) {
+    const internalHost = this.normalizeMikrotikInternalHost(host);
+    return internalHost ? `http://${internalHost}` : null;
+  }
+
+  getWildcardCertificatePaths(domain) {
     const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
     const certDir = process.env.WILDCARD_CERT_DIR || `/etc/letsencrypt/live/${baseDomain}`;
     const certPath = process.env.WILDCARD_CERT_PATH || `${certDir}/fullchain.pem`;
     const keyPath = process.env.WILDCARD_KEY_PATH || `${certDir}/privkey.pem`;
+    return {
+      baseDomain,
+      certPath,
+      keyPath,
+      hasWildcardCert: domain.endsWith(baseDomain) && fs.existsSync(certPath) && fs.existsSync(keyPath),
+    };
+  }
+
+  buildNginxConfig(domain, targetUrl) {
+    const target = this.normalizeProxyTargetUrl(targetUrl);
+    if (!target) return null;
+    const { certPath, keyPath, hasWildcardCert } = this.getWildcardCertificatePaths(domain);
     const optionsSslPath = "/etc/letsencrypt/options-ssl-nginx.conf";
     const dhParamPath = "/etc/letsencrypt/ssl-dhparams.pem";
 
-    const hasWildcardCert = domain.endsWith(baseDomain);
-
-    const sslLines = [
-      "    listen 443 ssl;",
-      `    server_name ${domain};`,
-      "",
-      `    ssl_certificate ${certPath};`,
-      `    ssl_certificate_key ${keyPath};`,
-      ...(fs.existsSync(optionsSslPath) ? [`    include ${optionsSslPath};`] : []),
-      ...(fs.existsSync(dhParamPath) ? [`    ssl_dhparam ${dhParamPath};`] : []),
-      "",
+    const proxyLines = [
       "    location / {",
-      `        proxy_pass ${targetUrl};`,
+      `        proxy_pass ${target};`,
       "        proxy_http_version 1.1;",
       "",
       "        proxy_set_header Host $host;",
@@ -8146,17 +8179,40 @@ class Controller {
       "        proxy_set_header Upgrade $http_upgrade;",
       "        proxy_set_header Connection \"upgrade\";",
       "    }",
-      "}",
       "",
     ];
 
     if (!hasWildcardCert) {
-      return null;
+      return [
+        "server {",
+        "    listen 80;",
+        `    server_name ${domain};`,
+        "",
+        ...proxyLines,
+        "}",
+        "",
+      ].join("\n");
     }
 
     return [
       "server {",
-      ...sslLines,
+      "    listen 80;",
+      `    server_name ${domain};`,
+      "    return 301 https://$host$request_uri;",
+      "}",
+      "",
+      "server {",
+      "    listen 443 ssl;",
+      `    server_name ${domain};`,
+      "",
+      `    ssl_certificate ${certPath};`,
+      `    ssl_certificate_key ${keyPath};`,
+      ...(fs.existsSync(optionsSslPath) ? [`    include ${optionsSslPath};`] : []),
+      ...(fs.existsSync(dhParamPath) ? [`    ssl_dhparam ${dhParamPath};`] : []),
+      "",
+      ...proxyLines,
+      "}",
+      "",
     ].join("\n");
   }
 
@@ -8166,11 +8222,16 @@ class Controller {
       return { success: false, message: "Invalid domain provided." };
     }
 
-    const config = this.buildNginxConfig(safeDomain, targetUrl);
+    const target = this.normalizeProxyTargetUrl(targetUrl);
+    if (!target) {
+      return { success: false, message: "Invalid reverse proxy target URL." };
+    }
+
+    const config = this.buildNginxConfig(safeDomain, target);
     if (!config) {
       return {
         success: false,
-        message: "Wildcard SSL certificate not found for this domain.",
+        message: "Failed to build nginx config.",
       };
     }
     const tmpPath = `/tmp/nginx-${safeDomain}.conf`;
@@ -8197,9 +8258,23 @@ class Controller {
       await run("sudo", ["-n", "/usr/sbin/nginx", "-t"]);
       await run("sudo", ["-n", "/usr/bin/systemctl", "reload", "nginx"]);
 
+      let ssl = { success: true, message: "Using wildcard SSL certificate." };
+      const { hasWildcardCert } = this.getWildcardCertificatePaths(safeDomain);
+      if (!hasWildcardCert && process.env.SKIP_LETSENCRYPT !== "true") {
+        ssl = await this.installLetsEncryptCert(safeDomain);
+        if (!ssl.success) {
+          return {
+            success: false,
+            message: `Nginx configured for ${safeDomain}, but Let's Encrypt SSL failed.`,
+            error: ssl.error || ssl.message,
+          };
+        }
+      }
+
       return {
         success: true,
         message: `Nginx reverse proxy configured for ${safeDomain}`,
+        ssl,
       };
     } catch (error) {
       console.error(`[Nginx] Error for "${safeDomain}":`, error);
@@ -8246,8 +8321,6 @@ class Controller {
   async provisionReverseProxyAndSSL(domain, targetUrl) {
     const proxy = await this.addReverseProxySite(domain, targetUrl);
     if (!proxy.success) return proxy;
-    const ssl = await this.addReverseProxySite(domain);
-    if (!ssl.success) return ssl;
     return { success: true, message: "Reverse proxy and SSL provisioned successfully." };
   }
 

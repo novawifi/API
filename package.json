@@ -10,6 +10,7 @@
     "seed:update-platform-urls": "node scripts/seed-update-platform-urls.js",
     "seed:notify-upgrade-complete": "node scripts/seed-notify-upgrade-complete.js",
     "seed:update-station-ddns": "node scripts/seed-update-station-ddns.js",
+    "seed:webfig-nginx-sites": "node scripts/seed-webfig-nginx-sites.js",
     "seed:update-webfig-ssl": "node scripts/seed-update-webfig-ssl.js",
     "seed:migrate-station-public-host": "node scripts/seed-migrate-station-public-host.js",
     "seed:provision-nginx-sites": "node scripts/seed-provision-nginx-sites.js",

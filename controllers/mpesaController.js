@@ -4632,6 +4632,13 @@ class MpesaController {
             await this.db.updatePlatform(bill.platformID, {
                 status: "active"
             })
+            if (typeof this.db.clearUnpaidBillNotifications === "function") {
+                const unpaidBills = await this.db.getUnpaidPlatformBilling(bill.platformID);
+                const hasUnpaidAmount = Array.isArray(unpaidBills) && unpaidBills.some((openBill) => Number(openBill?.amount || 0) > 0);
+                if (!hasUnpaidAmount) {
+                    await this.db.clearUnpaidBillNotifications(bill.platformID);
+                }
+            }
             try {
                 await this.applyPaidDedicatedServerResize(bill.platformID, billId);
                 if (bill.meta?.serviceKey === "billing" && bill.meta?.plan === "professional") {
