@@ -86,7 +86,7 @@
     <button class="btn-main" id="btnConnect" onclick="handleAlreadyPaid()">CONNECT</button>
   </div>
 
-  <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</div>
+  <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span></div>
 
 </div>
 
@@ -117,6 +117,7 @@ var MAC = "$(mac)";
 var BRAND_NAME = "OFFLINEBOX";
 var SUPPORT_PHONE = "0700 000 000";
 var PACKAGES = [];
+var PREVIEW_MODE = false;
 var selectedPlan = null;
 var paymentSocket = null;
 var currentCheckoutRequestId = null;
@@ -131,8 +132,12 @@ function init(){
   el.textContent = SUPPORT_PHONE || "Customer Care";
   el.href = SUPPORT_PHONE ? "tel:" + SUPPORT_PHONE.replace(/\s/g,"") : "#";
 
-  renderPackages(PACKAGES, "Loading packages...");
-  fetchPackages();
+  if(PACKAGES && PACKAGES.length > 0){
+    renderPackages(PACKAGES);
+  } else {
+    renderPackages(PACKAGES, "Loading packages...");
+  }
+  if(!PREVIEW_MODE) fetchPackages();
 
   var saved = localStorage.getItem("wifiPhone");
   if(saved) document.getElementById("alreadyInput").value = saved;
@@ -190,7 +195,7 @@ function renderPackages(packages, emptyText){
       +'<div class="pkg-period">'+escapeHtml(formatPeriod(pkg.period, ""))+'</div>';
     button.className = "btn-connect-pkg";
     button.type = "button";
-    button.textContent = "BUY / CONNECT";
+    button.textContent = "CONNECT";
     button.onclick = function(e){ e.stopPropagation(); openBuyModal(pkg.id); };
     card.onclick = function(){ openBuyModal(pkg.id); };
     card.appendChild(button);
@@ -217,11 +222,15 @@ function fetchPackages(){
         .map(normalizePackage);
       renderPackages(PACKAGES);
     } else {
-      renderPackages(PACKAGES, (data && data.message) || "Packages unavailable. Please contact customer care.");
+      if(!PACKAGES || PACKAGES.length === 0){
+        renderPackages(PACKAGES, (data && data.message) || "Packages unavailable. Please contact customer care.");
+      }
     }
   })
   .catch(function(){
-    renderPackages(PACKAGES, "Could not load packages. Please contact customer care.");
+    if(!PACKAGES || PACKAGES.length === 0){
+      renderPackages(PACKAGES, "Could not load packages. Please contact customer care.");
+    }
   });
 }
 
@@ -263,7 +272,7 @@ function submitBuy(){
   fetch(API_BASE_URL+"/mpesa/stkpush",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({phone:phone, amount:selectedPlan.price, package:selectedPlan, platformID:PLATFORM_ID, mac:MAC})
+    body:JSON.stringify({phone:phone, amount:String(selectedPlan.price), package:selectedPlan, platformID:PLATFORM_ID, mac:MAC})
   })
   .then(function(r){ return r.json(); })
   .then(function(data){

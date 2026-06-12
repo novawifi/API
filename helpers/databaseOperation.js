@@ -671,10 +671,14 @@ class DataBase {
     async addMpesaCode(data) {
         if (!data) return null;
         try {
+            const nextData = { ...data };
+            ["amount", "charges", "net_amount"].forEach((field) => {
+                if (typeof nextData[field] === "number") {
+                    nextData[field] = String(nextData[field]);
+                }
+            });
             const mpesaCode = await prisma.mpesa.create({
-                data: {
-                    ...data,
-                },
+                data: nextData,
             });
             return mpesaCode;
         } catch (error) {

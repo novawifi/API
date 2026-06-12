@@ -7165,6 +7165,7 @@ class Controller {
       platformID,
       host,
       hash: options.hash || getHotspotHash(host),
+      preview: Boolean(options.preview),
     });
   }
 
@@ -7173,6 +7174,7 @@ class Controller {
     let platformID = req.body?.platformID || req.params?.platformID || req.query?.platformID;
     const station = req.body?.station || req.query?.station || req.body?.host || req.query?.host;
     const hash = req.body?.hash || req.query?.hash;
+    const preview = req.body?.preview === true || req.body?.preview === "true" || req.query?.preview === "true";
 
     if (token) {
       const auth = await this.auth.AuthenticateRequest(token);
@@ -7187,7 +7189,7 @@ class Controller {
     }
 
     try {
-      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req });
+      const html = await this.buildOfflineBoxLoginHtml(platformID, { station, hash, req, preview });
       return res
         .status(200)
         .set("Content-Type", "text/html; charset=utf-8")

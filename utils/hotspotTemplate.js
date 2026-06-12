@@ -115,6 +115,7 @@ function renderOfflineBoxLoginTemplate(options = {}) {
   html = replaceElementText(html, "footerBrandName", brandName);
   html = replaceJsVar(html, "SUPPORT_PHONE", supportPhone);
   html = replaceJsVar(html, "PACKAGES", normalizePackages(options.packages));
+  html = replaceJsVar(html, "PREVIEW_MODE", Boolean(options.preview));
   return html;
 }
 
