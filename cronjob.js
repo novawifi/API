@@ -19,7 +19,7 @@ const { MpesaController } = require("./controllers/mpesaController");
 const { Mikrotikcontroller } = require("./controllers/mikrotikController");
 const { Utils } = require("./utils/Functions");
 const { socketManager } = require("./controllers/socketController");
-const { updateClientIp } = require("./utils/radiusConfig");
+const { getRadiusClientIp, isWireGuardMikrotikIp, updateClientIp } = require("./utils/radiusConfig");
 const { WebdockService } = require("./services/webdockService");
 
 class CronJob {
@@ -2169,6 +2169,19 @@ Price: KSH ${service.price}</p>
         for (const station of stations) {
             try {
                 if (station.systemBasis !== "RADIUS") continue;
+                const internalClientIp = getRadiusClientIp(station, station.radiusClientIp || "");
+                if (isWireGuardMikrotikIp(internalClientIp)) {
+                    if (station.radiusClientIp !== internalClientIp) {
+                        const updateResult = await updateClientIp({
+                            name: station.radiusClientName,
+                            ip: internalClientIp,
+                        });
+                        if (updateResult?.updated) {
+                            await this.db.updateStation(station.id, { radiusClientIp: internalClientIp });
+                        }
+                    }
+                    continue;
+                }
                 if (!station.mikrotikDDNS) continue;
                 if (Utils.isValidIP && Utils.isValidIP(station.mikrotikDDNS)) continue;
                 if (!station.radiusClientName) continue;

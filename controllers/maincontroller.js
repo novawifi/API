@@ -22,7 +22,7 @@ const { Mikrotikcontroller } = require("./mikrotikController");
 const { MpesaController } = require("./mpesaController");
 const { socketManager } = require("./socketController");
 const cache = require("../utils/cache");
-const { ensureRadiusClient, removeRadiusClient } = require("../utils/radiusConfig");
+const { ensureRadiusClient, getRadiusClientIp, getRadiusServerIp, isWireGuardMikrotikIp, removeRadiusClient } = require("../utils/radiusConfig");
 const { WebdockService } = require("../services/webdockService");
 
 class Controller {
@@ -4394,7 +4394,7 @@ class Controller {
           }
           newData.radiusClientName = radiusClientName;
           newData.radiusClientSecret = newData.radiusClientSecret || crypto.randomBytes(12).toString("hex");
-          const serverIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+          const serverIp = getRadiusServerIp();
           newData.radiusServerIp = serverIp;
         }
         const newStation = await this.db.createStation(newData);
@@ -4414,7 +4414,7 @@ class Controller {
           }
           updData.radiusClientName = radiusClientName;
           updData.radiusClientSecret = updData.radiusClientSecret || station?.radiusClientSecret || crypto.randomBytes(12).toString("hex");
-          const serverIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+          const serverIp = getRadiusServerIp();
           updData.radiusServerIp = serverIp;
         }
         const updatedStation = await this.db.updateStation(stationID, updData);
@@ -4432,9 +4432,9 @@ class Controller {
       }
       const resolvedIp = Array.isArray(result.addresses) && result.addresses.length > 0 ? result.addresses[0] : endpointHost;
       if (systemBasis === "RADIUS") {
-        const radiusHost = mikrotikPublicHost && Utils.isValidIP(mikrotikPublicHost)
+        const radiusHost = getRadiusClientIp(stationResult, mikrotikPublicHost && Utils.isValidIP(mikrotikPublicHost)
           ? mikrotikPublicHost
-          : resolvedIp;
+          : resolvedIp);
         await this.db.updateStation(stationResult.id, {
           radiusClientIp: radiusHost || "",
         });
@@ -4613,7 +4613,7 @@ class Controller {
         radiusClientName = genName();
       }
       const radiusClientSecret = crypto.randomBytes(12).toString("hex");
-      const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+      const radiusServerIp = getRadiusServerIp();
 
       return res.json({
         success: true,
@@ -6296,23 +6296,46 @@ class Controller {
       const data = { template: nextTemplate };
       const upd = await this.db.updatePlatformConfig(platformID, data);
       this.cache.del(`main:templates:${platformID}`);
-      const uploadSummary = await this.syncHotspotLoginTemplates(
-        platformID,
-        templateMode === "offline" ? "offline" : "online",
-        { station: selectedRouter.station }
-      );
-      const uploadFailed = uploadSummary.failed > 0;
+      const uploadMode = templateMode === "offline" ? "offline" : "online";
+      const uploadStation = selectedRouter.station;
+      setImmediate(() => {
+        this.syncHotspotLoginTemplates(platformID, uploadMode, { station: uploadStation })
+          .then((summary) => {
+            const failed = Number(summary?.failed || 0);
+            this.logPlatform(
+              platformID,
+              failed > 0
+                ? `login.html upload failed on ${failed}/${summary?.total || 1} router(s) after template update`
+                : `login.html uploaded to ${uploadStation?.name || uploadStation?.mikrotikHost || "selected router"} after template update`,
+              { context: "templates", level: failed > 0 ? "warn" : "info", uploadSummary: summary }
+            );
+          })
+          .catch((error) => {
+            this.logPlatform(platformID, `login.html upload failed: ${error?.message || error}`, {
+              context: "templates",
+              level: "error",
+              stationId: uploadStation?.id,
+              host: uploadStation?.mikrotikHost,
+            });
+          });
+      });
 
       return res.status(200).json({
         success: true,
-        message: uploadFailed
-          ? `${templateMode === "offline" ? "Offline template selected" : "Template updated"}, but login.html failed on ${uploadSummary.failed}/${uploadSummary.total} router(s).`
-          : templateMode === "offline"
-            ? "Offline template selected and login.html uploaded successfully"
-            : "Template updated and login.html uploaded successfully",
+        message: templateMode === "offline"
+          ? "Offline template selected. login.html upload started for the selected router."
+          : "Template updated. login.html upload started for the selected router.",
         template: nextTemplate,
         templateMode: templateMode === "offline" ? "offline" : "online",
-        uploadSummary,
+        uploadSummary: {
+          mode: uploadMode,
+          total: 1,
+          success: 0,
+          failed: 0,
+          pending: 1,
+          stationId: uploadStation?.id,
+          host: uploadStation?.mikrotikHost,
+        },
       });
 
     } catch (error) {
@@ -10978,7 +11001,7 @@ class Controller {
       const plans = (await this.db.getPPPoEPlans(platformID)) || [];
       const planMap = new Map(plans.map((p) => [p.id, p]));
       const packageMap = new Map(stationPackages.map((p) => [p.id, p]));
-      const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+      const radiusServerIp = getRadiusServerIp();
 
       const summary = {
         target: normalizedTarget,
@@ -11011,23 +11034,24 @@ class Controller {
         existingNames.add(clientName);
         const clientSecret = station.radiusClientSecret || crypto.randomBytes(12).toString("hex");
         const publicIp = await this.resolveStationPublicIp(station);
-        if (!publicIp) {
-          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: missing public IP/DDNS`);
+        const radiusClientIp = getRadiusClientIp(station, publicIp || station.radiusClientIp || "");
+        if (!radiusClientIp) {
+          summary.warnings.push(`Station ${station.name || station.mikrotikHost}: missing Radius client IP`);
         }
 
         await this.db.updateStation(station.id, {
           systemBasis: "RADIUS",
           radiusClientName: clientName,
           radiusClientSecret: clientSecret,
-          radiusClientIp: publicIp || station.radiusClientIp || "",
+          radiusClientIp: radiusClientIp,
           radiusServerIp: radiusServerIp || station.radiusServerIp || "",
         });
         summary.stationUpdated = true;
 
-        if (publicIp && radiusServerIp) {
+        if (radiusClientIp && radiusServerIp) {
           const addResult = await ensureRadiusClient({
             name: clientName,
-            ip: publicIp,
+            ip: radiusClientIp,
             secret: clientSecret,
             shortname: station.name || station.mikrotikHost,
             server: radiusServerIp,

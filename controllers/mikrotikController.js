@@ -19,7 +19,7 @@ const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
 const { Auth } = require("./authController");
 const cache = require("../utils/cache");
-const { ensureRadiusClient } = require("../utils/radiusConfig");
+const { ensureRadiusClient, getRadiusClientIp, getRadiusServerIp } = require("../utils/radiusConfig");
 
 class Mikrotikcontroller {
     constructor() {
@@ -266,22 +266,18 @@ function autoLogin() {
         const loginHtml = mode === "online"
             ? await this.buildOnlineLoginTemplateHtml(platformID, stationHost)
             : await this.buildOfflineLoginTemplateHtml(platformID, stationHost);
-        const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, stationHost);
-        if (!apiConnection?.api) {
-            return { success: false, message: "Failed to open low-level API connection" };
+        const connection = await this.config.createSingleMikrotikClient(platformID, stationHost);
+        if (!connection?.channel) {
+            return { success: false, message: "Failed to open MikroTik API connection" };
         }
 
-        let rawChannel = null;
+        const channel = connection.channel;
         try {
-            await apiConnection.api.connect();
-            const rawApi = apiConnection.api.api().rosApi;
-            rawChannel = await rawApi.openChannel();
-            const loginFilePath = await this.resolveHotspotLoginFilePath(rawChannel);
-            const writtenPath = await this.writeHotspotLoginFile(rawChannel, loginFilePath, loginHtml);
+            const loginFilePath = await this.resolveHotspotLoginFilePath(channel);
+            const writtenPath = await this.writeHotspotLoginFile(channel, loginFilePath, loginHtml);
             return { success: true, path: writtenPath, message: `login.html uploaded to ${writtenPath}` };
         } finally {
-            try { await rawChannel?.close(); } catch (err) { }
-            try { await apiConnection.api.close(); } catch (err) { }
+            try { await channel.close?.(); } catch (err) { }
         }
     }
 
@@ -334,20 +330,16 @@ function autoLogin() {
     }
 
     async withRouterFileChannel(platformID, host, callback) {
-        const apiConnection = await this.config.createSingleMikrotikClientAPI(platformID, host);
-        if (!apiConnection?.api) {
-            return { success: false, message: "Failed to open low-level API connection" };
+        const connection = await this.config.createSingleMikrotikClient(platformID, host);
+        if (!connection?.channel) {
+            return { success: false, message: "Failed to connect to MikroTik" };
         }
 
-        let rawChannel = null;
+        const channel = connection.channel;
         try {
-            await apiConnection.api.connect();
-            const rawApi = apiConnection.api.api().rosApi;
-            rawChannel = await rawApi.openChannel();
-            return await callback(rawChannel);
+            return await callback(channel);
         } finally {
-            try { await rawChannel?.close(); } catch (err) { }
-            try { await apiConnection.api.close(); } catch (err) { }
+            try { await channel.close?.(); } catch (err) { }
         }
     }
 
@@ -3459,7 +3451,7 @@ function autoLogin() {
             );
             const isRadius = stationRecord?.systemBasis === "RADIUS";
             if (isRadius) {
-                const radiusServerIp = stationRecord?.radiusServerIp || (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+                const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
                 const radiusSecret = stationRecord?.radiusClientSecret;
                 if (!radiusServerIp || !radiusSecret) {
                     return res.status(400).json({
@@ -3562,7 +3554,7 @@ function autoLogin() {
                     }
                 }
                 if (isRadius) {
-                    const radiusServerIp = stationRecord?.radiusServerIp || (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+                    const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
                     const radiusSecret = stationRecord?.radiusClientSecret;
                     if (radiusServerIp && radiusSecret) {
                         const radiusEntries = await channel.write("/radius/print", []);
@@ -3734,7 +3726,7 @@ function autoLogin() {
                 const matchedServer = servers.find(s => s["service-name"] === serverName);
                 if (!matchedServer) return res.json({ autoconfigured: false, message: "PPPoE Server configuration mismatch" });
                 if (isRadius) {
-                    const radiusServerIp = stationRecord?.radiusServerIp || (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+                    const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
                     const radiusSecret = stationRecord?.radiusClientSecret;
                     if (!radiusServerIp || !radiusSecret) {
                         return res.json({ autoconfigured: false, message: "Missing RADIUS credentials for this station." });
@@ -3982,7 +3974,7 @@ function autoLogin() {
                 }
 
                 if (isRadius && stationRecord?.radiusClientSecret) {
-                    const radiusServerIp = stationRecord.radiusServerIp || (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+                    const radiusServerIp = stationRecord.radiusServerIp || getRadiusServerIp();
                     if (radiusServerIp) {
                         const radiusEntries = await channel.write("/radius/print", []);
                         const hasRadius = Array.isArray(radiusEntries)
@@ -4071,7 +4063,7 @@ function autoLogin() {
                     return res.json({ isConfigured: false, message: "Hotspot profile not set to use RADIUS." });
                 }
 
-                const radiusServerIp = stationRecord?.radiusServerIp || (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+                const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
                 const radiusSecret = stationRecord?.radiusClientSecret;
                 if (!radiusServerIp || !radiusSecret) {
                     return res.json({ isConfigured: false, message: "Missing RADIUS credentials for this station." });
@@ -4313,7 +4305,7 @@ function autoLogin() {
             const endpointAddress = (process.env.SERVER_IP || "77.37.97.244").toString().split(":")[0];
             const endpointPort = (process.env.SERVER_WIREGUARD_PORT || "51820").toString();
 	            const serverWgPublicKey = process.env.WIREGUARD_PUBLIC_KEY || "xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=";
-	            const radiusServerIp = (process.env.RADIUS_SERVER_IP || process.env.SERVER_IP || "").toString().split(":")[0];
+	            const radiusServerIp = getRadiusServerIp();
 	            const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
 	            const walledGardenHosts = this.getHotspotWalledGardenHosts();
 	            if (session.systemBasis === "RADIUS") {
@@ -4992,7 +4984,7 @@ function autoLogin() {
                     systemBasis,
                     radiusClientName: session.radiusClientName || null,
                     radiusClientSecret: session.radiusClientSecret || null,
-                    radiusClientIp: systemBasis === "RADIUS" ? (payload.publicIp || "") : null,
+                    radiusClientIp: systemBasis === "RADIUS" ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || "") : null,
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || "") : null,
                 });
 
@@ -5012,18 +5004,19 @@ function autoLogin() {
                     systemBasis,
                     radiusClientName: session.radiusClientName || existing.radiusClientName || null,
                     radiusClientSecret: session.radiusClientSecret || existing.radiusClientSecret || null,
-                    radiusClientIp: systemBasis === "RADIUS" ? (payload.publicIp || existing.radiusClientIp || "") : existing.radiusClientIp || null,
+                    radiusClientIp: systemBasis === "RADIUS" ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || existing.radiusClientIp || "") : existing.radiusClientIp || null,
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || existing.radiusServerIp || "") : existing.radiusServerIp || null,
                 });
             }
 
             if (systemBasis === "RADIUS" && session.radiusClientName && session.radiusClientSecret) {
-                if (!payload.publicIp) {
-                    warnings.push("RADIUS client not added: missing public IP/DDNS");
+                const radiusClientIp = getRadiusClientIp(payload.mikrotikHost, payload.publicIp || "");
+                if (!radiusClientIp) {
+                    warnings.push("RADIUS client not added: missing router client IP");
                 } else {
                     const addResult = await ensureRadiusClient({
                         name: session.radiusClientName,
-                        ip: payload.publicIp,
+                        ip: radiusClientIp,
                         secret: session.radiusClientSecret,
                         shortname: name,
                         server: session.radiusServerIp || "",
