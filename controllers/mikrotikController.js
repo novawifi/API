@@ -500,6 +500,158 @@ function autoLogin() {
         }
     }
 
+    async withAuthenticatedStationChannel(req, res, callback) {
+        const auth = await this.authenticateStationRequest(req);
+        if (!auth.success) {
+            res.status(auth.status).json({ success: false, message: auth.message });
+            return null;
+        }
+
+        const connection = await this.config.createSingleMikrotikClient(auth.platformID, auth.host);
+        if (!connection?.channel) {
+            res.status(500).json({ success: false, message: "Failed to connect to MikroTik" });
+            return null;
+        }
+
+        try {
+            return await callback(connection.channel, auth);
+        } finally {
+            await this.safeCloseChannel(connection.channel);
+        }
+    }
+
+    normalizeRouterDisabled(value) {
+        return String(value || "").toLowerCase() === "true" || String(value || "").toLowerCase() === "yes";
+    }
+
+    async setIpServiceDisabled(channel, serviceName, disabledValue) {
+        const services = await channel.write("/ip/service/print", [`?name=${serviceName}`]).catch(() => []);
+        const service = Array.isArray(services) ? services[0] : null;
+        if (!service?.[".id"]) return false;
+        await channel.write("/ip/service/set", [`=.id=${service[".id"]}`, `=disabled=${disabledValue}`]);
+        return true;
+    }
+
+    async getRouterQuickSettings(req, res) {
+        try {
+            const result = await this.withAuthenticatedStationChannel(req, res, async (channel, auth) => {
+                const hotspotServers = await channel.write("/ip/hotspot/print", []).catch(() => []);
+                const pppoeServers = await channel.write("/interface/pppoe-server/server/print", []).catch(() => []);
+                const ipServices = await channel.write("/ip/service/print", []).catch(() => []);
+                const dnsSettings = await channel.write("/ip/dns/print", []).catch(() => []);
+                const cloudSettings = await channel.write("/ip/cloud/print", []).catch(() => []);
+
+                const serviceByName = new Map((Array.isArray(ipServices) ? ipServices : []).map((service) => [service.name, service]));
+                const dns = Array.isArray(dnsSettings) ? dnsSettings[0] : null;
+                const cloud = Array.isArray(cloudSettings) ? cloudSettings[0] : null;
+                const allEnabled = (items) => Array.isArray(items) && items.length > 0 && items.some((item) => !this.normalizeRouterDisabled(item.disabled));
+                const countEnabled = (items) => Array.isArray(items) ? items.filter((item) => !this.normalizeRouterDisabled(item.disabled)).length : 0;
+
+                return {
+                    success: true,
+                    station: { id: auth.station.id, name: auth.station.name, host: auth.host },
+                    settings: {
+                        hotspot: {
+                            enabled: allEnabled(hotspotServers),
+                            total: Array.isArray(hotspotServers) ? hotspotServers.length : 0,
+                            enabledCount: countEnabled(hotspotServers),
+                        },
+                        pppoe: {
+                            enabled: allEnabled(pppoeServers),
+                            total: Array.isArray(pppoeServers) ? pppoeServers.length : 0,
+                            enabledCount: countEnabled(pppoeServers),
+                        },
+                        api: {
+                            enabled: !this.normalizeRouterDisabled(serviceByName.get("api")?.disabled),
+                            port: serviceByName.get("api")?.port || "",
+                        },
+                        webfig: {
+                            enabled: ["www", "www-ssl"].some((name) => !this.normalizeRouterDisabled(serviceByName.get(name)?.disabled)),
+                            httpEnabled: !this.normalizeRouterDisabled(serviceByName.get("www")?.disabled),
+                            httpsEnabled: !this.normalizeRouterDisabled(serviceByName.get("www-ssl")?.disabled),
+                        },
+                        dnsRemote: {
+                            enabled: String(dns?.["allow-remote-requests"] || "").toLowerCase() === "yes",
+                        },
+                        ipCloud: {
+                            enabled: String(cloud?.["ddns-enabled"] || "").toLowerCase() === "yes",
+                            dnsName: cloud?.["dns-name"] || "",
+                        },
+                    },
+                };
+            });
+            if (result) return res.json(result);
+        } catch (error) {
+            console.error("Router quick settings fetch error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to fetch router settings" });
+        }
+    }
+
+    async updateRouterQuickSetting(req, res) {
+        try {
+            const setting = String(req.body?.setting || "").trim();
+            const enabled = req.body?.enabled === true || req.body?.enabled === "true";
+            const allowed = new Set(["hotspot", "pppoe", "api", "webfig", "dnsRemote", "ipCloud"]);
+            if (!allowed.has(setting)) {
+                return res.status(400).json({ success: false, message: "Invalid router setting" });
+            }
+
+            const result = await this.withAuthenticatedStationChannel(req, res, async (channel) => {
+                const disabledValue = enabled ? "no" : "yes";
+                const boolValue = enabled ? "yes" : "no";
+                let touched = 0;
+
+                if (setting === "hotspot") {
+                    const servers = await channel.write("/ip/hotspot/print", []);
+                    for (const server of Array.isArray(servers) ? servers : []) {
+                        if (!server[".id"]) continue;
+                        await channel.write("/ip/hotspot/set", [`=.id=${server[".id"]}`, `=disabled=${disabledValue}`]);
+                        touched += 1;
+                    }
+                }
+
+                if (setting === "pppoe") {
+                    const servers = await channel.write("/interface/pppoe-server/server/print", []);
+                    for (const server of Array.isArray(servers) ? servers : []) {
+                        if (!server[".id"]) continue;
+                        await channel.write("/interface/pppoe-server/server/set", [`=.id=${server[".id"]}`, `=disabled=${disabledValue}`]);
+                        touched += 1;
+                    }
+                }
+
+                if (setting === "api") {
+                    touched = await this.setIpServiceDisabled(channel, "api", disabledValue) ? 1 : 0;
+                }
+
+                if (setting === "webfig") {
+                    const http = await this.setIpServiceDisabled(channel, "www", disabledValue);
+                    const https = await this.setIpServiceDisabled(channel, "www-ssl", disabledValue);
+                    touched = Number(http) + Number(https);
+                }
+
+                if (setting === "dnsRemote") {
+                    await channel.write("/ip/dns/set", [`=allow-remote-requests=${boolValue}`]);
+                    touched = 1;
+                }
+
+                if (setting === "ipCloud") {
+                    await channel.write("/ip/cloud/set", [`=ddns-enabled=${boolValue}`]);
+                    touched = 1;
+                }
+
+                return {
+                    success: true,
+                    message: `${setting} ${enabled ? "enabled" : "disabled"} successfully`,
+                    touched,
+                };
+            });
+            if (result) return res.json(result);
+        } catch (error) {
+            console.error("Router quick setting update error:", error);
+            return res.status(500).json({ success: false, message: error?.message || "Failed to update router setting" });
+        }
+    }
+
     async writeWithTimeout(channel, command, args = [], timeoutMs = 12000) {
         return Promise.race([
             channel.write(command, args),

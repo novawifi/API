@@ -66,6 +66,8 @@ router.post("/files/read", use("readMikrotikFile"));
 router.post("/files/upload", use("uploadMikrotikFile"));
 router.post("/files/move", use("moveMikrotikFile"));
 router.post("/files/delete", use("deleteMikrotikFile"));
+router.post("/router-settings", use("getRouterQuickSettings"));
+router.post("/router-settings/update", use("updateRouterQuickSetting"));
 router.post("/router-backup/notify", use("notifyRouterBackupUploaded"));
 router.get("/router-backup/notify", use("notifyRouterBackupUploaded"));
 router.put(
