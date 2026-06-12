@@ -6293,49 +6293,42 @@ class Controller {
         });
       }
 
-      const data = { template: nextTemplate };
-      const upd = await this.db.updatePlatformConfig(platformID, data);
-      this.cache.del(`main:templates:${platformID}`);
       const uploadMode = templateMode === "offline" ? "offline" : "online";
       const uploadStation = selectedRouter.station;
-      setImmediate(() => {
-        this.syncHotspotLoginTemplates(platformID, uploadMode, { station: uploadStation })
-          .then((summary) => {
-            const failed = Number(summary?.failed || 0);
-            this.logPlatform(
-              platformID,
-              failed > 0
-                ? `login.html upload failed on ${failed}/${summary?.total || 1} router(s) after template update`
-                : `login.html uploaded to ${uploadStation?.name || uploadStation?.mikrotikHost || "selected router"} after template update`,
-              { context: "templates", level: failed > 0 ? "warn" : "info", uploadSummary: summary }
-            );
-          })
-          .catch((error) => {
-            this.logPlatform(platformID, `login.html upload failed: ${error?.message || error}`, {
-              context: "templates",
-              level: "error",
-              stationId: uploadStation?.id,
-              host: uploadStation?.mikrotikHost,
-            });
-          });
-      });
+      const uploadSummary = await this.syncHotspotLoginTemplates(platformID, uploadMode, { station: uploadStation });
+      const failed = Number(uploadSummary?.failed || 0);
+      const firstResult = Array.isArray(uploadSummary?.results) ? uploadSummary.results[0] : null;
+
+      this.logPlatform(
+        platformID,
+        failed > 0
+          ? `login.html upload failed on ${failed}/${uploadSummary?.total || 1} router(s) after template update`
+          : `login.html uploaded to ${uploadStation?.name || uploadStation?.mikrotikHost || "selected router"} after template update`,
+        { context: "templates", level: failed > 0 ? "warn" : "info", uploadSummary }
+      );
+
+      if (failed > 0) {
+        return res.status(502).json({
+          success: false,
+          message: firstResult?.message || "login.html failed to upload to the selected MikroTik. Template was not changed.",
+          template: nextTemplate,
+          templateMode: templateMode === "offline" ? "offline" : "online",
+          uploadSummary,
+        });
+      }
+
+      const data = { template: nextTemplate };
+      await this.db.updatePlatformConfig(platformID, data);
+      this.cache.del(`main:templates:${platformID}`);
 
       return res.status(200).json({
         success: true,
         message: templateMode === "offline"
-          ? "Offline template selected. login.html upload started for the selected router."
-          : "Template updated. login.html upload started for the selected router.",
+          ? firstResult?.message || "Offline template selected and login.html uploaded to the selected router."
+          : firstResult?.message || "Template updated and login.html uploaded to the selected router.",
         template: nextTemplate,
         templateMode: templateMode === "offline" ? "offline" : "online",
-        uploadSummary: {
-          mode: uploadMode,
-          total: 1,
-          success: 0,
-          failed: 0,
-          pending: 1,
-          stationId: uploadStation?.id,
-          host: uploadStation?.mikrotikHost,
-        },
+        uploadSummary,
       });
 
     } catch (error) {
