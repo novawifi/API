@@ -174,6 +174,9 @@ function formatPeriod(period, usage){
 function renderPackages(packages, emptyText){
   var grid = document.getElementById("packagesGrid");
   grid.innerHTML = "";
+  packages = Array.isArray(packages)
+    ? packages.slice().sort(function(a,b){ return Number(a.price || 0) - Number(b.price || 0); })
+    : packages;
 
   if(!packages || packages.length === 0){
     var empty = document.createElement("div");
