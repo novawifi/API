@@ -100,6 +100,36 @@ test("buildNginxConfig contains server_name and proxy_pass", async () => {
     assert.ok(config.includes("proxy_pass http://localhost:3000;"));
 });
 
+test("getStationTemplateSelection keeps station template modes independent", () => {
+    const controller = new Controller();
+    const config = { template: "Default" };
+
+    const online = controller.getStationTemplateSelection(config, {
+        hotspotTemplateMode: "online",
+        hotspotTemplateName: "Nexus",
+    });
+    const offline = controller.getStationTemplateSelection(config, {
+        hotspotTemplateMode: "offline",
+        hotspotTemplateName: null,
+    });
+
+    assert.equal(online.templateMode, "online");
+    assert.equal(online.defaulttemplate, "Nexus");
+    assert.equal(offline.templateMode, "offline");
+    assert.equal(offline.defaulttemplate, "");
+});
+
+test("getStationTemplateSelection supports legacy platform defaults", () => {
+    const controller = new Controller();
+    const selection = controller.getStationTemplateSelection(
+        { template: "OfflineBox" },
+        {}
+    );
+
+    assert.equal(selection.templateMode, "offline");
+    assert.equal(selection.defaulttemplate, "");
+});
+
 test("ensureStationWebfigSite repairs the selected station mapping", async () => {
     const controller = new Controller();
     const calls = [];

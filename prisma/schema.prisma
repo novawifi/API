@@ -319,6 +319,8 @@ model Station {
   radiusClientSecret String?
   radiusClientIp     String?
   radiusServerIp     String?
+  hotspotTemplateMode String?
+  hotspotTemplateName String?
   reminderSent       Boolean? @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

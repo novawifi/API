@@ -6069,7 +6069,7 @@ class Controller {
 
   async fetchTemplates(req, res) {
 
-    const { token } = req.body;
+    const { token, stationId, host, station: stationHost } = req.body;
 
     if (!token) {
       return res.json({
@@ -6094,7 +6094,15 @@ class Controller {
         });
       }
       const platformID = auth.admin.platformID;
-      const cacheKey = `main:templates:${platformID}`;
+      const selectedRouter = await this.resolveTemplateUploadStation(platformID, stationId, host || stationHost);
+      if (!selectedRouter.success) {
+        return res.status(selectedRouter.status || 400).json({
+          success: false,
+          message: selectedRouter.message,
+        });
+      }
+      const station = selectedRouter.station;
+      const cacheKey = `main:templates:${platformID}:${station.id}`;
       const cached = this.cache.get(cacheKey);
       if (cached) {
         return res.json(cached);
@@ -6107,11 +6115,8 @@ class Controller {
         });
       }
       const templates = await this.db.getTemplates();
-      const offlineTemplateName = "OfflineBox";
-      const defaulttemplate = config.template;
-      const templateMode = String(defaulttemplate || "").toLowerCase() === offlineTemplateName.toLowerCase()
-        ? "offline"
-        : "online";
+      const { offlineTemplateName, templateMode, defaulttemplate } =
+        this.getStationTemplateSelection(config, station);
 
       const response = {
         success: true,
@@ -6132,6 +6137,22 @@ class Controller {
       });
     }
 
+  }
+
+  getStationTemplateSelection(config, station) {
+    const offlineTemplateName = "OfflineBox";
+    const legacyTemplate = config?.template;
+    const storedMode = String(station?.hotspotTemplateMode || "").toLowerCase();
+    const templateMode = storedMode === "offline" || storedMode === "online"
+      ? storedMode
+      : String(legacyTemplate || "").toLowerCase() === offlineTemplateName.toLowerCase()
+        ? "offline"
+        : "online";
+    return {
+      templateMode,
+      defaulttemplate: station?.hotspotTemplateName || (templateMode === "online" ? legacyTemplate : ""),
+      offlineTemplateName,
+    };
   }
 
   async resolveTemplateUploadStation(platformID, stationId, host) {
@@ -6326,9 +6347,11 @@ class Controller {
         });
       }
 
-      const data = { template: nextTemplate };
-      await this.db.updatePlatformConfig(platformID, data);
-      this.cache.del(`main:templates:${platformID}`);
+      await this.db.updateStation(uploadStation.id, {
+        hotspotTemplateMode: uploadMode,
+        hotspotTemplateName: uploadMode === "online" ? nextTemplate : null,
+      });
+      this.cache.del(`main:templates:${platformID}:${uploadStation.id}`);
 
       return res.status(200).json({
         success: true,

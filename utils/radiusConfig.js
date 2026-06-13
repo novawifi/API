@@ -118,16 +118,26 @@ const readClientsConf = async () => {
 };
 
 const writeClientsConf = async (confPath, updatedContent) => {
-  const tmpPath = `/tmp/clients-${Date.now()}.conf`;
+  const timestamp = Date.now();
+  const tmpPath = `/tmp/clients-${timestamp}.conf`;
+  const backupPath = `/tmp/clients-${timestamp}.backup`;
   await fsp.writeFile(tmpPath, updatedContent, "utf8");
   try {
+    await runSudo(["/bin/cp", confPath, backupPath]);
     await runSudo(["/usr/bin/install", "-m", "640", "-o", "root", "-g", "freerad", tmpPath, confPath]);
+    await runSudo(["/usr/sbin/freeradius", "-XC"]);
+    await runSudo(["/usr/bin/systemctl", "reload", getRadiusServiceName()]);
   } catch (error) {
-    await runSudo(["/bin/cp", tmpPath, confPath]);
-    await runSudo(["/bin/chown", "root:freerad", confPath]);
-    await runSudo(["/bin/chmod", "640", confPath]);
+    try {
+      await runSudo(["/usr/bin/install", "-m", "640", "-o", "root", "-g", "freerad", backupPath, confPath]);
+    } catch (restoreError) {
+      throw new Error(`RADIUS configuration failed and rollback failed: ${restoreError}`);
+    }
+    throw error;
+  } finally {
+    await fsp.unlink(tmpPath).catch(() => {});
+    await runSudo(["/bin/rm", "-f", backupPath]).catch(() => {});
   }
-  return runSudo(["/usr/bin/systemctl", "reload", getRadiusServiceName()]);
 };
 
 const updateClientIp = async ({ name, ip }) => {

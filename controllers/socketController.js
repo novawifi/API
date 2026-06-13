@@ -7,6 +7,7 @@ const path = require("path");
 const appRoot = require("app-root-path").path;
 const cache = require("../utils/cache");
 const { MikrotikConnection } = require("../configs/mikrotikConfig");
+const { Utils } = require("../utils/Functions");
 
 
 class Socket {
@@ -31,6 +32,27 @@ class Socket {
             fs.mkdirSync(this.SUPPORT_UPLOADS_DIR, { recursive: true });
         }
     };
+
+    async applyStationTemplate(platformData, hash) {
+        if (!platformData || !hash) return platformData;
+        let host = "";
+        try {
+            host = Utils.decodeHashedIP(hash);
+        } catch (error) {
+            return platformData;
+        }
+        const station = await this.db.getStationByHost(platformData.platformID, host);
+        if (!station?.hotspotTemplateMode) return platformData;
+        const mode = String(station.hotspotTemplateMode).toLowerCase();
+        return {
+            ...platformData,
+            template: mode === "online" && station.hotspotTemplateName
+                ? station.hotspotTemplateName
+                : "Default",
+            hotspotTemplateMode: mode,
+            stationId: station.id,
+        };
+    }
 
     sanitizeFileName(name) {
         if (!name) return "attachment";
@@ -158,9 +180,12 @@ class Socket {
                 }
 
                 socket.on("client-data", async (data) => {
-                    const { platform, ip } = data;
+                    const { platform, hash } = data;
                     try {
-                        const platformData = await this.db.getPlatformByUrl(platform);
+                        const platformData = await this.applyStationTemplate(
+                            await this.db.getPlatformByUrl(platform),
+                            hash
+                        );
                         socket.emit("platform-data", platformData);
                     } catch (error) {
                         console.error(`Error fetching platform for ${platform}:`, error);
@@ -169,9 +194,12 @@ class Socket {
                 });
 
                 socket.on("client-data_2", async (data) => {
-                    const { plat_id, ip } = data;
+                    const { plat_id, hash } = data;
                     try {
-                        const platformData = await this.db.getPlatform(plat_id);
+                        const platformData = await this.applyStationTemplate(
+                            await this.db.getPlatform(plat_id),
+                            hash
+                        );
                         socket.emit("platform-data", platformData);
                     } catch (error) {
                         console.error(`Error fetching platform for ${data.plat_id}:`, error);

@@ -2295,6 +2295,18 @@ class DataBase {
         }
     }
 
+    async getStationByHost(platformID, mikrotikHost) {
+        if (!platformID || !mikrotikHost) return null;
+        try {
+            return await prisma.station.findFirst({
+                where: { platformID, mikrotikHost },
+            });
+        } catch (error) {
+            console.log("An error occurred", error);
+            return null;
+        }
+    }
+
     async createStation(data) {
         if (!data) return null;
         try {
