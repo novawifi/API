@@ -4564,17 +4564,12 @@ class Controller {
                   return res.json({ success: false, message: "WireGuard restart failed." });
                 }
 
-                if (!station) {
-                  const siteUser = Utils.generateUsername();
-                  const siteUserPassword = Utils.generateRandomString();
-                  if (!siteUser || !siteUserPassword) {
-                    return res.json({ success: false, message: "Internal configuration error" });
-                  }
-
-                  const addProxy = await this.addReverseProxySite(WebfigHost, webfigTargetUrl);
-                  if (!addProxy.success) {
-                    return res.json({ success: false, message: addProxy.message || "Reverse proxy creation failed." });
-                  }
+                const webfigSite = await this.ensureStationWebfigSite(stationResult);
+                if (!webfigSite.success) {
+                  return res.json({
+                    success: false,
+                    message: webfigSite.message || "WebFig reverse proxy verification failed.",
+                  });
                 }
 
                 const seedScripts = await this.mikrotik.seedStationScriptsOnConnect(platformID, {
@@ -4587,6 +4582,7 @@ class Controller {
                   success: true,
                   message: `${responseMessage} and WireGuard updated.`,
                   station: stationResult,
+                  webfigSite,
                   seedScripts,
                 });
               });
@@ -8262,6 +8258,94 @@ class Controller {
   buildMikrotikWebfigTarget(host) {
     const internalHost = this.normalizeMikrotikInternalHost(host);
     return internalHost ? `http://${internalHost}` : null;
+  }
+
+  generateMikrotikWebfigHost(name) {
+    const prefix = String(name || "router")
+      .toLowerCase()
+      .replace(/[^a-z]/g, "")
+      .slice(0, 12) || "router";
+    const suffix = crypto.randomBytes(3).toString("hex");
+    const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
+    return `${prefix}${suffix}.${baseDomain}`;
+  }
+
+  async verifyNginxSite(domain, targetUrl) {
+    const safeDomain = this.sanitizeDomain(domain);
+    const target = this.normalizeProxyTargetUrl(targetUrl);
+    if (!safeDomain || !target) {
+      return { success: false, message: "Invalid nginx site verification input." };
+    }
+
+    const availablePath = `/etc/nginx/sites-available/${safeDomain}`;
+    const enabledPath = `/etc/nginx/sites-enabled/${safeDomain}`;
+    const run = (cmd, args = []) => new Promise((resolve, reject) => {
+      execFile(cmd, args, (error, stdout, stderr) => {
+        if (error) return reject(new Error(String(stderr || error.message).trim()));
+        resolve(String(stdout || "").trim());
+      });
+    });
+
+    try {
+      const [config, enabledTarget] = await Promise.all([
+        fsp.readFile(availablePath, "utf8"),
+        fsp.readlink(enabledPath),
+      ]);
+      if (!config.includes(`server_name ${safeDomain};`) || !config.includes(`proxy_pass ${target};`)) {
+        return { success: false, message: `Nginx mapping for ${safeDomain} does not match ${target}.` };
+      }
+      if (path.resolve(path.dirname(enabledPath), enabledTarget) !== availablePath) {
+        return { success: false, message: `Nginx enabled link for ${safeDomain} is incorrect.` };
+      }
+
+      await run("sudo", ["-n", "/usr/sbin/nginx", "-t"]);
+      const serviceState = await run("sudo", ["-n", "/usr/bin/systemctl", "is-active", "nginx"]);
+      if (serviceState !== "active") return { success: false, message: "Nginx is not active." };
+
+      const httpCode = await run("/usr/bin/curl", [
+        "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--max-time", "8",
+        "--resolve", `${safeDomain}:443:127.0.0.1`,
+        `https://${safeDomain}/`,
+      ]);
+      if (!/^\d{3}$/.test(httpCode) || httpCode === "000") {
+        return { success: false, message: `Nginx site ${safeDomain} did not answer locally.` };
+      }
+      return { success: true, domain: safeDomain, target, httpCode };
+    } catch (error) {
+      return {
+        success: false,
+        message: `Failed to verify nginx site ${safeDomain}.`,
+        error: error?.message || String(error),
+      };
+    }
+  }
+
+  async ensureStationWebfigSite(station) {
+    if (!station?.id) return { success: false, message: "Station is missing." };
+    const target = this.buildMikrotikWebfigTarget(station.mikrotikHost);
+    if (!target) {
+      return { success: false, message: "Station requires a valid 10.10.10.x internal host." };
+    }
+
+    let domain = this.sanitizeDomain(station.mikrotikWebfigHost);
+    if (!domain) {
+      domain = this.generateMikrotikWebfigHost(station.name);
+      await this.db.updateStation(station.id, { mikrotikWebfigHost: domain });
+      station.mikrotikWebfigHost = domain;
+    }
+
+    const provision = await this.addReverseProxySite(domain, target);
+    if (!provision?.success) return provision;
+    const verification = await this.verifyNginxSite(domain, target);
+    if (!verification.success) return verification;
+    return {
+      success: true,
+      message: `WebFig nginx site verified for ${domain}`,
+      domain,
+      target,
+      httpCode: verification.httpCode,
+    };
   }
 
   getWildcardCertificatePaths(domain) {

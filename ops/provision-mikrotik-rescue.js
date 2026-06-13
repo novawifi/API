@@ -6,9 +6,16 @@ const { Mikrotikcontroller } = require("../controllers/mikrotikController");
 const { getMikrotikRescueConfig } = require("../utils/mikrotikRescue");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const withTimeout = (promise, timeoutMs, message) => {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+};
 
 async function run() {
-    const dryRun = process.argv.includes("--dry-run");
+    const apply = process.argv.includes("--apply");
     const db = new DataBase();
     const connectionManager = new MikrotikConnection();
     const controller = new Mikrotikcontroller();
@@ -25,8 +32,8 @@ async function run() {
         targets.push(station);
     }
 
-    console.log(`SSTP rescue rollout targets: ${targets.length}${dryRun ? " (dry run)" : ""}`);
-    if (dryRun) return;
+    console.log(`SSTP rescue rollout targets: ${targets.length}${apply ? "" : " (dry run; pass --apply to configure)"}`);
+    if (!apply) return;
 
     const results = { configured: 0, unreachable: 0, failed: 0 };
     for (const station of targets) {
@@ -45,7 +52,11 @@ async function run() {
                 continue;
             }
 
-            const outcome = await controller.ensureMikrotikRescue(connection.channel, host);
+            const outcome = await withTimeout(
+                controller.ensureMikrotikRescue(connection.channel, host),
+                30000,
+                "Rescue configuration timed out"
+            );
             if (!outcome?.success) throw new Error(outcome?.reason || "Rescue configuration was rejected");
             results.configured += 1;
             console.log(`[configured] ${host} -> ${outcome.rescueAddress}`);
@@ -69,4 +80,5 @@ run()
     .finally(async () => {
         const prisma = require("../prisma");
         await prisma.$disconnect();
+        process.exit(process.exitCode || 0);
     });

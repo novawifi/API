@@ -99,3 +99,51 @@ test("buildNginxConfig contains server_name and proxy_pass", async () => {
     assert.ok(config.includes("server_name example.com;"));
     assert.ok(config.includes("proxy_pass http://localhost:3000;"));
 });
+
+test("ensureStationWebfigSite repairs the selected station mapping", async () => {
+    const controller = new Controller();
+    const calls = [];
+    controller.addReverseProxySite = async (domain, target) => {
+        calls.push({ type: "provision", domain, target });
+        return { success: true };
+    };
+    controller.verifyNginxSite = async (domain, target) => {
+        calls.push({ type: "verify", domain, target });
+        return { success: true, httpCode: "502" };
+    };
+
+    const result = await controller.ensureStationWebfigSite({
+        id: "station-1",
+        name: "Office",
+        mikrotikHost: "10.10.10.42",
+        mikrotikWebfigHost: "office-webfig.novawifi.co.ke",
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.target, "http://10.10.10.42");
+    assert.deepEqual(calls, [
+        { type: "provision", domain: "office-webfig.novawifi.co.ke", target: "http://10.10.10.42" },
+        { type: "verify", domain: "office-webfig.novawifi.co.ke", target: "http://10.10.10.42" },
+    ]);
+});
+
+test("ensureStationWebfigSite creates and stores a missing hostname", async () => {
+    const controller = new Controller();
+    const updates = [];
+    controller.generateMikrotikWebfigHost = () => "generated-webfig.novawifi.co.ke";
+    controller.db = {
+        updateStation: async (id, data) => updates.push({ id, data }),
+    };
+    controller.addReverseProxySite = async () => ({ success: true });
+    controller.verifyNginxSite = async () => ({ success: true, httpCode: "200" });
+
+    const station = { id: "station-2", name: "Branch", mikrotikHost: "10.10.10.43" };
+    const result = await controller.ensureStationWebfigSite(station);
+
+    assert.equal(result.success, true);
+    assert.equal(station.mikrotikWebfigHost, "generated-webfig.novawifi.co.ke");
+    assert.deepEqual(updates, [{
+        id: "station-2",
+        data: { mikrotikWebfigHost: "generated-webfig.novawifi.co.ke" },
+    }]);
+});
