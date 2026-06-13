@@ -5229,7 +5229,7 @@ function autoLogin() {
                     .replace(/-+/g, "-")
                     .replace(/^[-.]+|[-.]+$/g, "");
             const name = sanitizeRouterName(payload.name) || `Mikrotik-${randomSuffix}`;
-            const endpointHost = payload.ddns || payload.publicIp;
+            const endpointHost = Utils.normalizeMikrotikPublicHost(payload.ddns || payload.publicIp);
             if (!endpointHost) return { success: false, message: "Public router host is required." };
             const internalHost = this.normalizeMikrotikInternalHost(payload.mikrotikHost);
             const webfigTargetUrl = this.buildMikrotikWebfigTarget(internalHost);
@@ -5243,10 +5243,11 @@ function autoLogin() {
             const existing = existingHost || existingKey;
 
             if (!existing) {
-                if (payload.ddns) {
+                const normalizedDdns = Utils.normalizeMikrotikPublicHost(payload.ddns);
+                if (normalizedDdns && !Utils.isValidIP(normalizedDdns)) {
                     const existingDnsName = stations.find(s =>
-                        s.mikrotikPublicHost?.trim() === payload.ddns?.trim() ||
-                        s.mikrotikDDNS?.trim() === payload.ddns?.trim()
+                        Utils.normalizeMikrotikPublicHost(s.mikrotikPublicHost) === normalizedDdns ||
+                        Utils.normalizeMikrotikPublicHost(s.mikrotikDDNS) === normalizedDdns
                     );
                     if (existingDnsName) {
                         return { success: false, message: "DDNS name is already being used by another router." };
@@ -5290,7 +5291,7 @@ function autoLogin() {
                     mikrotikUser: payload.mikrotikUser,
                     mikrotikPassword: encryptedPassword,
                     mikrotikDDNS: "",
-                    mikrotikPublicHost: payload.ddns || payload.publicIp || "",
+                    mikrotikPublicHost: endpointHost,
                     mikrotikWebfigHost,
                     platformID,
                     adminID,
@@ -5299,6 +5300,8 @@ function autoLogin() {
                     radiusClientSecret: session.radiusClientSecret || null,
                     radiusClientIp: systemBasis === "RADIUS" ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || "") : null,
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || "") : null,
+                    hotspotTemplateMode: "offline",
+                    hotspotTemplateName: null,
                 });
 
                 const proxy = await this.addReverseProxySite(mikrotikWebfigHost, webfigTargetUrl);
@@ -5313,7 +5316,7 @@ function autoLogin() {
                     mikrotikUser: payload.mikrotikUser,
                     mikrotikPassword: encryptedPassword,
                     mikrotikDDNS: "",
-                    mikrotikPublicHost: payload.ddns || payload.publicIp || "",
+                    mikrotikPublicHost: endpointHost,
                     systemBasis,
                     radiusClientName: session.radiusClientName || existing.radiusClientName || null,
                     radiusClientSecret: session.radiusClientSecret || existing.radiusClientSecret || null,
@@ -5359,12 +5362,22 @@ function autoLogin() {
 	                warnings.push(seedResult.message || "Failed to seed station scripts");
 	            }
 
-	            const loginTemplateResult = await this.uploadHotspotLoginTemplate(
-	                platformID,
-	                stationResult?.mikrotikHost || payload.mikrotikHost
-	            ).catch((error) => ({ success: false, message: error?.message || "Failed to upload login.html" }));
-	            if (!loginTemplateResult.success) {
-	                warnings.push(loginTemplateResult.message || "Failed to upload login.html");
+	            let loginTemplateResult = null;
+	            if (String(stationResult?.hotspotTemplateMode || "").toLowerCase() === "offline") {
+	                loginTemplateResult = await this.uploadHotspotLoginTemplate(
+	                    platformID,
+	                    stationResult?.mikrotikHost || payload.mikrotikHost,
+	                    { mode: "offline" }
+	                ).catch((error) => ({ success: false, message: error?.message || "Failed to upload login.html" }));
+	                if (!loginTemplateResult.success) {
+	                    return {
+	                        success: false,
+	                        message: `Station was saved, but its offline template could not be uploaded: ${loginTemplateResult.message || "unknown error"}`,
+	                        station: stationResult,
+	                        seedScripts: seedResult,
+	                        loginTemplate: loginTemplateResult,
+	                    };
+	                }
 	            }
 
 	            const warningMessage = warnings.length > 0 ? ` Warnings: ${warnings.join(" | ")}` : "";

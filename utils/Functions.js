@@ -49,6 +49,19 @@ class Utils {
     return ddnsRegex.test(host.trim());
   }
 
+  static normalizeMikrotikPublicHost(value) {
+    const input = String(value || "").trim();
+    if (!input) return "";
+    if (Utils.isValidIP(input)) return input;
+
+    try {
+      const url = new URL(/^https?:\/\//i.test(input) ? input : `http://${input}`);
+      const hostname = String(url.hostname || "").trim().replace(/^\[|\]$/g, "").toLowerCase();
+      if (Utils.isValidIP(hostname) || Utils.validateDdnsHost(hostname)) return hostname;
+    } catch (error) { }
+    return "";
+  }
+
   static isValidIP(ip) {
     const ipv4 =
       /^(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}$/;

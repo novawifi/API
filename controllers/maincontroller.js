@@ -3410,10 +3410,6 @@ class Controller {
         const add = await this.db.createPlatformConfig(platformID, payload);
         await this.refreshDashboardStats(platformID, { role: auth.admin.role });
         this.cache.del(`main:settings:${platformID}`);
-        this.syncHotspotLoginTemplates(
-          platformID,
-          String(payload.template || "Default").toLowerCase() === "offlinebox" ? "offline" : "online"
-        ).catch((error) => this.logPlatform(platformID, `login.html sync failed: ${error?.message || error}`, { context: "templates", level: "warn" }));
         return res.json({
           success: true,
           message: "Platform Settings created.",
@@ -3423,10 +3419,6 @@ class Controller {
       const updatedConfig = await this.db.updatePlatformConfig(platformID, payload);
       await this.refreshDashboardStats(platformID, { role: auth.admin.role });
       this.cache.del(`main:settings:${platformID}`);
-      this.syncHotspotLoginTemplates(
-        platformID,
-        String(updatedConfig?.template || payload.template || existingConfig?.template || "Default").toLowerCase() === "offlinebox" ? "offline" : "online"
-      ).catch((error) => this.logPlatform(platformID, `login.html sync failed: ${error?.message || error}`, { context: "templates", level: "warn" }));
       return res.json({
         success: true,
         message: "Platform Settings updated.",
@@ -4334,6 +4326,11 @@ class Controller {
       data.platformID = platformID;
       data.adminID = adminID;
       data.mikrotikDDNS = "";
+      const normalizedPublicHost = Utils.normalizeMikrotikPublicHost(mikrotikPublicHost || mikrotikDDNS);
+      if (!normalizedPublicHost) {
+        return res.json({ success: false, message: "Public router host must be a valid DDNS hostname or IP address." });
+      }
+      data.mikrotikPublicHost = normalizedPublicHost;
       const platformData = await this.db.getPlatform(platformID);
       if (!platformData) {
         return res.json({ success: false, message: "Platform doesn't exist." });
@@ -4396,6 +4393,8 @@ class Controller {
         }
 
         const { id, token, ...newData } = data;
+        newData.hotspotTemplateMode = "offline";
+        newData.hotspotTemplateName = null;
         if (systemBasis === "RADIUS") {
           const stations = await this.db.getStations(platformID);
           const existingNames = new Set(stations.map(s => s.radiusClientName).filter(Boolean));
@@ -4435,18 +4434,15 @@ class Controller {
         responseMessage = "Station updated";
       }
 
-      const endpointHost = mikrotikPublicHost;
-      if (!endpointHost) {
-        return res.json({ success: false, message: "Public router host or DDNS is required." });
-      }
+      const endpointHost = normalizedPublicHost;
       const result = await this.resolveMikrotikHost(endpointHost);
       if (!result.success) {
         return res.json({ success: false, message: result.message });
       }
       const resolvedIp = Array.isArray(result.addresses) && result.addresses.length > 0 ? result.addresses[0] : endpointHost;
       if (systemBasis === "RADIUS") {
-        const radiusHost = getRadiusClientIp(stationResult, mikrotikPublicHost && Utils.isValidIP(mikrotikPublicHost)
-          ? mikrotikPublicHost
+        const radiusHost = getRadiusClientIp(stationResult, Utils.isValidIP(normalizedPublicHost)
+          ? normalizedPublicHost
           : resolvedIp);
         await this.db.updateStation(stationResult.id, {
           radiusClientIp: radiusHost || "",
@@ -4572,6 +4568,27 @@ class Controller {
                   });
                 }
 
+                let defaultTemplate = null;
+                if (String(stationResult.hotspotTemplateMode || "").toLowerCase() === "offline") {
+                  defaultTemplate = await this.mikrotik.uploadHotspotLoginTemplate(
+                    platformID,
+                    stationResult.mikrotikHost,
+                    { mode: "offline" }
+                  ).catch((error) => ({
+                    success: false,
+                    message: error?.message || "Failed to upload the default offline template.",
+                  }));
+                  if (!defaultTemplate?.success) {
+                    return res.status(502).json({
+                      success: false,
+                      message: `Station was saved, but its offline template could not be uploaded: ${defaultTemplate?.message || "unknown error"}`,
+                      station: stationResult,
+                      webfigSite,
+                      defaultTemplate,
+                    });
+                  }
+                }
+
                 const seedScripts = await this.mikrotik.seedStationScriptsOnConnect(platformID, {
                   mikrotikHost: stationResult?.mikrotikHost || mikrotikHost,
                   systemBasis: stationResult?.systemBasis || systemBasis || "API",
@@ -4583,6 +4600,7 @@ class Controller {
                   message: `${responseMessage} and WireGuard updated.`,
                   station: stationResult,
                   webfigSite,
+                  defaultTemplate,
                   seedScripts,
                 });
               });
@@ -6347,10 +6365,17 @@ class Controller {
         });
       }
 
-      await this.db.updateStation(uploadStation.id, {
+      const updatedStation = await this.db.updateStation(uploadStation.id, {
         hotspotTemplateMode: uploadMode,
         hotspotTemplateName: uploadMode === "online" ? nextTemplate : null,
       });
+      if (!updatedStation?.id) {
+        return res.status(500).json({
+          success: false,
+          message: "Template reached the MikroTik, but its station setting could not be saved. Please retry.",
+          uploadSummary,
+        });
+      }
       this.cache.del(`main:templates:${platformID}:${uploadStation.id}`);
 
       return res.status(200).json({
