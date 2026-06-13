@@ -5,6 +5,7 @@ const { RouterOSAPI } = require('@fibercom/routeros-api');
 const { Utils } = require("../utils/Functions");
 const { DataBase } = require("../helpers/databaseOperation");
 const { Auth } = require('../controllers/authController');
+const { getMikrotikRescueConfig } = require('../utils/mikrotikRescue');
 
 class MikrotikConnection {
     constructor() {
@@ -20,6 +21,30 @@ class MikrotikConnection {
             )
         ]);
     };
+
+    async connectRouterApi(host, user, password, timeout = 3000) {
+        const api = new RouterOSAPI({ host, user, password, port: 8728, timeout });
+        return this.withTimeout(api.connect(), timeout, `Connection timeout (${host})`);
+    }
+
+    async connectRouterApiWithFallback(primaryHost, user, password) {
+        try {
+            const channel = await this.connectRouterApi(primaryHost, user, password);
+            return { channel, host: primaryHost, transport: "wireguard" };
+        } catch (primaryError) {
+            const rescue = getMikrotikRescueConfig(primaryHost);
+            if (!rescue.enabled) throw primaryError;
+
+            try {
+                const channel = await this.connectRouterApi(rescue.rescueAddress, user, password, 5000);
+                return { channel, host: rescue.rescueAddress, transport: "sstp-rescue" };
+            } catch (rescueError) {
+                throw new Error(
+                    `Primary connection failed (${primaryError.message}); SSTP rescue failed (${rescueError.message})`
+                );
+            }
+        }
+    }
 
     async createMikrotikClient(token) {
         if (!token) return null;
@@ -58,21 +83,19 @@ class MikrotikConnection {
                 }
 
                 const decryptedPassword = Utils.decryptPasswordSafe(mikrotikPassword);
-                const client = new RouterOSAPI({
-                    host: mikrotikHost,
-                    user: mikrotikUser,
-                    password: decryptedPassword,
-                    port: 8728,
-                    timeout: 3000,
-                });
-
                 try {
-                    const channel = await this.withTimeout(client.connect(), 3000, "Connection timeout");
+                    const connection = await this.connectRouterApiWithFallback(
+                        mikrotikHost,
+                        mikrotikUser,
+                        decryptedPassword
+                    );
                     return {
                         id,
                         host: mikrotikHost,
                         username: mikrotikUser,
-                        channel,
+                        channel: connection.channel,
+                        connectedHost: connection.host,
+                        transport: connection.transport,
                         status: "Connected",
                         message: "Connected successfully",
                     };
@@ -115,18 +138,14 @@ class MikrotikConnection {
         console.log("Connecting to MikroTik (Single):", mikrotikHost);
 
         const decryptedPassword = Utils.decryptPasswordSafe(mikrotikPassword);
-        const api = new RouterOSAPI({
-            host: mikrotikHost,
-            user: mikrotikUser,
-            password: decryptedPassword,
-            port: 8728,
-            timeout: 3000,
-        });
-
         try {
-            const channel = await this.withTimeout(api.connect(), 3000, "Connection timeout");
-            console.log(`Connected to ${mikrotikHost} single`);
-            return { channel };
+            const connection = await this.connectRouterApiWithFallback(
+                mikrotikHost,
+                mikrotikUser,
+                decryptedPassword
+            );
+            console.log(`Connected to ${mikrotikHost} single via ${connection.transport}`);
+            return connection;
 
         } catch (err) {
             console.error(`Failed to connect to ${mikrotikHost}:`, err.message);
@@ -171,23 +190,22 @@ class MikrotikConnection {
         }
 
         const decryptedPassword = Utils.decryptPasswordSafe(mikrotikPassword);
-        const client = new RouterOSAPI({
-            host: mikrotikHost,
-            user: mikrotikUser,
-            password: decryptedPassword,
-            port: 8728,
-            timeout: 3000,
-        });
-
         try {
-            const channel = await this.withTimeout(client.connect(), 3000, "Connection timeout");
-            if (channel) {
-                channel.close?.();
+            const connection = await this.connectRouterApiWithFallback(
+                mikrotikHost,
+                mikrotikUser,
+                decryptedPassword
+            );
+            if (connection.channel) {
+                connection.channel.close?.();
             }
             return {
                 success: true,
                 status: "Connected",
-                message: "Connected successfully",
+                transport: connection.transport,
+                message: connection.transport === "sstp-rescue"
+                    ? "Connected through SSTP rescue"
+                    : "Connected successfully",
             };
         } catch (err) {
             return {

@@ -5546,7 +5546,23 @@ class DataBase {
     }
 
 	    async searchPppoe({ platformID, search, station, limit, offset }) {
-	        const where = {
+	        const where = this.buildPppoeSearchWhere({ platformID, search, station });
+
+        const [rows, totalCount] = await Promise.all([
+            prisma.pppoe.findMany({
+                where,
+                skip: offset,
+                take: limit,
+                orderBy: { createdAt: "desc" },
+            }),
+            prisma.pppoe.count({ where }),
+        ]);
+
+        return { rows, totalCount };
+    }
+
+    buildPppoeSearchWhere({ platformID, search, station }) {
+	        return {
 	            platformID,
 	            ...(station && { station }),
 	            ...(search && {
@@ -5564,18 +5580,20 @@ class DataBase {
                 ],
             }),
         };
+    }
 
-        const [rows, totalCount] = await Promise.all([
+    async getPppoeSearchSummary({ platformID, search, station }) {
+        const where = this.buildPppoeSearchWhere({ platformID, search, station });
+        const [users, activeAccounts, expiredAccounts] = await Promise.all([
             prisma.pppoe.findMany({
                 where,
-                skip: offset,
-                take: limit,
-                orderBy: { createdAt: "desc" },
+                select: { clientname: true, status: true },
             }),
-            prisma.pppoe.count({ where }),
+            prisma.pppoe.count({ where: { ...where, status: "active" } }),
+            prisma.pppoe.count({ where: { ...where, status: "expired" } }),
         ]);
 
-        return { rows, totalCount };
+        return { users, activeAccounts, expiredAccounts };
     }
 
     async searchModerators({ platformID, search, limit, offset }) {

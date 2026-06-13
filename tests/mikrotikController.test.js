@@ -28,6 +28,50 @@ test("buildNginxConfig includes server_name and proxy_pass", async () => {
     assert.ok(cfg.includes("proxy_pass http://localhost:3000;"));
 });
 
+test("getHotspotWalledGardenHosts includes Google Fonts hosts", () => {
+    const ctrl = new Mikrotikcontroller();
+    const hosts = ctrl.getHotspotWalledGardenHosts();
+
+    assert.ok(hosts.includes("fonts.googleapis.com"));
+    assert.ok(hosts.includes("fonts.gstatic.com"));
+});
+
+test("getHotspotWalledGardenHosts includes captive portal check hosts", () => {
+    const ctrl = new Mikrotikcontroller();
+    const hosts = ctrl.getHotspotWalledGardenHosts();
+
+    assert.ok(hosts.includes("connectivitycheck.gstatic.com"));
+    assert.ok(hosts.includes("captive.apple.com"));
+});
+
+test("uploadHotspotLoginTemplate ensures walled garden for offline templates", async () => {
+    const ctrl = new Mikrotikcontroller();
+    const calls = [];
+    const channel = { close: async () => calls.push("close") };
+
+    ctrl.buildOfflineLoginTemplateHtml = async () => "<html>offline</html>";
+    ctrl.config = {
+        createSingleMikrotikClient: async () => ({ channel }),
+    };
+    ctrl.ensureHotspotWalledGarden = async (receivedChannel) => {
+        assert.equal(receivedChannel, channel);
+        calls.push("walled-garden");
+    };
+    ctrl.resolveHotspotLoginFilePath = async () => {
+        calls.push("resolve-path");
+        return "hotspot/login.html";
+    };
+    ctrl.fetchHotspotLoginFile = async () => {
+        calls.push("fetch-file");
+        return "hotspot/login.html";
+    };
+
+    const result = await ctrl.uploadHotspotLoginTemplate("plat1", "10.0.0.1", { mode: "offline" });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(calls, ["walled-garden", "resolve-path", "fetch-file", "close"]);
+});
+
 const createRes = () => ({
     statusCode: 200,
     body: null,

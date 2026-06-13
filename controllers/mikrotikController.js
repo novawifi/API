@@ -14,6 +14,7 @@ const { Mikrotik } = require("../helpers/mikrotikOperation");
 const { MikrotikConnection } = require("../configs/mikrotikConfig");
 const { Utils } = require("../utils/Functions");
 const { getHotspotHash, renderOfflineBoxLoginTemplate, resolveApiBaseUrl } = require("../utils/hotspotTemplate");
+const { buildMikrotikRescueScript, getMikrotikRescueConfig } = require("../utils/mikrotikRescue");
 const net = require("net");
 const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
@@ -71,7 +72,15 @@ class Mikrotikcontroller {
 
     getHotspotWalledGardenHosts() {
         const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
-        const hosts = [domain, `*.${domain}`, "api64.ipify.org"];
+        const hosts = [
+            domain,
+            `*.${domain}`,
+            "api64.ipify.org",
+            "fonts.googleapis.com",
+            "fonts.gstatic.com",
+            "connectivitycheck.gstatic.com",
+            "captive.apple.com",
+        ];
         try {
             const apiHost = new URL(resolveApiBaseUrl()).hostname;
             if (apiHost) {
@@ -96,6 +105,175 @@ class Mikrotikcontroller {
                 "=action=allow",
             ]);
             existingHosts.add(host);
+        }
+    }
+
+    async ensureMikrotikRescue(channel, routerHost) {
+        const config = getMikrotikRescueConfig(routerHost);
+        if (!config.enabled) {
+            return { success: false, configured: false, reason: config.reason };
+        }
+
+        const fixes = [];
+        const interfaces = await channel.write("/interface/sstp-client/print", []);
+        const existing = (Array.isArray(interfaces) ? interfaces : [])
+            .find((entry) => entry.name === config.interfaceName);
+        const interfaceArgs = [
+            `=connect-to=${config.server}`,
+            `=port=${config.port}`,
+            `=user=${config.username}`,
+            `=password=${config.password}`,
+            "=authentication=mschap2",
+            "=profile=default-encryption",
+            "=add-default-route=no",
+            "=dial-on-demand=no",
+            "=keepalive-timeout=30",
+            "=tls-version=only-1.2",
+            "=verify-server-certificate=yes",
+            "=verify-server-address-from-certificate=yes",
+            "=disabled=no",
+            "=comment=Nova emergency rescue tunnel",
+        ];
+
+        if (existing?.[".id"]) {
+            await channel.write("/interface/sstp-client/set", [
+                `=.id=${existing[".id"]}`,
+                ...interfaceArgs,
+            ]);
+            fixes.push("sstp_rescue_updated");
+        } else {
+            await channel.write("/interface/sstp-client/add", [
+                `=name=${config.interfaceName}`,
+                ...interfaceArgs,
+            ]);
+            fixes.push("sstp_rescue_added");
+        }
+
+        const services = await channel.write("/ip/service/print", ["?name=api"]);
+        const apiService = Array.isArray(services) ? services[0] : null;
+        if (apiService?.[".id"]) {
+            const allowed = new Set(
+                String(apiService.address || "")
+                    .split(",")
+                    .map((entry) => entry.trim())
+                    .filter(Boolean)
+            );
+            allowed.add("10.10.10.0/24");
+            allowed.add(config.rescueSubnet);
+            await channel.write("/ip/service/set", [
+                `=.id=${apiService[".id"]}`,
+                `=address=${[...allowed].join(",")}`,
+                "=disabled=no",
+            ]);
+            fixes.push("sstp_rescue_api_allowed");
+        }
+
+        const firewall = await channel.write("/ip/firewall/filter/print", []);
+        const rescueRule = (Array.isArray(firewall) ? firewall : [])
+            .find((entry) => entry.comment === "Nova rescue management");
+        const firewallArgs = [
+            "=chain=input",
+            `=in-interface=${config.interfaceName}`,
+            `=src-address=${config.rescueSubnet}`,
+            "=protocol=tcp",
+            `=dst-port=${config.managementPorts}`,
+            "=action=accept",
+            "=comment=Nova rescue management",
+            "=disabled=no",
+        ];
+        if (rescueRule?.[".id"]) {
+            await channel.write("/ip/firewall/filter/set", [
+                `=.id=${rescueRule[".id"]}`,
+                ...firewallArgs,
+            ]);
+        } else {
+            await channel.write("/ip/firewall/filter/add", [
+                ...firewallArgs,
+                "=place-before=0",
+            ]);
+        }
+        fixes.push("sstp_rescue_firewall_allowed");
+
+        const watchdogEvent = [
+            `:local rescue [/interface/sstp-client/find name=\"${config.interfaceName}\"]`,
+            ":if ([:len $rescue] > 0) do={",
+            ":local restart false",
+            ":if ([/interface/sstp-client/get $rescue running] = false) do={ :set restart true }",
+            `:if (!$restart) do={ :if ([/ping address=${config.rescueGateway} interface=${config.interfaceName} count=3 interval=1s] = 0) do={ :set restart true } }`,
+            ":if ($restart) do={ /interface/sstp-client disable $rescue; :delay 5s; /interface/sstp-client enable $rescue }",
+            "}",
+        ].join("; ");
+        const schedulers = await channel.write("/system/scheduler/print", []);
+        const watchdog = (Array.isArray(schedulers) ? schedulers : [])
+            .find((entry) => entry.name === config.watchdogName);
+        const schedulerArgs = [
+            "=interval=2m",
+            "=start-time=startup",
+            `=on-event=${watchdogEvent}`,
+            "=policy=read,write,test",
+            "=disabled=no",
+        ];
+        if (watchdog?.[".id"]) {
+            await channel.write("/system/scheduler/set", [
+                `=.id=${watchdog[".id"]}`,
+                ...schedulerArgs,
+            ]);
+        } else {
+            await channel.write("/system/scheduler/add", [
+                `=name=${config.watchdogName}`,
+                ...schedulerArgs,
+            ]);
+        }
+        fixes.push("sstp_rescue_watchdog_ready");
+
+        return {
+            success: true,
+            configured: true,
+            rescueAddress: config.rescueAddress,
+            fixes,
+        };
+    }
+
+    async configureMikrotikRescue(req, res) {
+        const auth = await this.authenticateStationRequest(req);
+        if (!auth.success) {
+            return res.status(auth.status || 400).json({ success: false, message: auth.message });
+        }
+
+        const config = getMikrotikRescueConfig(auth.host);
+        if (!config.enabled) {
+            return res.status(503).json({
+                success: false,
+                message: `SSTP rescue is not available: ${config.reason}`,
+            });
+        }
+
+        const connection = await this.config.createSingleMikrotikClient(auth.platformID, auth.host);
+        if (!connection?.channel) {
+            return res.status(502).json({ success: false, message: "Unable to connect to the selected MikroTik" });
+        }
+        if (connection.transport === "sstp-rescue") {
+            await this.safeCloseChannel(connection.channel);
+            return res.status(409).json({
+                success: false,
+                message: "The router is currently reachable only through SSTP rescue; refusing to reconfigure the active rescue tunnel.",
+            });
+        }
+
+        try {
+            const result = await this.ensureMikrotikRescue(connection.channel, auth.host);
+            return res.status(200).json({
+                success: true,
+                message: "SSTP rescue connection configured",
+                ...result,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: error?.message || "Failed to configure SSTP rescue connection",
+            });
+        } finally {
+            await this.safeCloseChannel(connection.channel);
         }
     }
 
@@ -308,6 +486,9 @@ function autoLogin() {
 
         const channel = connection.channel;
         try {
+            if (mode === "offline") {
+                await this.ensureHotspotWalledGarden(channel);
+            }
             const loginFilePath = await this.resolveHotspotLoginFilePath(channel);
             const writtenPath = await this.fetchHotspotLoginFile(channel, loginFilePath, loginHtml);
             return { success: true, path: writtenPath, message: `login.html fetched to ${writtenPath}` };
@@ -4391,6 +4572,11 @@ function autoLogin() {
 	            const radiusServerIp = getRadiusServerIp();
 	            const domain = (process.env.DOMAIN || process.env.NEXT_PUBLIC_DOMAIN || "novawifi.co.ke").toString();
 	            const walledGardenHosts = this.getHotspotWalledGardenHosts();
+	            const rescueConfig = getMikrotikRescueConfig(internalIp);
+	            const rescueScript = buildMikrotikRescueScript(rescueConfig);
+	            const apiAllowedAddresses = rescueConfig.enabled
+	                ? `10.10.10.0/24,${rescueConfig.rescueSubnet}`
+	                : "10.10.10.0/24";
 	            if (session.systemBasis === "RADIUS") {
                 const stations = await this.db.getStations(platformID);
                 const existingNames = new Set(stations.map(s => s.radiusClientName).filter(Boolean));
@@ -4521,7 +4707,7 @@ function autoLogin() {
 	                `:do { :execute "/interface wifi set [find] ssid=$ssid disabled=no" } on-error={}`,
 	                `:do { :execute "/interface wifiwave2 set [find] ssid=$ssid disabled=no" } on-error={}`,
                 `:delay 10s`,
-                `/ip service set api address=10.10.10.0/24`,
+                `/ip service set api address=${apiAllowedAddresses}`,
                 `/ip service set www-ssl disabled=no`,
                 `/ip service set api disabled=no`,
                 `/ip service set ftp disabled=no`,
@@ -4530,6 +4716,7 @@ function autoLogin() {
                 `/interface list member add list=LAN interface=wireguard`,
                 `/ip firewall filter add action=accept chain=input dst-port=13231 protocol=udp`,
                 `/ip firewall filter add action=accept chain=input src-address=10.10.10.0/24`,
+	            ...rescueScript,
                 `/ip dns set servers=8.8.8.8,1.1.1.1 allow-remote-requests=yes`,
 	                ...walledGardenHosts.map((host) =>
 	                    `:do { :if ([:len [/ip/hotspot/walled-garden/find dst-host="${host}"]] = 0) do={ /ip/hotspot/walled-garden/add dst-host="${host}" action=allow } } on-error={ $safeFetch ($logBase . "hotspot-walled-garden-skip") }`

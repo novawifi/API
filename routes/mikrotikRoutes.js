@@ -44,6 +44,7 @@ router.post("/isPPPoEAutoConfigured", use("isPPPoEAutoConfigured"));
 router.post("/autoConfigureHotspot", use("autoConfigureHotspot"));
 router.post("/isHotspotAutoConfigured", use("isHotspotAutoConfigured"));
 router.post("/repair-router", use("repairRouter"));
+router.post("/rescue/configure", use("configureMikrotikRescue"));
 router.post("/auto-router/start", use("startAutoRouter"));
 router.get("/auto-router/script", use("getAutoRouterScript"));
 router.get("/auto-router/script/:token", use("getAutoRouterScript"));

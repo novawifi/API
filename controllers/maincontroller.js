@@ -910,6 +910,7 @@ class Controller {
 
       let result;
       let rows;
+      let summary;
 
       switch (entity) {
         case "payments":
@@ -1011,15 +1012,12 @@ class Controller {
           rows = result?.rows || [];
           break;
         case "pppoe":
-          result = await this.db.searchPppoe({
-            platformID,
-            search,
-            station,
-            limit,
-            offset
-          });
+          [result, summary] = await Promise.all([
+            this.db.searchPppoe({ platformID, search, station, limit, offset }),
+            this.db.getPppoeSearchSummary({ platformID, search, station }),
+          ]);
           rows = result?.rows || [];
-          if (rows.length > 0) {
+          {
             const platform = await this.db.getPlatform(platformID);
             const platformUrl = platform?.url;
             await Promise.all(
@@ -1034,9 +1032,9 @@ class Controller {
                 }
               })
             );
-            const stationHosts = Array.from(
-              new Set(rows.map((row) => row.station).filter(Boolean))
-            );
+            const stationHosts = station
+              ? [station]
+              : Array.from(new Set(rows.map((row) => row.station).filter(Boolean)));
             const statusResults = await Promise.all(
               stationHosts.map((host) =>
                 this.mikrotik.checkPPPUserStatus(platformID, host)
@@ -1066,6 +1064,20 @@ class Controller {
                 return { ...row, active: isActive ? "Online" : "Offline" };
               });
             }
+            const summaryUsers = summary?.users || [];
+            const onlineUsers = mikrotikFailed
+              ? 0
+              : summaryUsers.filter(
+                  (user) => user.status === "active" && activeUsernames.has(user.clientname)
+                ).length;
+            summary = {
+              totalUsers: result?.totalCount || 0,
+              activeUsers: summary?.activeAccounts || 0,
+              expiredUsers: summary?.expiredAccounts || 0,
+              onlineUsers,
+              offlineUsers: Math.max((result?.totalCount || 0) - onlineUsers, 0),
+              mikrotikReachable: !mikrotikFailed,
+            };
           }
           break;
         case "moderators":
@@ -1106,7 +1118,8 @@ class Controller {
       const response = {
         success: true,
         rows: rows,
-        totalCount: result.totalCount
+        totalCount: result.totalCount,
+        ...(summary && { summary }),
       };
       this.cache.set(cacheKey, response, 15000);
       return res.status(200).json(response);
