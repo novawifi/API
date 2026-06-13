@@ -442,6 +442,11 @@ function autoLogin() {
 
     async removeHotspotLoginFile(channel, path) {
         const safePath = `${this.normalizeHotspotHtmlDirectory(path)}/login.html`;
+        await this.removeRouterFile(channel, safePath);
+        return safePath;
+    }
+
+    async removeRouterFile(channel, safePath) {
         const existingFiles = await channel.write(["/file/print", `?name=${safePath}`]);
         if (Array.isArray(existingFiles) && existingFiles.length > 0) {
             for (const file of existingFiles) {
@@ -452,7 +457,6 @@ function autoLogin() {
                 ]);
             }
         }
-        return safePath;
     }
 
     createHotspotLoginDownload(loginHtml) {
@@ -474,6 +478,35 @@ function autoLogin() {
         return safePath;
     }
 
+    async fetchHotspotFontAsset(channel, loginFilePath) {
+        const htmlDirectory = this.normalizeHotspotHtmlDirectory(loginFilePath);
+        const fileName = "nunito-sans-latin.woff2";
+        const safePath = `${htmlDirectory}/${fileName}`;
+        const url = `${resolveApiBaseUrl()}/mkt/hotspot/font/${fileName}`;
+
+        await this.removeRouterFile(channel, safePath);
+        await channel.write([
+            "/tool/fetch",
+            `=url=${url}`,
+            `=dst-path=${safePath}`,
+            "=keep-result=yes",
+            "=check-certificate=no",
+        ]);
+        return safePath;
+    }
+
+    async downloadHotspotFontAsset(req, res) {
+        const fileName = String(req.params?.fileName || "");
+        if (fileName !== "nunito-sans-latin.woff2") {
+            return res.status(404).send("Font asset not found");
+        }
+
+        const fontPath = path.join(appRoot, "assets", "hotspot-fonts", fileName);
+        res.setHeader("Content-Type", "font/woff2");
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        return res.sendFile(fontPath);
+    }
+
     async uploadHotspotLoginTemplate(platformID, stationHost, options = {}) {
         const mode = String(options.mode || "offline").toLowerCase() === "online" ? "online" : "offline";
         const loginHtml = mode === "online"
@@ -490,8 +523,18 @@ function autoLogin() {
                 await this.ensureHotspotWalledGarden(channel);
             }
             const loginFilePath = await this.resolveHotspotLoginFilePath(channel);
+            const fontPath = mode === "offline"
+                ? await this.fetchHotspotFontAsset(channel, loginFilePath)
+                : null;
             const writtenPath = await this.fetchHotspotLoginFile(channel, loginFilePath, loginHtml);
-            return { success: true, path: writtenPath, message: `login.html fetched to ${writtenPath}` };
+            return {
+                success: true,
+                path: writtenPath,
+                fontPath,
+                message: fontPath
+                    ? `Offline template and Nunito Sans fetched to ${writtenPath}`
+                    : `login.html fetched to ${writtenPath}`,
+            };
         } finally {
             try { await channel.close?.(); } catch (err) { }
         }

@@ -56,6 +56,7 @@ router.get(
 router.get("/auto-router/log", use("autoRouterLog"));
 router.get("/auto-router/complete", use("autoRouterComplete"));
 router.get("/hotspot/expire", use("expireHotspotUserFromRouter"));
+router.get("/hotspot/font/:fileName", use("downloadHotspotFontAsset"));
 router.get("/hotspot/login-template/:token.html", use("downloadHotspotLoginTemplate"));
 router.get("/hotspot/login-template/:token", use("downloadHotspotLoginTemplate"));
 router.post("/ppp-info", use("fetchPPPoEInfo"));

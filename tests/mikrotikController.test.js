@@ -61,6 +61,10 @@ test("uploadHotspotLoginTemplate ensures walled garden for offline templates", a
         calls.push("resolve-path");
         return "hotspot/login.html";
     };
+    ctrl.fetchHotspotFontAsset = async () => {
+        calls.push("fetch-font");
+        return "hotspot/nunito-sans-latin.woff2";
+    };
     ctrl.fetchHotspotLoginFile = async () => {
         calls.push("fetch-file");
         return "hotspot/login.html";
@@ -69,7 +73,28 @@ test("uploadHotspotLoginTemplate ensures walled garden for offline templates", a
     const result = await ctrl.uploadHotspotLoginTemplate("plat1", "10.0.0.1", { mode: "offline" });
 
     assert.equal(result.success, true);
-    assert.deepEqual(calls, ["walled-garden", "resolve-path", "fetch-file", "close"]);
+    assert.equal(result.fontPath, "hotspot/nunito-sans-latin.woff2");
+    assert.deepEqual(calls, ["walled-garden", "resolve-path", "fetch-font", "fetch-file", "close"]);
+});
+
+test("fetchHotspotFontAsset replaces the local Nunito Sans file", async () => {
+    const ctrl = new Mikrotikcontroller();
+    const calls = [];
+    const channel = {
+        write: async (command) => {
+            calls.push(command);
+            return [];
+        },
+    };
+    ctrl.removeRouterFile = async (_channel, path) => calls.push(["remove", path]);
+
+    const result = await ctrl.fetchHotspotFontAsset(channel, "flash/hotspot/login.html");
+
+    assert.equal(result, "flash/hotspot/nunito-sans-latin.woff2");
+    assert.deepEqual(calls[0], ["remove", "flash/hotspot/nunito-sans-latin.woff2"]);
+    assert.equal(calls[1][0], "/tool/fetch");
+    assert.ok(calls[1].includes("=url=https://api.novawifi.co.ke/mkt/hotspot/font/nunito-sans-latin.woff2"));
+    assert.ok(calls[1].includes("=dst-path=flash/hotspot/nunito-sans-latin.woff2"));
 });
 
 const createRes = () => ({
