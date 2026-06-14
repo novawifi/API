@@ -1753,76 +1753,9 @@ Price: KSH ${service.price}</p>
     async saveBandwidthUsageForPlatform(platform) {
         const stations = await this.db.getStations(platform.platformID);
         if (!stations || stations.length === 0) return;
-
-        const today = new Date();
-        const dateOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-        const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-
-        for (const station of stations) {
-            try {
-                const usages = await this.mikrotikController.calculateBandwidthUsage(station.platformID);
-
-                for (const usage of usages) {
-                    const daily = await this.db.getNetworkUsageByStation(
-                        usage.id,
-                        usage.service,
-                        "daily",
-                        dateOnly
-                    );
-
-                    if (daily) {
-                        const tx = Number(daily.tx);
-                        const rx = Number(daily.rx);
-
-                        await this.db.updateNetworkUsage(daily.id, {
-                            tx: BigInt(usage.tx < tx ? tx + usage.tx : usage.tx),
-                            rx: BigInt(usage.rx < rx ? rx + usage.rx : usage.rx),
-                        });
-                    } else {
-                        await this.db.createNetworkUsage({
-                            platformID: station.platformID,
-                            station: usage.id,
-                            service: usage.service,
-                            tx: BigInt(usage.tx),
-                            rx: BigInt(usage.rx),
-                            period: "daily",
-                            date: dateOnly,
-                        });
-                    }
-
-                    const monthly = await this.db.getNetworkUsageByStation(
-                        usage.id,
-                        usage.service,
-                        "monthly",
-                        monthStart
-                    );
-
-                    if (monthly) {
-                        const tx = Number(monthly.tx);
-                        const rx = Number(monthly.rx);
-
-                        await this.db.updateNetworkUsage(monthly.id, {
-                            tx: BigInt(usage.tx < tx ? tx + usage.tx : usage.tx),
-                            rx: BigInt(usage.rx < rx ? rx + usage.rx : usage.rx),
-                        });
-                    } else {
-                        await this.db.createNetworkUsage({
-                            platformID: station.platformID,
-                            station: usage.id,
-                            service: usage.service,
-                            tx: BigInt(usage.tx),
-                            rx: BigInt(usage.rx),
-                            period: "monthly",
-                            date: monthStart,
-                        });
-                    }
-                }
-
-                console.log(`✅ Usage saved: ${station.name}`);
-            } catch (err) {
-                console.error(`❌ Usage failed: ${station.name}`, err);
-            }
-        }
+        const samples = await this.mikrotikController.collectBandwidthSamples(platform.platformID);
+        await this.db.applyBandwidthSamples(samples, new Date());
+        console.log(`Bandwidth usage saved for ${platform.platformID}: ${samples.length} counters`);
     }
 
     async processScheduledBulkSms(platform) {
@@ -2339,6 +2272,7 @@ Price: KSH ${service.price}</p>
 
         const tasks = [
             () => this.checkPPPoEExpirations(),
+            () => this.saveBandwidthUsageForPlatform(platform),
             () => this.checkAndExpireUsersForPlatform(platform),
             () => this.expireDataPlansForPlatform(platform),
             () => this.updateOnlineCountsForPlatform(platform),

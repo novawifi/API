@@ -453,6 +453,23 @@ model NetworkUsage {
   updatedAt  DateTime @default(now()) @updatedAt
 }
 
+model BandwidthCounterSnapshot {
+  id         String   @id @default(uuid())
+  platformID String
+  station    String
+  service    String
+  counterKey String
+  rx         BigInt   @default(0)
+  tx         BigInt   @default(0)
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([station, service, counterKey])
+  @@index([platformID, station])
+  @@index([lastSeenAt])
+}
+
 model DashboardStats {
   id           String   @id @default(uuid())
   platformID   String   @unique

@@ -7,6 +7,7 @@ const {
     startOfMonth,
     endOfMonth,
 } = require("date-fns");
+const { counterDelta } = require("../utils/bandwidth");
 const now = new Date();
 const offsetDate = new Date(
     now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
@@ -559,6 +560,120 @@ class DataBase {
             console.error("Error aggregating RADIUS usage:", error);
             return { hotspot: { tx: 0, rx: 0 }, pppoe: { tx: 0, rx: 0 } };
         }
+    }
+
+    async getRadiusBandwidthCounters(nasIps = [], since = new Date(Date.now() - 60 * 60 * 1000)) {
+        if (!Array.isArray(nasIps) || nasIps.length === 0) return [];
+        try {
+            return await prisma.radacct.findMany({
+                where: {
+                    nasipaddress: { in: nasIps },
+                    OR: [
+                        { acctstoptime: null },
+                        { acctupdatetime: { gte: since } },
+                        { acctstoptime: { gte: since } },
+                    ],
+                },
+                select: {
+                    radacctid: true,
+                    acctsessionid: true,
+                    acctuniqueid: true,
+                    framedprotocol: true,
+                    servicetype: true,
+                    acctinputoctets: true,
+                    acctoutputoctets: true,
+                },
+            });
+        } catch (error) {
+            console.error("Error fetching RADIUS bandwidth counters:", error);
+            throw error;
+        }
+    }
+
+    async applyBandwidthSamples(samples, observedAt = new Date()) {
+        if (!Array.isArray(samples) || samples.length === 0) return [];
+        const day = new Date(observedAt);
+        day.setHours(0, 0, 0, 0);
+        const month = new Date(observedAt.getFullYear(), observedAt.getMonth(), 1);
+
+        return prisma.$transaction(async (tx) => {
+            const increments = new Map();
+            const platformIDs = [...new Set(samples.map((sample) => sample?.platformID).filter(Boolean))];
+            const stationIDs = [...new Set(samples.map((sample) => sample?.station).filter(Boolean))];
+            const existingSnapshots = await tx.bandwidthCounterSnapshot.findMany({
+                where: { platformID: { in: platformIDs }, station: { in: stationIDs } },
+            });
+            const snapshotsByKey = new Map(existingSnapshots.map((snapshot) => [
+                `${snapshot.station}:${snapshot.service}:${snapshot.counterKey}`,
+                snapshot,
+            ]));
+
+            for (const sample of samples) {
+                if (!sample?.platformID || !sample?.station || !sample?.service || !sample?.counterKey) continue;
+                const rx = BigInt(sample.rx ?? 0);
+                const txBytes = BigInt(sample.tx ?? 0);
+                const snapshotKey = `${sample.station}:${sample.service}:${sample.counterKey}`;
+                const where = {
+                    station_service_counterKey: {
+                        station: sample.station,
+                        service: sample.service,
+                        counterKey: sample.counterKey,
+                    },
+                };
+                const previous = snapshotsByKey.get(snapshotKey);
+                const rxDelta = previous ? counterDelta(rx, previous.rx) : 0n;
+                const txDelta = previous ? counterDelta(txBytes, previous.tx) : 0n;
+                await tx.bandwidthCounterSnapshot.upsert({
+                    where,
+                    update: { platformID: sample.platformID, rx, tx: txBytes, lastSeenAt: observedAt },
+                    create: {
+                        platformID: sample.platformID,
+                        station: sample.station,
+                        service: sample.service,
+                        counterKey: sample.counterKey,
+                        rx,
+                        tx: txBytes,
+                        lastSeenAt: observedAt,
+                    },
+                });
+                snapshotsByKey.set(snapshotKey, { ...sample, rx, tx: txBytes });
+
+                const aggregateKey = `${sample.platformID}:${sample.station}:${sample.service}`;
+                const aggregate = increments.get(aggregateKey) || {
+                    platformID: sample.platformID,
+                    station: sample.station,
+                    service: sample.service,
+                    rx: 0n,
+                    tx: 0n,
+                };
+                aggregate.rx += rxDelta;
+                aggregate.tx += txDelta;
+                increments.set(aggregateKey, aggregate);
+            }
+
+            for (const increment of increments.values()) {
+                if (increment.rx === 0n && increment.tx === 0n) continue;
+                for (const [period, date] of [["daily", day], ["monthly", month]]) {
+                    const existing = await tx.networkUsage.findFirst({
+                        where: { station: increment.station, service: increment.service, period, date },
+                    });
+                    if (existing) {
+                        await tx.networkUsage.update({
+                            where: { id: existing.id },
+                            data: { rx: { increment: increment.rx }, tx: { increment: increment.tx } },
+                        });
+                    } else {
+                        await tx.networkUsage.create({ data: { ...increment, period, date } });
+                    }
+                }
+            }
+
+            const staleBefore = new Date(observedAt.getTime() - 90 * 24 * 60 * 60 * 1000);
+            await tx.bandwidthCounterSnapshot.deleteMany({
+                where: { platformID: { in: platformIDs }, lastSeenAt: { lt: staleBefore } },
+            });
+            return [...increments.values()];
+        }, { maxWait: 10000, timeout: 120000 });
     }
 
     async getRadiusUsageByUsernames(usernames = []) {
@@ -3722,11 +3837,16 @@ class DataBase {
         const now = new Date();
 
         const dailyUsage = networkusage.filter((u) =>
-            new Date(u.createdAt) >= startOfDay(now) && new Date(u.createdAt) <= endOfDay(now)
+            u.period === "daily" &&
+            new Date(u.date || u.createdAt) >= startOfDay(now) &&
+            new Date(u.date || u.createdAt) <= endOfDay(now)
         );
         const monthlyUsage = networkusage.filter((u) =>
-            new Date(u.createdAt) >= startOfMonth(now) && new Date(u.createdAt) <= endOfMonth(now)
+            u.period === "monthly" &&
+            new Date(u.date || u.createdAt) >= startOfMonth(now) &&
+            new Date(u.date || u.createdAt) <= endOfMonth(now)
         );
+        const allTimeUsage = networkusage.filter((u) => u.period === "daily");
 
         const sumUsage = (usage) =>
             usage.reduce(
@@ -3758,12 +3878,12 @@ class DataBase {
         const overallPerService = services.map((service) => ({
             service,
             period: "overall",
-            ...sumUsage(networkusage.filter((u) => u.service === service)),
+            ...sumUsage(allTimeUsage.filter((u) => u.service === service)),
         }));
 
         const overallDaily = { service: "Overall", period: "daily", ...sumUsage(dailyUsage) };
         const overallMonthly = { service: "Overall", period: "monthly", ...sumUsage(monthlyUsage) };
-        const overallAllTime = { service: "Overall", period: "overall", ...sumUsage(networkusage) };
+        const overallAllTime = { service: "Overall", period: "overall", ...sumUsage(allTimeUsage) };
 
         return [
             ...dailyStats,

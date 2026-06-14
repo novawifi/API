@@ -21,6 +21,7 @@ const { SMS } = require("./smsController");
 const { Auth } = require("./authController");
 const cache = require("../utils/cache");
 const { ensureRadiusClient, getRadiusClientIp, getRadiusServerIp } = require("../utils/radiusConfig");
+const { apiCounterKey, radiusCounterKey, readBytes } = require("../utils/bandwidth");
 
 class Mikrotikcontroller {
     constructor() {
@@ -5514,12 +5515,13 @@ function autoLogin() {
         }
     }
 
-    async calculateBandwidthUsage(platformID) {
+    async collectBandwidthSamples(platformID) {
         const stations = await this.db.getStations(platformID);
-        const results = [];
+        const samples = [];
         for (const station of stations) {
             try {
-                const isRadius = station?.systemBasis === "RADIUS";
+                if (!station?.id) continue;
+                const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
                 const ipCandidates = [
                     station?.radiusClientIp,
                     station?.mikrotikPublicHost,
@@ -5529,35 +5531,61 @@ function autoLogin() {
                 const nasIps = Array.from(new Set(ipCandidates.filter((val) => ipRegex.test(val))));
 
                 if (isRadius) {
-                    const radiusUsage = await this.db.getRadiusUsageByNasIps(nasIps);
-                    const totalTx = radiusUsage.hotspot.tx + radiusUsage.pppoe.tx;
-                    const totalRx = radiusUsage.hotspot.rx + radiusUsage.pppoe.rx;
-                    if (totalTx > 0 || totalRx > 0) {
-                        results.push(
-                            { id: station.id, service: "hotspot", tx: radiusUsage.hotspot.tx, rx: radiusUsage.hotspot.rx },
-                            { id: station.id, service: "pppoe", tx: radiusUsage.pppoe.tx, rx: radiusUsage.pppoe.rx }
-                        );
-                        continue;
+                    const rows = await this.db.getRadiusBandwidthCounters(nasIps);
+                    for (const row of rows) {
+                        const counterKey = radiusCounterKey(row);
+                        if (!counterKey) continue;
+                        const protocol = `${row.framedprotocol || ""} ${row.servicetype || ""}`.toLowerCase();
+                        samples.push({
+                            platformID,
+                            station: station.id,
+                            service: protocol.includes("ppp") ? "pppoe" : "hotspot",
+                            counterKey,
+                            rx: readBytes(row, "rx"),
+                            tx: readBytes(row, "tx"),
+                        });
                     }
+                    continue;
                 }
 
                 const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
                 if (!connection?.channel) continue;
                 const { channel } = connection;
                 try {
-                    let hotspotTx = 0, hotspotRx = 0;
-                    const hotspotUsers = await this.mikrotik.listHotspotActiveUsers(channel);
-                    for (const user of hotspotUsers) { hotspotTx += Number(user["bytes-out"] || 0); hotspotRx += Number(user["bytes-in"] || 0); }
-                    let pppoeTx = 0, pppoeRx = 0;
+                    const hotspotUsers = await this.mikrotik.listHotspotUsers(channel);
+                    for (const user of hotspotUsers) {
+                        const counterKey = apiCounterKey("hotspot", user);
+                        if (!counterKey) continue;
+                        samples.push({
+                            platformID,
+                            station: station.id,
+                            service: "hotspot",
+                            counterKey,
+                            rx: readBytes(user, "rx"),
+                            tx: readBytes(user, "tx"),
+                        });
+                    }
                     const pppoeUsers = await this.mikrotik.listPPPActiveUsers(channel);
-                    for (const user of pppoeUsers) { pppoeTx += Number(user["bytes-out"] || 0); pppoeRx += Number(user["bytes-in"] || 0); }
-                    results.push({ id: station.id, service: "hotspot", tx: hotspotTx, rx: hotspotRx }, { id: station.id, service: "pppoe", tx: pppoeTx, rx: pppoeRx });
+                    for (const user of pppoeUsers) {
+                        const counterKey = apiCounterKey("pppoe", user);
+                        if (!counterKey) continue;
+                        samples.push({
+                            platformID,
+                            station: station.id,
+                            service: "pppoe",
+                            counterKey,
+                            rx: readBytes(user, "rx"),
+                            tx: readBytes(user, "tx"),
+                        });
+                    }
                 } finally {
                     await this.safeCloseChannel(channel);
                 }
-            } catch (err) { }
+            } catch (error) {
+                console.warn(`[Bandwidth] Failed to collect station ${station?.id || station?.mikrotikHost || "unknown"}:`, error?.message || error);
+            }
         }
-        return results;
+        return samples;
     }
 
     async fetchPPPoEInfo(req, res) {

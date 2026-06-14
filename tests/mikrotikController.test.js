@@ -44,6 +44,46 @@ test("getHotspotWalledGardenHosts includes captive portal check hosts", () => {
     assert.ok(hosts.includes("captive.apple.com"));
 });
 
+test("collectBandwidthSamples collects per-station API and RADIUS counters", async () => {
+    const ctrl = new Mikrotikcontroller();
+    const closed = [];
+    ctrl.db = {
+        getStations: async () => ([
+            { id: "api-station", mikrotikHost: "10.10.10.2", systemBasis: "API" },
+            { id: "radius-station", mikrotikHost: "10.10.10.3", radiusClientIp: "192.0.2.3", systemBasis: "RADIUS" },
+        ]),
+        getRadiusBandwidthCounters: async (ips) => {
+            assert.deepEqual(ips, ["192.0.2.3", "10.10.10.3"]);
+            return [{ acctuniqueid: "rad-1", framedprotocol: "PPP", acctinputoctets: 30n, acctoutputoctets: 40n }];
+        },
+    };
+    ctrl.config = {
+        createSingleMikrotikClient: async (_platformID, host) => ({
+            channel: { host, close: async () => closed.push(host) },
+        }),
+    };
+    ctrl.mikrotik = {
+        listHotspotUsers: async () => [{ name: "voucher-1", "bytes-in": "10", "bytes-out": "20" }],
+        listPPPActiveUsers: async () => [{ ".id": "*A", name: "alice", "caller-id": "AA:BB", "bytes-in": "50", "bytes-out": "60" }],
+    };
+
+    const samples = await ctrl.collectBandwidthSamples("plat-1");
+
+    assert.equal(samples.length, 3);
+    assert.deepEqual(samples.map((row) => ({
+        station: row.station,
+        service: row.service,
+        counterKey: row.counterKey,
+        rx: row.rx,
+        tx: row.tx,
+    })), [
+        { station: "api-station", service: "hotspot", counterKey: "api:hotspot:voucher-1", rx: 10n, tx: 20n },
+        { station: "api-station", service: "pppoe", counterKey: "api:pppoe:alice:AA:BB", rx: 50n, tx: 60n },
+        { station: "radius-station", service: "pppoe", counterKey: "radius:rad-1", rx: 30n, tx: 40n },
+    ]);
+    assert.deepEqual(closed, ["10.10.10.2"]);
+});
+
 test("uploadHotspotLoginTemplate ensures walled garden for offline templates", async () => {
     const ctrl = new Mikrotikcontroller();
     const calls = [];
