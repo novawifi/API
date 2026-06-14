@@ -959,6 +959,38 @@ class DataBase {
         }
     }
 
+    async getCompletedHotspotPaymentsByLookup(platformID, lookup, phoneCandidates = []) {
+        if (!platformID || !lookup) return [];
+        const value = String(lookup).trim();
+        const phones = [...new Set(
+            (Array.isArray(phoneCandidates) ? phoneCandidates : [])
+                .map((phone) => String(phone || "").trim())
+                .filter(Boolean)
+        )];
+        try {
+            return await prisma.mpesa.findMany({
+                where: {
+                    platformID,
+                    status: "COMPLETE",
+                    AND: [
+                        { OR: [{ service: "hotspot" }, { service: null }] },
+                        { OR: [{ reversed: false }, { reversed: null }] },
+                        { OR: [
+                            { code: value },
+                            { reqcode: value },
+                            ...(phones.length > 0 ? [{ phone: { in: phones } }] : []),
+                        ] },
+                    ],
+                },
+                orderBy: { createdAt: "desc" },
+                take: 20,
+            });
+        } catch (error) {
+            console.error("Error finding completed hotspot payments:", error);
+            throw error;
+        }
+    }
+
     async getBillPaymentsByPlatform(platformID) {
         if (!platformID) return null;
         try {

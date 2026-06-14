@@ -4841,6 +4841,21 @@ function autoLogin() {
             name: payload.name,
             systemBasis: session.systemBasis,
         });
+
+        res.status(202).json({ success: true, accepted: true });
+        this.queueAutoRouterCompletion(session, payload);
+    }
+
+    queueAutoRouterCompletion(session, payload) {
+        setImmediate(() => {
+            this.finishAutoRouterCompletion(session, payload).catch((error) => {
+                console.error("[AutoRouter] completion failed", error);
+            });
+        });
+    }
+
+    async finishAutoRouterCompletion(session, payload) {
+        const token = payload.token;
         const saveResult = await this.saveAutoStation(session, payload);
         const finalPayload = {
             ...payload,
@@ -4866,7 +4881,6 @@ function autoLogin() {
                 });
             });
         }
-        return res.json({ success: true, saved: saveResult.success, message: saveResult.message });
     }
 
     sanitizeDomain(domain) {
@@ -5389,6 +5403,7 @@ function autoLogin() {
 	                loginTemplate: loginTemplateResult,
 	            };
         } catch (error) {
+            console.error("[AutoRouter] failed to save station", error);
             return { success: false, message: "Failed to save station" };
         }
     }

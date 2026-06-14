@@ -9,6 +9,90 @@ const assert = require("node:assert/strict");
 const { Controller } = require("../controllers/maincontroller");
 const { socketManager } = require("../controllers/socketController");
 
+const createJsonResponse = () => ({
+    statusCode: 200,
+    body: null,
+    status(code) {
+        this.statusCode = code;
+        return this;
+    },
+    json(payload) {
+        this.body = payload;
+        return this;
+    },
+});
+
+test("getCode restores a completed hotspot payment found by transaction code", async () => {
+    const controller = new Controller();
+    const payment = {
+        code: "TST1234567",
+        reqcode: "checkout-1",
+        phone: "254700000000",
+        reason: "pkg-1",
+        platformID: "plat-1",
+        status: "COMPLETE",
+        service: "hotspot",
+    };
+    let lookup = null;
+    let recovery = null;
+    controller.db = {
+        getCodesByPhone: async () => [],
+        getCodesByMpesa: async () => [],
+        getCompletedHotspotPaymentsByLookup: async (platformID, value, phones) => {
+            lookup = { platformID, value, phones };
+            return [payment];
+        },
+        getUserByCodeAndPlatform: async () => null,
+        getPackagesByID: async () => ({ id: "pkg-1", routerHost: "10.10.10.2" }),
+    };
+    controller.mikrotik = {
+        addManualCode: async (data) => {
+            recovery = data;
+            return {
+                success: true,
+                code: {
+                    id: "user-1",
+                    username: payment.code,
+                    password: payment.code,
+                    status: "active",
+                    createdAt: new Date(),
+                    expireAt: new Date(Date.now() + 60 * 60 * 1000),
+                },
+            };
+        },
+    };
+
+    const res = createJsonResponse();
+    await controller.getCode({ body: { phone: "tst1234567", platformID: "plat-1" } }, res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.type, "success");
+    assert.equal(res.body.foundcodes[0].username, payment.code);
+    assert.equal(lookup.value, "TST1234567");
+    assert.equal(recovery.code, payment.code);
+});
+
+test("getCode finds completed hotspot payments using normalized phone variants", async () => {
+    const controller = new Controller();
+    let capturedPhones = [];
+    controller.db = {
+        getCodesByPhone: async () => [],
+        getCodesByMpesa: async () => [],
+        getCompletedHotspotPaymentsByLookup: async (_platformID, _value, phones) => {
+            capturedPhones = phones;
+            return [];
+        },
+    };
+
+    const res = createJsonResponse();
+    await controller.getCode({ body: { phone: "0712 345 678", platformID: "plat-1" } }, res);
+
+    assert.ok(capturedPhones.includes("0712 345 678"));
+    assert.ok(capturedPhones.includes("0712345678"));
+    assert.ok(capturedPhones.includes("254712345678"));
+    assert.equal(res.body.type, "error");
+});
+
 test("buildDashboardResponse limits stats for admin role", async () => {
     const controller = new Controller();
     const payload = {

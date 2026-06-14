@@ -7659,16 +7659,23 @@ class Controller {
       }
 
       if (foundcodes.length === 0) {
-        const mpesaPayments = await this.db.getMpesaByPhone(cleanphone, platformID);
+        const formattedPhone = Utils.formatPhoneNumber(cleanphone);
+        const localPhone = formattedPhone ? `0${formattedPhone.slice(3)}` : "";
+        const phoneCandidates = [cleanphone, formattedPhone, localPhone].filter(Boolean);
+        const mpesaPayments = await this.db.getCompletedHotspotPaymentsByLookup(
+          platformID,
+          cleanphone.toUpperCase(),
+          phoneCandidates
+        );
         if (mpesaPayments?.length > 0) {
           for (const payment of mpesaPayments) {
-            if (!payment?.code || !payment?.reason || !payment?.amount) continue;
+            if (!payment?.code || !payment?.reason) continue;
             const existing = await this.db.getUserByCodeAndPlatform(payment.code, platformID);
-            if (existing) {
+            if (existing && existing.status === "active" && (!existing.expireAt || moment(existing.expireAt).isAfter(moment()))) {
               foundcodes.push(existing);
               continue;
             }
-            const pkg = await this.db.getPackagesByAmount(payment.platformID, `${parseInt(payment.amount)}`, payment.reason);
+            const pkg = await this.db.getPackagesByID(payment.reason);
             if (!pkg) continue;
             const data = {
               phone: payment.phone,
@@ -7678,7 +7685,7 @@ class Controller {
               routerHost: pkg.routerHost,
               code: payment.code.trim(),
               mac: "null",
-              token: "null"
+              token: "null",
             };
             const addcodetorouter = await this.mikrotik.addManualCode(data);
             if (addcodetorouter?.success && addcodetorouter.code) {
@@ -7689,7 +7696,7 @@ class Controller {
       }
 
       if (foundcodes.length === 0) {
-        return res.json({ type: "error", message: "No codes found." });
+        return res.json({ type: "error", message: "No completed hotspot payment or active session found." });
       }
 
       const uniqueCodes = new Map();

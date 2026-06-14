@@ -110,6 +110,47 @@ const createRes = () => ({
     },
 });
 
+test("autoRouterComplete acknowledges before station saving starts", async () => {
+    const ctrl = new Mikrotikcontroller();
+    const session = {
+        platformID: "plat1",
+        adminID: "admin1",
+        systemBasis: "API",
+        apiUser: "nova-test",
+        apiPass: "secret",
+        mikrotikHost: "10.10.10.13",
+        name: "DEMO",
+    };
+    ctrl.routerAutoSessions.set("session-token", session);
+
+    let queued = null;
+    ctrl.queueAutoRouterCompletion = (receivedSession, payload) => {
+        queued = { session: receivedSession, payload };
+    };
+
+    const req = {
+        query: {
+            token: "session-token",
+            publicKey: "public+key=",
+            ddns: "demo.sn.mynetname.net",
+            publicIp: "203.0.113.10",
+            user: "nova-test",
+            pass: "secret",
+            host: "10.10.10.13",
+            name: "DEMO",
+        },
+    };
+    const res = createRes();
+
+    await ctrl.autoRouterComplete(req, res);
+
+    assert.equal(res.statusCode, 202);
+    assert.deepEqual(res.body, { success: true, accepted: true });
+    assert.equal(queued.session, session);
+    assert.equal(queued.payload.mikrotikHost, "10.10.10.13");
+    assert.equal(queued.payload.publicKey, "public+key=");
+});
+
 test("autoConfigurePPPoE returns 400 when RADIUS station is missing credentials", async () => {
     const ctrl = new Mikrotikcontroller();
     ctrl.auth = {
