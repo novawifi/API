@@ -6132,7 +6132,7 @@ class Controller {
           message: "Platform config not found!",
         });
       }
-      const templates = await this.db.getTemplates();
+      const templates = this.withOfflineBoxOnlineTemplate(await this.db.getTemplates());
       const { offlineTemplateName, templateMode, defaulttemplate } =
         this.getStationTemplateSelection(config, station);
 
@@ -6171,6 +6171,21 @@ class Controller {
       defaulttemplate: station?.hotspotTemplateName || (templateMode === "online" ? legacyTemplate : ""),
       offlineTemplateName,
     };
+  }
+
+  withOfflineBoxOnlineTemplate(templates) {
+    const list = Array.isArray(templates) ? [...templates] : [];
+    const exists = list.some((template) => String(template?.name || "").toLowerCase() === "offlinebox");
+    if (!exists) {
+      list.push({
+        id: "offlinebox-online-template",
+        name: "OfflineBox",
+        url: "/login?template=OfflineBox",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return list;
   }
 
   async resolveTemplateUploadStation(platformID, stationId, host) {
@@ -6223,7 +6238,10 @@ class Controller {
       const results = [];
       try {
         const upload = await this.withTimeout(
-          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
+          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, {
+            mode,
+            templateName: options.templateName,
+          }),
           45000,
           "login.html upload timed out on selected router"
         );
@@ -6261,7 +6279,10 @@ class Controller {
       const host = station.mikrotikHost;
       try {
         const upload = await this.withTimeout(
-          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, { mode }),
+          this.mikrotik.uploadHotspotLoginTemplate(platformID, host, {
+            mode,
+            templateName: options.templateName,
+          }),
           45000,
           "login.html upload timed out on router"
         );
@@ -6343,7 +6364,10 @@ class Controller {
 
       const uploadMode = templateMode === "offline" ? "offline" : "online";
       const uploadStation = selectedRouter.station;
-      const uploadSummary = await this.syncHotspotLoginTemplates(platformID, uploadMode, { station: uploadStation });
+      const uploadSummary = await this.syncHotspotLoginTemplates(platformID, uploadMode, {
+        station: uploadStation,
+        templateName: uploadMode === "online" ? nextTemplate : "",
+      });
       const failed = Number(uploadSummary?.failed || 0);
       const firstResult = Array.isArray(uploadSummary?.results) ? uploadSummary.results[0] : null;
 
@@ -7624,7 +7648,7 @@ class Controller {
   }
 
   async getCode(req, res) {
-    const { phone, platformID } = req.body;
+    const { phone, platformID, host, packageID } = req.body;
     let foundcodes = [];
     let cleanphone = "";
     if (phone) {
@@ -7665,7 +7689,9 @@ class Controller {
         const mpesaPayments = await this.db.getCompletedHotspotPaymentsByLookup(
           platformID,
           cleanphone.toUpperCase(),
-          phoneCandidates
+          phoneCandidates,
+          host || null,
+          packageID || null
         );
         if (mpesaPayments?.length > 0) {
           for (const payment of mpesaPayments) {

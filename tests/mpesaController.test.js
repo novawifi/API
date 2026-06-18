@@ -231,6 +231,91 @@ test("stkPush (API) initiates STK push and stores pending mpesa code", async () 
     assert.equal(res.payload?.data?.checkoutRequestId, "chk-api-456");
 });
 
+test("initiateC2BStkPush sends direct Buy Goods STK to destination till", async () => {
+    let capturedPayload;
+    await withEnv(
+        {
+            MPESA_C2B_CONSUMER_KEY: "ckey",
+            MPESA_C2B_CONSUMER_SECRET: "csecret",
+            MPESA_C2B_SHORT_CODE: "999999",
+            MPESA_C2B_PASS_KEY: "passkey",
+        },
+        async () => {
+            const controller = new MpesaController();
+            controller.getC2BAccessToken = async () => "tok-c2b";
+            controller.getDarajaAxios = () => ({
+                post: async (_url, payload) => {
+                    capturedPayload = payload;
+                    return { data: { CheckoutRequestID: "chk-till" } };
+                },
+            });
+
+            const checkout = await controller.initiateC2BStkPush({
+                platformID: "PLT1",
+                phone: "0700000000",
+                amount: 50,
+                accountReference: "Test Platform",
+                transactionDesc: "WiFi Subscription Payment",
+                destinationType: "Till",
+                destinationShortCode: "123456",
+            });
+
+            assert.equal(checkout, "chk-till");
+        }
+    );
+
+    assert.ok(capturedPayload);
+    assert.equal(capturedPayload.BusinessShortCode, "999999");
+    assert.equal(capturedPayload.TransactionType, "CustomerBuyGoodsOnline");
+    assert.equal(capturedPayload.PartyB, "123456");
+    assert.equal(capturedPayload.PhoneNumber, "254700000000");
+    assert.equal(capturedPayload.AccountReference, "Test Platfor");
+    assert.equal(capturedPayload.TransactionDesc, "WiFi Subscrip");
+});
+
+test("initiateC2BStkPush sends direct Paybill STK to destination paybill", async () => {
+    let capturedPayload;
+    await withEnv(
+        {
+            MPESA_C2B_CONSUMER_KEY: "ckey",
+            MPESA_C2B_CONSUMER_SECRET: "csecret",
+            MPESA_C2B_SHORT_CODE: "999999",
+            MPESA_C2B_PASS_KEY: "passkey",
+        },
+        async () => {
+            const controller = new MpesaController();
+            controller.getC2BAccessToken = async () => "tok-c2b";
+            controller.getDarajaAxios = () => ({
+                post: async (_url, payload) => {
+                    capturedPayload = payload;
+                    return { data: { CheckoutRequestID: "chk-paybill" } };
+                },
+            });
+
+            const checkout = await controller.initiateC2BStkPush({
+                platformID: "PLT1",
+                phone: "700000000",
+                amount: 80,
+                accountReference: "ignored",
+                transactionDesc: "PPPoE Subscription Payment",
+                destinationType: "Paybill",
+                destinationShortCode: "600111",
+                destinationAccount: "ACC-123",
+            });
+
+            assert.equal(checkout, "chk-paybill");
+        }
+    );
+
+    assert.ok(capturedPayload);
+    assert.equal(capturedPayload.BusinessShortCode, "600111");
+    assert.equal(capturedPayload.TransactionType, "CustomerPayBillOnline");
+    assert.equal(capturedPayload.PartyB, "600111");
+    assert.equal(capturedPayload.PhoneNumber, "254700000000");
+    assert.equal(capturedPayload.AccountReference, "ACC-123");
+    assert.equal(capturedPayload.TransactionDesc, "PPPoE Subscri");
+});
+
 test("initiateC2BB2BTransfer uses Daraja ReceiverIdentifierType (Paybill)", async () => {
     let capturedPayload;
     await withEnv(

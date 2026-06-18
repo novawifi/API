@@ -298,7 +298,7 @@ class Mikrotikcontroller {
         });
     }
 
-    async buildOnlineLoginTemplateHtml(platformID, stationHost) {
+    async buildOnlineLoginTemplateHtml(platformID, stationHost, templateName = "") {
         const platform = await this.db.getPlatform(platformID);
         const config = await this.db.getPlatformConfig(platformID);
         if (!platform || !config) {
@@ -320,7 +320,10 @@ class Mikrotikcontroller {
         const portalUrl = /^https?:\/\//i.test(portalBase)
             ? portalBase.replace(/\/+$/, "")
             : `https://${portalBase.replace(/\/+$/, "")}`;
-        const loginUrl = `${portalUrl}/login?hash=${encodeURIComponent(hash)}&mac=$(mac)`;
+        const templateParam = String(templateName || "").trim();
+        const loginUrl = `${portalUrl}/login?hash=${encodeURIComponent(hash)}&mac=$(mac)${
+            templateParam ? `&template=${encodeURIComponent(templateParam)}` : ""
+        }`;
 
         return `<!DOCTYPE html>
 <html>
@@ -511,7 +514,7 @@ function autoLogin() {
     async uploadHotspotLoginTemplate(platformID, stationHost, options = {}) {
         const mode = String(options.mode || "offline").toLowerCase() === "online" ? "online" : "offline";
         const loginHtml = mode === "online"
-            ? await this.buildOnlineLoginTemplateHtml(platformID, stationHost)
+            ? await this.buildOnlineLoginTemplateHtml(platformID, stationHost, options.templateName)
             : await this.buildOfflineLoginTemplateHtml(platformID, stationHost);
         const connection = await this.config.createSingleMikrotikClient(platformID, stationHost);
         if (!connection?.channel) {

@@ -573,7 +573,42 @@ class MpesaController {
         socketManager.log(platformID, message, { context: "payments", level });
     }
 
-    async initiateC2BStkPush({ platformID, phone, amount, accountReference, transactionDesc }) {
+    sanitizeDarajaText(value, fallback, maxLength) {
+        const cleaned = String(value || fallback || "")
+            .replace(/[^a-zA-Z0-9 ._-]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+        return (cleaned || String(fallback || "NOVA")).slice(0, maxLength);
+    }
+
+    validateDirectC2BDestination({ destinationType, destinationShortCode, destinationAccount }) {
+        const type = String(destinationType || "").trim().toLowerCase();
+        const shortCode = String(destinationShortCode || "").trim();
+        const account = String(destinationAccount || "").trim();
+
+        if (!["till", "paybill"].includes(type)) {
+            throw new Error("Configure MPESA C2B destination as Till or Paybill.");
+        }
+        if (!/^\d{5,8}$/.test(shortCode)) {
+            throw new Error("MPESA C2B destination must be 5 to 8 digits.");
+        }
+        if (type === "paybill" && !account) {
+            throw new Error("MPESA C2B Paybill account number is required.");
+        }
+
+        return { type, shortCode, account };
+    }
+
+    async initiateC2BStkPush({
+        platformID,
+        phone,
+        amount,
+        accountReference,
+        transactionDesc,
+        destinationType,
+        destinationShortCode,
+        destinationAccount,
+    }) {
         const c2bEnv = this.getC2BEnvConfig();
         if (!this.mpesa.MPESA_STK_URL) {
             throw new Error("MPESA_STK_URL not set.");
@@ -582,11 +617,35 @@ class MpesaController {
             throw new Error("Missing MPESA C2B shortcode or passkey.");
         }
 
+        const destination = destinationShortCode
+            ? this.validateDirectC2BDestination({ destinationType, destinationShortCode, destinationAccount })
+            : {
+                type: String(c2bEnv.shortCodeType || "").toLowerCase() === "paybill" ? "paybill" : "till",
+                shortCode: String(c2bEnv.shortCode || ""),
+                account: "",
+            };
+        const isPaybill = destination.type === "paybill";
+        const businessShortCode = isPaybill ? destination.shortCode : String(c2bEnv.shortCode);
+        const partyB = destination.shortCode;
+        const reference = this.sanitizeDarajaText(
+            isPaybill ? destination.account : accountReference,
+            isPaybill ? "PAYBILL" : "NOVA WIFI",
+            12
+        );
+        const description = this.sanitizeDarajaText(transactionDesc, "NOVA WiFi", 13);
+
+        if (!businessShortCode) {
+            throw new Error("Missing MPESA C2B business shortcode.");
+        }
+
         const accessToken = await this.getC2BAccessToken(platformID);
         const timestamp = moment().format('YYYYMMDDHHmmss');
-        const password = Buffer.from(`${c2bEnv.shortCode}${c2bEnv.passKey}${timestamp}`).toString('base64');
+        const password = Buffer.from(`${businessShortCode}${c2bEnv.passKey}${timestamp}`).toString('base64');
         const cleanphone = Utils.formatPhoneNumber(phone);
-        const txType = String(c2bEnv.shortCodeType || "").toLowerCase() === "paybill"
+        if (!cleanphone) {
+            throw new Error("Invalid MPESA phone number.");
+        }
+        const txType = isPaybill
             ? 'CustomerPayBillOnline'
             : 'CustomerBuyGoodsOnline';
 
@@ -594,17 +653,17 @@ class MpesaController {
         const response = await http.post(
             this.mpesa.MPESA_STK_URL,
             {
-                BusinessShortCode: c2bEnv.shortCode,
+                BusinessShortCode: businessShortCode,
                 Password: password,
                 Timestamp: timestamp,
                 TransactionType: txType,
                 Amount: amount,
                 PartyA: cleanphone,
-                PartyB: c2bEnv.shortCode,
+                PartyB: partyB,
                 PhoneNumber: cleanphone,
                 CallBackURL: this.mpesa.MPESA_CALLBACK_URL,
-                AccountReference: accountReference || platformID || "Nova C2B",
-                TransactionDesc: transactionDesc || 'WiFi Subscription Payment',
+                AccountReference: reference,
+                TransactionDesc: description,
             },
             {
                 headers: {
@@ -673,7 +732,7 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            RecieverIdentifierType: receiverIdentifierType,
+	            ReceiverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -1217,6 +1276,9 @@ class MpesaController {
                     amount,
                     accountReference: client?.name || platformID,
                     transactionDesc: 'WiFi Subscription Payment',
+                    destinationType: platform.mpesaC2BShortCodeType,
+                    destinationShortCode: platform.mpesaC2BShortCode,
+                    destinationAccount: platform.mpesaC2BAccountNumber,
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
@@ -1463,6 +1525,9 @@ class MpesaController {
                     amount,
                     accountReference: "PPPOE",
                     transactionDesc: 'PPPoE Subscription Payment',
+                    destinationType: platform.mpesaC2BShortCodeType,
+                    destinationShortCode: platform.mpesaC2BShortCode,
+                    destinationAccount: platform.mpesaC2BAccountNumber,
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
@@ -1847,12 +1912,12 @@ class MpesaController {
                 });
                 this.logPayment(mpesaCode.platformID, `STK payment marked COMPLETE (ref ${CheckoutRequestID})`, "success");
 
-                // Credit platform balance on successful Daraja deposit (C2B/B2B STK).
+                // Credit platform balance only for Nova B2B deposits. Direct C2B STK settles to the merchant.
                 try {
                     const paymentMethod = String(mpesaCode.paymentMethod || "").toLowerCase();
                     const funds = await this.db.getFunds(mpesaCode.platformID);
                     const depositAmount = Number(transactionDetails.amount || 0);
-                    const shouldCreditBalance = paymentMethod === "mpesa c2b" || paymentMethod === "mpesa b2b";
+                    const shouldCreditBalance = paymentMethod === "mpesa b2b";
 
                     if (shouldCreditBalance && Number.isFinite(depositAmount) && depositAmount > 0) {
                         if (funds) {
@@ -1873,81 +1938,6 @@ class MpesaController {
                     }
                 } catch (error) {
                     // ignore: balance tracking should not block activation/transfers
-                }
-
-                const paymentMethod = String(mpesaCode.paymentMethod || "").toLowerCase();
-                // Only Nova C2B auto-transfers. Nova B2B stores balance for manual withdrawals.
-                if (paymentMethod === "mpesa c2b") {
-                    const amountValue = Number(transactionDetails.amount || 0);
-                    const referenceReceipt = String(transactionDetails.mpesaReceiptNumber || transactionDetails.checkoutRequestId || CheckoutRequestID);
-                    const mpesaSnapshot = { ...mpesaCode };
-
-                    // Do not block hotspot/pppoe activation on transfer calls.
-                    setImmediate(async () => {
-                        try {
-                            const platform = await this.db.getPlatformConfig(mpesaSnapshot.platformID);
-                            const destType = platform?.mpesaC2BShortCodeType || "";
-                            const destShortCode = platform?.mpesaC2BShortCode || "";
-                            const destAccount = platform?.mpesaC2BAccountNumber || "";
-                            const shouldPool = amountValue < 10;
-
-                            if (!platform || !destShortCode || !destType) return;
-
-                            if (shouldPool) {
-                                await this.addToC2BTransferPool({
-                                    platformID: mpesaSnapshot.platformID,
-                                    amount: amountValue,
-                                    destinationType: destType,
-                                    destinationShortCode: destShortCode,
-                                    destinationAccount: destAccount,
-                                });
-                                await this.flushC2BTransferPool({
-                                    platformID: mpesaSnapshot.platformID,
-                                    destinationType: destType,
-                                    destinationShortCode: destShortCode,
-                                    destinationAccount: destAccount,
-                                });
-                                this.logPayment(mpesaSnapshot.platformID, `C2B transfer pooled (amount ${amountValue})`, "info");
-                                return;
-                            }
-
-	                            try {
-	                                const lowerDestType = String(destType).toLowerCase();
-	                                if (!["till", "paybill"].includes(lowerDestType)) {
-	                                    throw new Error("Destination type must be Till or Paybill.");
-	                                }
-	                                await this.initiateC2BB2BTransfer({
-	                                    platformID: mpesaSnapshot.platformID,
-	                                    amount: amountValue,
-	                                    mpesaCode: mpesaSnapshot,
-	                                    reference: referenceReceipt,
-	                                });
-	                                this.logPayment(mpesaSnapshot.platformID, `C2B B2B transfer queued (ref ${referenceReceipt})`, "success");
-	                            } catch (error) {
-                                const errMsg =
-                                    error?.response?.data?.errorMessage ||
-                                    error?.response?.data?.ResponseDescription ||
-                                    error?.message ||
-                                    "Transfer failed";
-                                await this.addToC2BTransferPool({
-                                    platformID: mpesaSnapshot.platformID,
-                                    amount: amountValue,
-                                    destinationType: destType,
-                                    destinationShortCode: destShortCode,
-                                    destinationAccount: destAccount,
-                                });
-                                await this.flushC2BTransferPool({
-                                    platformID: mpesaSnapshot.platformID,
-                                    destinationType: destType,
-                                    destinationShortCode: destShortCode,
-                                    destinationAccount: destAccount,
-                                });
-                                this.logPayment(mpesaSnapshot.platformID, `Transfer failed (${errMsg}), pooled for retry (ref ${referenceReceipt})`, "warn");
-                            }
-                        } catch (error) {
-                            this.logPayment(mpesaSnapshot.platformID, `Auto-transfer background job failed: ${error?.message || error}`, "warn");
-                        }
-                    });
                 }
 
                 if (mpesaCode.service === "hotspot") {

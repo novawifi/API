@@ -1074,7 +1074,7 @@ class DataBase {
         }
     }
 
-    async getCompletedHotspotPaymentsByLookup(platformID, lookup, phoneCandidates = []) {
+    async getCompletedHotspotPaymentsByLookup(platformID, lookup, phoneCandidates = [], routerHost = null, packageID = null) {
         if (!platformID || !lookup) return [];
         const value = String(lookup).trim();
         const phones = [...new Set(
@@ -1083,20 +1083,30 @@ class DataBase {
                 .filter(Boolean)
         )];
         try {
+            const where = {
+                platformID,
+                status: "COMPLETE",
+                AND: [
+                    { OR: [{ service: "hotspot" }, { service: null }] },
+                    { OR: [{ reversed: false }, { reversed: null }] },
+                    { OR: [
+                        { code: value },
+                        { reqcode: value },
+                        ...(phones.length > 0 ? [{ phone: { in: phones } }] : []),
+                    ] },
+                ],
+            };
+
+            if (routerHost) {
+                where.routerHost = String(routerHost || "").trim();
+            }
+
+            if (packageID) {
+                where.AND.push({ reason: String(packageID) });
+            }
+
             return await prisma.mpesa.findMany({
-                where: {
-                    platformID,
-                    status: "COMPLETE",
-                    AND: [
-                        { OR: [{ service: "hotspot" }, { service: null }] },
-                        { OR: [{ reversed: false }, { reversed: null }] },
-                        { OR: [
-                            { code: value },
-                            { reqcode: value },
-                            ...(phones.length > 0 ? [{ phone: { in: phones } }] : []),
-                        ] },
-                    ],
-                },
+                where,
                 orderBy: { createdAt: "desc" },
                 take: 20,
             });

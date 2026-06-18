@@ -198,6 +198,10 @@ class Utils {
       number = "0" + number.slice(3);
     }
 
+    if ((number.startsWith("7") || number.startsWith("1")) && number.length === 9) {
+      number = "0" + number;
+    }
+
     if (!/^\d+$/.test(number)) {
       return { valid: false, reason: "Phone number must contain only digits" };
     }
