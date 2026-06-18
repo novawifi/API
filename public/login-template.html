@@ -455,6 +455,13 @@
       <button class="btn-main" id="btnConnect" onclick="handleAlreadyPaid()">CONNECT</button>
     </div>
 
+    <div class="already-card">
+      <div class="already-title">Voucher Login</div>
+      <div class="already-sub">Enter your voucher code</div>
+      <input id="voucherInput" class="input-field" type="text" placeholder="Enter voucher code">
+      <button class="btn-main" id="btnVoucherConnect" onclick="handleVoucherLogin()">CONNECT</button>
+    </div>
+
     <div class="footer">Powered by <span id="footerBrandName">OFFLINEBOX</span></div>
 
   </div>
@@ -809,6 +816,40 @@
         })
         .catch(function () {
           showToast("Connection check failed. Please try again.", "error");
+          btn.disabled = false;
+          btn.innerHTML = "CONNECT";
+        });
+    }
+
+    function handleVoucherLogin() {
+      var code = document.getElementById("voucherInput").value.trim().toUpperCase();
+      if (!code) { showToast("Enter your voucher code.", "error"); return; }
+      if (!/^[A-Z0-9]{3,32}$/.test(code)) {
+        showToast("Enter a valid voucher code.", "error"); return;
+      }
+
+      var btn = document.getElementById("btnVoucherConnect");
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Checking...';
+
+      fetch(API_BASE_URL + "/req/verifyCode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: code, platformID: PLATFORM_ID, hash: HASH })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data && data.success) {
+            showToast("Voucher verified. Connecting you...", "success");
+            doLogin(code, code);
+            return;
+          }
+          showToast((data && data.message) || "Voucher was not found.", "error");
+          btn.disabled = false;
+          btn.innerHTML = "CONNECT";
+        })
+        .catch(function () {
+          showToast("Voucher check failed. Please try again.", "error");
           btn.disabled = false;
           btn.innerHTML = "CONNECT";
         });
