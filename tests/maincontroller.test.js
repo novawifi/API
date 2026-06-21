@@ -5,6 +5,8 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || "test-jwt-secret";
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const { Controller } = require("../controllers/maincontroller");
 const { socketManager } = require("../controllers/socketController");
@@ -20,6 +22,45 @@ const createJsonResponse = () => ({
         this.body = payload;
         return this;
     },
+});
+
+test("verifyCodes returns stored RADIUS credentials for mixed-case hotspot usernames", async () => {
+    const controller = new Controller();
+    const lookups = [];
+    controller.db = {
+        getUniqueCode: async (code) => {
+            lookups.push({ type: "exact", code });
+            return null;
+        },
+        getUniqueCodeCaseInsensitive: async (code) => {
+            lookups.push({ type: "insensitive", code });
+            return {
+                username: "Staff.User",
+                password: "not-the-voucher-code",
+                status: "active",
+            };
+        },
+    };
+
+    const res = createJsonResponse();
+    await controller.verifyCodes({ body: { code: "Staff.User", platformID: "plat-1" } }, res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.code, "Staff.User");
+    assert.equal(res.body.password, "not-the-voucher-code");
+    assert.deepEqual(lookups, [
+        { type: "exact", code: "Staff.User" },
+        { type: "insensitive", code: "Staff.User" },
+    ]);
+});
+
+test("server hotspot template submits credentials returned by verification", () => {
+    const template = fs.readFileSync(
+        path.join(__dirname, "..", "public", "login-template.html"),
+        "utf8"
+    );
+    assert.match(template, /doLogin\(data\.code \|\| code, data\.password \|\| data\.code \|\| code\)/);
+    assert.doesNotMatch(template, /value\.trim\(\)\.toUpperCase\(\)/);
 });
 
 test("getCode restores a completed hotspot payment found by transaction code", async () => {

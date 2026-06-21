@@ -787,6 +787,9 @@ class DataBase {
         if (!data) return null;
         try {
             const nextData = { ...data };
+            if (!nextData.checkoutRequestId && /^ws_CO_/i.test(String(nextData.reqcode || nextData.code || ""))) {
+                nextData.checkoutRequestId = String(nextData.reqcode || nextData.code);
+            }
             ["amount", "charges", "net_amount"].forEach((field) => {
                 if (typeof nextData[field] === "number") {
                     nextData[field] = String(nextData[field]);
@@ -998,6 +1001,75 @@ class DataBase {
             console.error("Error deleting mpesa code:", error);
             throw error;
         }
+    }
+
+    async getMpesaByCheckoutRequestId(checkoutRequestId) {
+        if (!checkoutRequestId) return null;
+        const value = String(checkoutRequestId).trim();
+        try {
+            return await prisma.mpesa.findFirst({
+                where: {
+                    OR: [
+                        { checkoutRequestId: value },
+                        { reqcode: value },
+                    ],
+                },
+            });
+        } catch (error) {
+            console.error("Error getting M-PESA payment by CheckoutRequestID:", error);
+            throw error;
+        }
+    }
+
+    async findPendingStkPayments({ minCreatedAt, dueAt, batchSize }) {
+        const now = dueAt || new Date();
+        return prisma.mpesa.findMany({
+            where: {
+                status: "PENDING",
+                checkoutRequestId: { not: null },
+                createdAt: { lte: minCreatedAt },
+                OR: [
+                    { nextReconciliationAt: null },
+                    { nextReconciliationAt: { lte: now } },
+                ],
+                AND: [{
+                    OR: [
+                        { reconciliationLeaseUntil: null },
+                        { reconciliationLeaseUntil: { lt: now } },
+                    ],
+                }],
+            },
+            orderBy: { createdAt: "asc" },
+            take: batchSize,
+        });
+    }
+
+    async claimMpesaReconciliation(id, leaseUntil) {
+        const now = new Date();
+        const result = await prisma.mpesa.updateMany({
+            where: {
+                id,
+                status: "PENDING",
+                OR: [
+                    { reconciliationLeaseUntil: null },
+                    { reconciliationLeaseUntil: { lt: now } },
+                ],
+            },
+            data: { reconciliationLeaseUntil: leaseUntil },
+        });
+        return result.count === 1;
+    }
+
+    async recordMpesaReconciliation(id, data) {
+        return prisma.mpesa.update({
+            where: { id },
+            data: {
+                ...data,
+                reconciliationAttempts: { increment: 1 },
+                lastReconciliationAt: new Date(),
+                reconciliationLeaseUntil: null,
+            },
+        });
     }
 
     async getMpesaByPlatform(platformID) {

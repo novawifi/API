@@ -48,10 +48,23 @@ model Mpesa {
   FirstName     String?  @default("N/A")
   MiddleName    String?  @default("N/A")
   LastName      String?  @default("N/A")
+  checkoutRequestId       String?   @unique
+  merchantRequestId       String?
+  resultCode              String?
+  resultDescription       String?
+  mpesaReceiptNumber      String?   @unique
+  transactionDate         DateTime?
+  reconciliationAttempts  Int       @default(0)
+  lastReconciliationAt    DateTime?
+  nextReconciliationAt    DateTime?
+  lastReconciliationError String?
+  reconciliationLeaseUntil DateTime?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   package Package? @relation(fields: [reason], references: [id])
+
+  @@index([status, nextReconciliationAt])
 }
 
 model C2BTransferPool {

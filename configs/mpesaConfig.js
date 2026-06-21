@@ -3,6 +3,7 @@ class MpesaConfig {
             this.MPESA_CALLBACK_URL = process.env.MPESA_CALLBACK_URL,
             this.MPESA_AUTH_URL = process.env.MPESA_AUTH_URL,
             this.MPESA_STK_URL = process.env.MPESA_STK_URL,
+            this.MPESA_STK_QUERY_URL = process.env.MPESA_STK_QUERY_URL,
             this.MPESA_BALANCE_URL = process.env.MPESA_BALANCE_URL,
             this.MPESA_B2B_URL = process.env.MPESA_B2B_URL,
             this.MPESA_B2POCHI_URL = process.env.MPESA_B2POCHI_URL,
