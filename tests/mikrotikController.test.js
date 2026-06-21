@@ -236,6 +236,8 @@ test("autoConfigurePPPoE configures RADIUS and reuses existing PPPoE server", as
                 radiusClientSecret: "newsecret",
             },
         ]),
+        getPPPoEPlans: async () => [],
+        createPPPoEPlan: async (data) => data,
     };
 
     const channelCalls = [];
@@ -288,7 +290,9 @@ test("autoConfigurePPPoE configures RADIUS and reuses existing PPPoE server", as
         addPPPServer: async () => { },
         addFirewallNatRule: async () => { },
         addIPAddress: async () => { },
+        listIPAddresses: async () => ([]),
         addPool: async () => { },
+        updatePool: async () => { },
         listPools: async () => ([]),
     };
 

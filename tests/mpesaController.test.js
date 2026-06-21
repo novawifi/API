@@ -27,6 +27,13 @@ const withEnv = async (env, fn) => {
     }
 };
 
+const createJsonResponse = () => ({
+    statusCode: 200,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(data) { this.payload = data; return this; },
+});
+
 test("getC2BEnvConfig reads env and defaults shortCodeType", async () => {
     await withEnv(
         {
@@ -403,4 +410,63 @@ test("initiateC2BB2BTransfer uses Daraja RecieverIdentifierType (Till)", async (
     assert.equal(capturedPayload.RecieverIdentifierType, "2");
     assert.ok(!("ReceiverIdentifierType" in capturedPayload));
     assert.equal(capturedPayload.AccountReference, "");
+});
+
+test("duplicate successful STK callback does not fulfill twice", async () => {
+    const controller = new MpesaController();
+    let claims = 0;
+    controller.db = {
+        getMpesaByCheckoutRequestId: async () => ({
+            id: "pay-1", platformID: "plat-1", status: "COMPLETE",
+        }),
+        claimMpesaForSuccessfulFinalization: async () => { claims += 1; return true; },
+    };
+    const res = createJsonResponse();
+    await controller.callBack({
+        body: { Body: { stkCallback: {
+            CheckoutRequestID: "ws_CO_duplicate",
+            ResultCode: 0,
+            ResultDesc: "Success",
+            CallbackMetadata: { Item: [] },
+        } } },
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.payload.message, "Already processed.");
+    assert.equal(claims, 0);
+});
+
+test("concurrent STK success loser returns without fulfillment", async () => {
+    const controller = new MpesaController();
+    controller.db = {
+        getMpesaByCheckoutRequestId: async () => ({
+            id: "pay-1", platformID: "plat-1", status: "PENDING",
+        }),
+        claimMpesaForSuccessfulFinalization: async () => false,
+    };
+    const res = createJsonResponse();
+    await controller.callBack({
+        body: { Body: { stkCallback: {
+            CheckoutRequestID: "ws_CO_race",
+            ResultCode: "0",
+            ResultDesc: "Success",
+            CallbackMetadata: { Item: [] },
+        } } },
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.payload.message, "Already processing.");
+});
+
+test("unknown CheckoutRequestID is acknowledged without creating a payment", async () => {
+    const controller = new MpesaController();
+    controller.db = { getMpesaByCheckoutRequestId: async () => null };
+    const res = createJsonResponse();
+    await controller.callBack({
+        body: { Body: { stkCallback: {
+            CheckoutRequestID: "ws_CO_unknown",
+            ResultCode: 0,
+            ResultDesc: "Success",
+        } } },
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.payload.success, false);
 });

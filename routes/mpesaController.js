@@ -1,6 +1,7 @@
 // @ts-check
 
 const router = require("express").Router();
+const rateLimit = require("express-rate-limit");
 const { MpesaController } = require("../controllers/mpesaController");
 
 const controller = new MpesaController();
@@ -28,7 +29,13 @@ if (INTASEND_DEPOSIT_CALLBACK_PATH) router.post(INTASEND_DEPOSIT_CALLBACK_PATH, 
 if (PAYSTACK_DEPOSIT_CALLBACK_PATH) router.post(PAYSTACK_DEPOSIT_CALLBACK_PATH, use("handlePaystackDepositCallback"));
 
 router.post("/confirm", use("checkPayment"));
-router.post("/admin/reconcile", use("reconcileStkPayment"));
+const reconciliationLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+router.post("/admin/reconcile", reconciliationLimiter, use("reconcileStkPayment"));
 router.post("/payPPPoE", use("payPPPoE"));
 router.post("/paybill", use("payBill"));
 router.post("/paysms", use("paySMS"));
