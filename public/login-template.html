@@ -822,9 +822,9 @@
     }
 
     function handleVoucherLogin() {
-      var code = document.getElementById("voucherInput").value.trim().toUpperCase();
+      var code = document.getElementById("voucherInput").value.trim();
       if (!code) { showToast("Enter your voucher code.", "error"); return; }
-      if (!/^[A-Z0-9]{3,32}$/.test(code)) {
+      if (!/^[A-Za-z0-9._@-]{3,64}$/.test(code)) {
         showToast("Enter a valid voucher code.", "error"); return;
       }
 
@@ -841,7 +841,7 @@
         .then(function (data) {
           if (data && data.success) {
             showToast("Voucher verified. Connecting you...", "success");
-            doLogin(code, code);
+            doLogin(data.code || code, data.password || data.code || code);
             return;
           }
           showToast((data && data.message) || "Voucher was not found.", "error");
@@ -876,7 +876,7 @@
         document.body.appendChild(form);
         form.submit();
       } else {
-        window.location.href = "http://local.wifi/login?username=" + encodeURIComponent(username) + "&password=" + encodeURIComponent(finalPass);
+        window.location.replace("$(link-login-only)?username=" + encodeURIComponent(username) + "&password=" + encodeURIComponent(finalPass));
       }
     }
 

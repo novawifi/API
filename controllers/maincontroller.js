@@ -6432,11 +6432,15 @@ class Controller {
       });
     }
     try {
-      const existingcode = await this.db.getUniqueCode(code, platformID);
+      const submittedCode = String(code).trim();
+      let existingcode = await this.db.getUniqueCode(submittedCode, platformID);
+      if (!existingcode) {
+        existingcode = await this.db.getUniqueCodeCaseInsensitive(submittedCode, platformID);
+      }
       if (!existingcode) {
         if (hash) {
           const host = Utils.decodeHashedIP(hash);
-          const routercode = await this.mikrotik.verifyMikrotikUser({ platformID, code, host })
+          const routercode = await this.mikrotik.verifyMikrotikUser({ platformID, code: submittedCode, host })
           if (!routercode.success) {
             return res.json({
               success: false,
@@ -6446,11 +6450,11 @@ class Controller {
           return res.status(200).json({
             success: true,
             message: "Code verified!",
-            code: code.trim(),
-            password: code.trim(),
+            code: submittedCode,
+            password: submittedCode,
           });
         }
-        const payment = await this.db.getMpesaCode(code);
+        const payment = await this.db.getMpesaCode(submittedCode);
         if (payment) {
           const pkg = await this.db.getPackagesByAmount(payment?.platformID, `${parseInt(payment.amount)}`, payment.reason);
 
@@ -6461,7 +6465,7 @@ class Controller {
               platformID: payment.platformID,
               package: pkg,
               routerHost: pkg.routerHost,
-              code: code.trim(),
+              code: submittedCode,
               mac: "null",
               token: "null"
             }
@@ -6477,8 +6481,8 @@ class Controller {
             return res.status(200).json({
               success: true,
               message: "Code verified!",
-              code: code.trim(),
-              password: code.trim(),
+              code: submittedCode,
+              password: submittedCode,
             });
           }
 

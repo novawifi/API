@@ -732,7 +732,8 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            // Daraja B2B intentionally spells this field "Reciever".
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -832,7 +833,8 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            // Daraja B2B intentionally spells this field "Reciever".
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -925,7 +927,8 @@ class MpesaController {
 	            SecurityCredential: securityCredential,
 	            CommandID: commandId,
 	            SenderIdentifierType: senderIdentifierType,
-	            ReceiverIdentifierType: receiverIdentifierType,
+	            // Daraja B2B intentionally spells this field "Reciever".
+	            RecieverIdentifierType: receiverIdentifierType,
 	            Amount: transferAmount,
 	            PartyA: c2bEnv.shortCode,
 	            PartyB: destShortCode,
@@ -3940,7 +3943,8 @@ class MpesaController {
 	                SecurityCredential: securityCredential,
 	                CommandID: commandId,
 	                SenderIdentifierType: senderIdentifierType,
-	                ReceiverIdentifierType: receiverIdentifierType,
+	                // Daraja B2B intentionally spells this field "Reciever".
+	                RecieverIdentifierType: receiverIdentifierType,
 	                Amount: transferAmount,
 	                PartyA: config.mpesaShortCode,
 	                PartyB: String(destinationShortCode),

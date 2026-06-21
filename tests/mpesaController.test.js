@@ -316,7 +316,7 @@ test("initiateC2BStkPush sends direct Paybill STK to destination paybill", async
     assert.equal(capturedPayload.TransactionDesc, "PPPoE Subscri");
 });
 
-test("initiateC2BB2BTransfer uses Daraja ReceiverIdentifierType (Paybill)", async () => {
+test("initiateC2BB2BTransfer uses Daraja RecieverIdentifierType (Paybill)", async () => {
     let capturedPayload;
     await withEnv(
         {
@@ -355,14 +355,14 @@ test("initiateC2BB2BTransfer uses Daraja ReceiverIdentifierType (Paybill)", asyn
     assert.ok(capturedPayload);
     assert.equal(capturedPayload.CommandID, "BusinessPayBill");
     assert.equal(capturedPayload.SenderIdentifierType, "4");
-    assert.equal(capturedPayload.ReceiverIdentifierType, "4");
-    assert.ok(!("RecieverIdentifierType" in capturedPayload));
+    assert.equal(capturedPayload.RecieverIdentifierType, "4");
+    assert.ok(!("ReceiverIdentifierType" in capturedPayload));
     assert.equal(capturedPayload.PartyA, "999999");
     assert.equal(capturedPayload.PartyB, "600111");
     assert.equal(capturedPayload.AccountReference, "ACC-123");
 });
 
-test("initiateC2BB2BTransfer uses Daraja ReceiverIdentifierType (Till)", async () => {
+test("initiateC2BB2BTransfer uses Daraja RecieverIdentifierType (Till)", async () => {
     let capturedPayload;
     await withEnv(
         {
@@ -400,7 +400,7 @@ test("initiateC2BB2BTransfer uses Daraja ReceiverIdentifierType (Till)", async (
 
     assert.ok(capturedPayload);
     assert.equal(capturedPayload.CommandID, "BusinessBuyGoods");
-    assert.equal(capturedPayload.ReceiverIdentifierType, "2");
-    assert.ok(!("RecieverIdentifierType" in capturedPayload));
+    assert.equal(capturedPayload.RecieverIdentifierType, "2");
+    assert.ok(!("ReceiverIdentifierType" in capturedPayload));
     assert.equal(capturedPayload.AccountReference, "");
 });

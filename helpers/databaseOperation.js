@@ -3162,6 +3162,21 @@ class DataBase {
         }
     }
 
+    async getUniqueCodeCaseInsensitive(code, platformID) {
+        if (!code) return null;
+        try {
+            return await prisma.user.findFirst({
+                where: {
+                    username: { equals: String(code).trim(), mode: "insensitive" },
+                    platformID,
+                },
+            });
+        } catch (error) {
+            console.error("Error fetching case-insensitive code:", error);
+            throw error;
+        }
+    }
+
     async deletePPPoEByHost(host) {
         if (!host) return null;
         try {
