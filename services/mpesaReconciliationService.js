@@ -79,7 +79,10 @@ class MpesaReconciliationService {
                 Timestamp: timestamp,
                 CheckoutRequestID: payment.checkoutRequestId || payment.reqcode,
             },
-            { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+            {
+                headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+                signal: AbortSignal.timeout(Math.max(5_000, Number(process.env.MPESA_HTTP_TIMEOUT_MS || 30_000))),
+            }
         );
 
         let token = await credentials.getToken();
@@ -180,7 +183,7 @@ class MpesaReconciliationService {
             const chunkResults = await Promise.all(chunk.map(async (payment) => {
                 const claimed = await this.db.claimMpesaReconciliation(payment.id, new Date(Date.now() + 60_000));
                 return claimed
-                    ? this.reconcileMpesaPayment(payment, source)
+                    ? this.reconcileMpesaPayment({ ...payment, status: "PENDING" }, source)
                     : { state: "SKIPPED", paymentId: payment.id, reason: "Claimed by another worker" };
             }));
             results.push(...chunkResults);

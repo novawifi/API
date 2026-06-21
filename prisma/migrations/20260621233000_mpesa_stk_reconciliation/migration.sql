@@ -9,7 +9,9 @@ ALTER TABLE "Mpesa"
     ADD COLUMN "lastReconciliationAt" TIMESTAMP(3),
     ADD COLUMN "nextReconciliationAt" TIMESTAMP(3),
     ADD COLUMN "lastReconciliationError" TEXT,
-    ADD COLUMN "reconciliationLeaseUntil" TIMESTAMP(3);
+    ADD COLUMN "reconciliationLeaseUntil" TIMESTAMP(3),
+    ADD COLUMN "balanceCreditedAt" TIMESTAMP(3),
+    ADD COLUMN "fulfilledAt" TIMESTAMP(3);
 
 UPDATE "Mpesa"
 SET "checkoutRequestId" = "reqcode"

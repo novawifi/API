@@ -1853,7 +1853,6 @@ class MpesaController {
             CallbackMetadata: {
                 Item: [
                     { Name: "Amount", Value: Number(payment.amount) },
-                    { Name: "MpesaReceiptNumber", Value: payment.mpesaReceiptNumber || checkoutRequestId },
                     { Name: "PhoneNumber", Value: payment.phone },
                 ],
             },
@@ -1901,6 +1900,15 @@ class MpesaController {
 
             if (resultCode === "0") {
                 if (mpesaCode.status === "COMPLETE") {
+                    const lateReceipt = getItemValue("MpesaReceiptNumber");
+                    if (lateReceipt && !mpesaCode.mpesaReceiptNumber) {
+                        await this.db.updateMpesaCodeByID(mpesaCode.id, {
+                            mpesaReceiptNumber: String(lateReceipt),
+                            merchantRequestId: stkCallback.MerchantRequestID || mpesaCode.merchantRequestId,
+                            resultCode: "0",
+                            resultDescription: message || mpesaCode.resultDescription,
+                        });
+                    }
                     this.logPayment(mpesaCode.platformID, `STK callback already processed (ref ${CheckoutRequestID})`, "info");
                     return res.status(200).json({ success: true, message: "Already processed." });
                 }
@@ -1919,7 +1927,7 @@ class MpesaController {
                 };
                 if (
                     transactionDetails.amount == null ||
-                    !transactionDetails.mpesaReceiptNumber ||
+                    (!transactionDetails.mpesaReceiptNumber && source === "MPESA_CALLBACK") ||
                     !transactionDetails.phoneNumber
                 ) {
                     await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "PENDING" });
@@ -1936,7 +1944,7 @@ class MpesaController {
 
                 console.log("Updating Mpesa code with data:", {
                     checkoutRequestId: transactionDetails.checkoutRequestId,
-                    code: transactionDetails.mpesaReceiptNumber,
+                    code: transactionDetails.mpesaReceiptNumber || transactionDetails.checkoutRequestId,
                     status: "COMPLETE",
                     amount: (transactionDetails.amount).toString(),
                     platformID: mpesaCode.platformID,
@@ -1945,7 +1953,7 @@ class MpesaController {
 
                 await this.db.updateMpesaCodeByID(mpesaCode.id, {
                     code: transactionDetails.mpesaReceiptNumber,
-                    status: "COMPLETE",
+                    status: "PROCESSING",
                     amount: (transactionDetails.amount).toString(),
                     platformID: mpesaCode.platformID,
                     type: 'deposit',
@@ -1953,7 +1961,7 @@ class MpesaController {
                     merchantRequestId: transactionDetails.merchantRequestId || null,
                     resultCode: "0",
                     resultDescription: message || null,
-                    mpesaReceiptNumber: transactionDetails.mpesaReceiptNumber,
+                    mpesaReceiptNumber: transactionDetails.mpesaReceiptNumber || null,
                     transactionDate: transactionDetails.transactionDate
                         ? new Date(String(transactionDetails.transactionDate).replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, "$1-$2-$3T$4:$5:$6+03:00"))
                         : null,
@@ -1963,26 +1971,11 @@ class MpesaController {
                 // Credit platform balance only for Nova B2B deposits. Direct C2B STK settles to the merchant.
                 try {
                     const paymentMethod = String(mpesaCode.paymentMethod || "").toLowerCase();
-                    const funds = await this.db.getFunds(mpesaCode.platformID);
                     const depositAmount = Number(transactionDetails.amount || 0);
                     const shouldCreditBalance = paymentMethod === "mpesa b2b";
 
                     if (shouldCreditBalance && Number.isFinite(depositAmount) && depositAmount > 0) {
-                        if (funds) {
-                            const newBalance = parseFloat(String(funds.balance || "0")) + depositAmount;
-                            const newDeposits = parseFloat(String(funds.deposits || "0")) + depositAmount;
-                            await this.db.updateFunds(mpesaCode.platformID, {
-                                balance: newBalance.toFixed(2),
-                                deposits: newDeposits.toFixed(2),
-                            });
-                        } else {
-                            await this.db.createFunds({
-                                balance: depositAmount.toFixed(2),
-                                withdrawals: "0",
-                                deposits: depositAmount.toFixed(2),
-                                platformID: mpesaCode.platformID,
-                            });
-                        }
+                        await this.db.creditFundsOnceForMpesa(mpesaCode.id, mpesaCode.platformID, depositAmount);
                     }
                 } catch (error) {
                     // ignore: balance tracking should not block activation/transfers
@@ -1991,6 +1984,10 @@ class MpesaController {
                 if (mpesaCode.service === "hotspot") {
                     const pkg = await this.db.getPackagesByAmount(mpesaCode.platformID, `${parseInt(transactionDetails.amount)}`, mpesaCode.reason);
                     if (!pkg) {
+                        await this.db.updateMpesaCodeByID(mpesaCode.id, {
+                            status: "MANUAL_REVIEW",
+                            lastReconciliationError: "Payment confirmed but its package could not be resolved.",
+                        });
                         return res.status(400).json({
                             success: false,
                             message: `Invalid package`,
@@ -2062,6 +2059,7 @@ class MpesaController {
                     }
 
                     if (existingUser) {
+                        await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "COMPLETE", fulfilledAt: new Date() });
                         socketManager.emitEvent("deposit-success", {
                             status: "COMPLETE",
                             checkoutRequestId: transactionDetails.checkoutRequestId,
@@ -2077,6 +2075,11 @@ class MpesaController {
                     let addcodetorouter = await this.mikrotik.addManualCode(data);
 
 	                    if (!addcodetorouter.success) {
+	                        await this.db.updateMpesaCodeByID(mpesaCode.id, {
+	                            status: "PENDING",
+	                            nextReconciliationAt: new Date(Date.now() + 5 * 60 * 1000),
+	                            lastReconciliationError: addcodetorouter?.message || "Hotspot fulfillment failed.",
+	                        });
 	                        socketManager.emitEvent("deposit-status", {
 	                            status: "INACTIVE",
 	                            checkoutRequestId: transactionDetails.checkoutRequestId,
@@ -2091,6 +2094,8 @@ class MpesaController {
 	                            message: "Payment received but we failed to automatically connect you to WiFi after multiple quick retries. Please connect manually using the M-PESA message, or contact customer care for assistance.",
 	                        };
 	                    }
+
+                    await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "COMPLETE", fulfilledAt: new Date() });
 
                     socketManager.emitEvent("deposit-success", {
                         status: "COMPLETE",
@@ -2211,6 +2216,7 @@ class MpesaController {
                             expiresAt: expireAt,
                             reminderSent: false
                         })
+                        await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "COMPLETE", fulfilledAt: new Date() });
                         const platform = await this.db.getPlatform(client.platformID);
 
                         if (client?.email) {
@@ -2240,6 +2246,11 @@ class MpesaController {
                             message: "PPPoE Server enabled successfully",
                         };
                     } else {
+                        await this.db.updateMpesaCodeByID(mpesaCode.id, {
+                            status: "PENDING",
+                            nextReconciliationAt: new Date(Date.now() + 5 * 60 * 1000),
+                            lastReconciliationError: "PPPoE fulfillment failed.",
+                        });
                         return {
                             success: false,
                             message: `Failed to enable PPPoE Server!`,
@@ -2248,6 +2259,9 @@ class MpesaController {
                 } else if (mpesaCode.service === "bill") {
                     await this.completePaymentForService(mpesaCode);
                     await this.refreshDashboardStatsForPlatform(mpesaCode.platformID);
+                    await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "COMPLETE", fulfilledAt: new Date() });
+                } else {
+                    await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "COMPLETE", fulfilledAt: new Date() });
                 }
             } else {
                 // Payment Failed

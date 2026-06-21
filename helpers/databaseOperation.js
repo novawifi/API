@@ -886,6 +886,38 @@ class DataBase {
         return result.count === 1;
     }
 
+    async creditFundsOnceForMpesa(paymentId, platformID, amount) {
+        const value = Number(amount);
+        if (!paymentId || !platformID || !Number.isFinite(value) || value <= 0) return false;
+        return prisma.$transaction(async (tx) => {
+            const claimed = await tx.mpesa.updateMany({
+                where: { id: paymentId, balanceCreditedAt: null },
+                data: { balanceCreditedAt: new Date() },
+            });
+            if (claimed.count !== 1) return false;
+            const funds = await tx.funds.findUnique({ where: { platformID } });
+            if (funds) {
+                await tx.funds.update({
+                    where: { platformID },
+                    data: {
+                        balance: (Number(funds.balance || 0) + value).toFixed(2),
+                        deposits: (Number(funds.deposits || 0) + value).toFixed(2),
+                    },
+                });
+            } else {
+                await tx.funds.create({
+                    data: {
+                        balance: value.toFixed(2),
+                        withdrawals: "0",
+                        deposits: value.toFixed(2),
+                        platformID,
+                    },
+                });
+            }
+            return true;
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }
+
     async getC2BTransferPool(platformID) {
         if (!platformID) return null;
         try {
@@ -1043,7 +1075,7 @@ class DataBase {
         const now = dueAt || new Date();
         return prisma.mpesa.findMany({
             where: {
-                status: "PENDING",
+                status: { in: ["PENDING", "PROCESSING"] },
                 checkoutRequestId: { not: null },
                 createdAt: { lte: minCreatedAt },
                 OR: [
@@ -1064,16 +1096,20 @@ class DataBase {
 
     async claimMpesaReconciliation(id, leaseUntil) {
         const now = new Date();
+        const staleProcessingAt = new Date(now.getTime() - 5 * 60 * 1000);
         const result = await prisma.mpesa.updateMany({
             where: {
                 id,
-                status: "PENDING",
                 OR: [
+                    { status: "PENDING" },
+                    { status: "PROCESSING", updatedAt: { lt: staleProcessingAt } },
+                ],
+                AND: [{ OR: [
                     { reconciliationLeaseUntil: null },
                     { reconciliationLeaseUntil: { lt: now } },
-                ],
+                ] }],
             },
-            data: { reconciliationLeaseUntil: leaseUntil },
+            data: { status: "PENDING", reconciliationLeaseUntil: leaseUntil },
         });
         return result.count === 1;
     }

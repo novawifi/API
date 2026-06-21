@@ -59,6 +59,8 @@ model Mpesa {
   nextReconciliationAt    DateTime?
   lastReconciliationError String?
   reconciliationLeaseUntil DateTime?
+  balanceCreditedAt         DateTime?
+  fulfilledAt               DateTime?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
