@@ -17,6 +17,7 @@ const { Mikrotikcontroller } = require("./mikrotikController");
 const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
 const { WebdockService } = require("../services/webdockService");
+const { MpesaReconciliationService } = require("../services/mpesaReconciliationService");
 const cache = require("../utils/cache");
 
 
@@ -43,6 +44,7 @@ class MpesaController {
         this.mikrotik = new Mikrotikcontroller();
         this.mailer = new Mailer();
         this.sms = new SMS();
+        this.reconciliation = new MpesaReconciliationService(this);
         this.darajaRequests = new Map();
         this.darajaRequestTTL = 10 * 60 * 1000;
         this.cache = cache;
@@ -1841,13 +1843,41 @@ class MpesaController {
         }
     };
 
-    async callBack(req, res) {
-        let callbackData = req.body;
-        console.log("Mpesa Callback", callbackData)
+    async finalizeReconciledStkPayment(payment, queryResponse, source = "MPESA_QUERY") {
+        const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
+        const callback = {
+            MerchantRequestID: queryResponse?.MerchantRequestID || payment.merchantRequestId || "",
+            CheckoutRequestID: checkoutRequestId,
+            ResultCode: 0,
+            ResultDesc: queryResponse?.ResultDesc || "Confirmed by M-PESA Express Query",
+            CallbackMetadata: {
+                Item: [
+                    { Name: "Amount", Value: Number(payment.amount) },
+                    { Name: "MpesaReceiptNumber", Value: payment.mpesaReceiptNumber || checkoutRequestId },
+                    { Name: "PhoneNumber", Value: payment.phone },
+                ],
+            },
+        };
+        let responseBody = null;
+        const response = {
+            statusCode: 200,
+            status(code) { this.statusCode = code; return this; },
+            json(body) { responseBody = body; return this; },
+        };
+        await this.callBack({ body: { Body: { stkCallback: callback } }, mpesaSource: source }, response);
+        if (response.statusCode >= 400 || responseBody?.success === false) {
+            throw new Error(responseBody?.message || "M-PESA payment fulfillment failed.");
+        }
+        return responseBody;
+    }
 
-        if (callbackData.Body.stkCallback) {
+    async callBack(req, res) {
+        const callbackData = req.body || {};
+        const source = req.mpesaSource || "MPESA_CALLBACK";
+
+        if (callbackData?.Body?.stkCallback) {
             let stkCallback = callbackData.Body.stkCallback;
-            let resultCode = stkCallback.ResultCode;
+            const resultCode = String(stkCallback.ResultCode);
             let message = stkCallback.ResultDesc;
             let CheckoutRequestID = stkCallback.CheckoutRequestID;
             const items = Array.isArray(stkCallback?.CallbackMetadata?.Item)
@@ -1855,23 +1885,29 @@ class MpesaController {
                 : [];
             const getItemValue = (name) => items.find(item => item.Name === name)?.Value;
 
-            const mpesaCode = await this.db.getMpesaByCode(CheckoutRequestID);
+            const mpesaCode = await this.db.getMpesaByCheckoutRequestId(CheckoutRequestID);
             if (!mpesaCode) {
-                return res.status(404).json({
+                console.warn("Unknown M-PESA CheckoutRequestID", { checkoutRequestId: CheckoutRequestID, source });
+                return res.status(200).json({
                     success: false,
                     message: "MPesa code not found for the given invoice ID.",
                 });
             }
             this.logPayment(
                 mpesaCode.platformID,
-                `STK callback received (${resultCode === 0 ? "SUCCESS" : "FAILED"}) ref ${CheckoutRequestID}`,
-                resultCode === 0 ? "success" : "warn"
+                `STK callback received (${resultCode === "0" ? "SUCCESS" : "FAILED"}) ref ${CheckoutRequestID}`,
+                resultCode === "0" ? "success" : "warn"
             );
 
-            if (resultCode === 0) {
+            if (resultCode === "0") {
                 if (mpesaCode.status === "COMPLETE") {
                     this.logPayment(mpesaCode.platformID, `STK callback already processed (ref ${CheckoutRequestID})`, "info");
                     return res.status(200).json({ success: true, message: "Already processed." });
+                }
+                const claimed = await this.db.claimMpesaForSuccessfulFinalization(mpesaCode.id);
+                if (!claimed) {
+                    this.logPayment(mpesaCode.platformID, `STK finalization already in progress (ref ${CheckoutRequestID})`, "info");
+                    return res.status(200).json({ success: true, message: "Already processing." });
                 }
                 let transactionDetails = {
                     merchantRequestId: stkCallback.MerchantRequestID,
@@ -1886,6 +1922,7 @@ class MpesaController {
                     !transactionDetails.mpesaReceiptNumber ||
                     !transactionDetails.phoneNumber
                 ) {
+                    await this.db.updateMpesaCodeByID(mpesaCode.id, { status: "PENDING" });
                     this.logPayment(
                         mpesaCode.platformID,
                         `STK callback missing metadata (ref ${CheckoutRequestID})`,
@@ -1912,6 +1949,14 @@ class MpesaController {
                     amount: (transactionDetails.amount).toString(),
                     platformID: mpesaCode.platformID,
                     type: 'deposit',
+                    checkoutRequestId: transactionDetails.checkoutRequestId,
+                    merchantRequestId: transactionDetails.merchantRequestId || null,
+                    resultCode: "0",
+                    resultDescription: message || null,
+                    mpesaReceiptNumber: transactionDetails.mpesaReceiptNumber,
+                    transactionDate: transactionDetails.transactionDate
+                        ? new Date(String(transactionDetails.transactionDate).replace(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/, "$1-$2-$3T$4:$5:$6+03:00"))
+                        : null,
                 });
                 this.logPayment(mpesaCode.platformID, `STK payment marked COMPLETE (ref ${CheckoutRequestID})`, "success");
 
@@ -2206,11 +2251,13 @@ class MpesaController {
                 }
             } else {
                 // Payment Failed
-                await this.db.updateMpesaCodeByID(mpesaCode.id, {
+                await this.db.failPendingMpesa(mpesaCode.id, {
                     status: "FAILED",
                     platformID: mpesaCode.platformID,
                     type: 'deposit',
-                    failed_reason: message
+                    failed_reason: message,
+                    resultCode,
+                    resultDescription: message || null,
                 });
 
                 const userMessage = this.getUserFriendlyMessage(message);
@@ -2221,13 +2268,45 @@ class MpesaController {
                 }, stkCallback.CheckoutRequestID);
                 this.logPayment(mpesaCode.platformID, `STK payment failed (ref ${CheckoutRequestID}) - ${message}`, "warn");
 
-                return res.status(400).json({ type: "error", message: this.getUserFriendlyMessage("Transaction not successful") });
+                return res.status(200).json({ type: "error", message: this.getUserFriendlyMessage("Transaction not successful") });
             }
         }
 
         return res.status(200).json({
             success: true,
             message: "Deposit callback processed.",
+        });
+    }
+
+    async reconcileStkPayment(req, res) {
+        const { token, paymentId, checkoutRequestId } = req.body || {};
+        if (!token) return res.status(401).json({ success: false, message: "Missing credentials required!" });
+        const auth = await this.auth.AuthenticateRequest(token);
+        if (!auth.success || !auth.admin || !["superuser", "admin"].includes(auth.admin.role)) {
+            return res.status(403).json({ success: false, message: "Unauthorised!" });
+        }
+        if (!paymentId && !checkoutRequestId) {
+            return res.status(400).json({ success: false, message: "paymentId or checkoutRequestId is required." });
+        }
+        const payment = paymentId
+            ? await this.db.getMpesaByID(String(paymentId))
+            : await this.db.getMpesaByCheckoutRequestId(String(checkoutRequestId));
+        if (!payment || payment.platformID !== auth.admin.platformID) {
+            return res.status(404).json({ success: false, message: "Payment not found." });
+        }
+        this.reconciliation.db = this.db;
+        const result = await this.reconciliation.reconcileMpesaPayment(payment, "MANUAL_RECONCILIATION");
+        const updated = await this.db.getMpesaByID(payment.id);
+        return res.status(200).json({
+            success: result.state !== "FAILED",
+            state: result.state,
+            payment: updated ? {
+                id: updated.id,
+                checkoutRequestId: updated.checkoutRequestId || updated.reqcode,
+                status: updated.status,
+                resultCode: updated.resultCode,
+                resultDescription: updated.resultDescription,
+            } : null,
         });
     }
 

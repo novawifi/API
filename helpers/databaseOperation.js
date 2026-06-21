@@ -868,6 +868,24 @@ class DataBase {
         }
     }
 
+    async claimMpesaForSuccessfulFinalization(id) {
+        if (!id) return false;
+        const result = await prisma.mpesa.updateMany({
+            where: { id, status: "PENDING" },
+            data: { status: "PROCESSING" },
+        });
+        return result.count === 1;
+    }
+
+    async failPendingMpesa(id, data) {
+        if (!id) return false;
+        const result = await prisma.mpesa.updateMany({
+            where: { id, status: "PENDING" },
+            data,
+        });
+        return result.count === 1;
+    }
+
     async getC2BTransferPool(platformID) {
         if (!platformID) return null;
         try {

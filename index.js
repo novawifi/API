@@ -10,6 +10,7 @@ const rateLimit = require("express-rate-limit");
 
 const { socketManager } = require("./controllers/socketController")
 const { CronJob } = require("./cronjob");
+const { MpesaReconciliationWorker } = require("./services/mpesaReconciliationWorker");
 
 const reqRoutes = require("./routes/controllerRoutes");
 const mikrotikRoutes = require("./routes/mikrotikRoutes");
@@ -22,6 +23,7 @@ const supportRoutes = require("./routes/supportRoutes");
 const app = express();
 app.set("trust proxy", 1);
 const server = http.createServer(app);
+const mpesaReconciliationWorker = new MpesaReconciliationWorker();
 
 // Middlewares
 app.use(cors({ origin: "*" }));
@@ -67,4 +69,9 @@ server.listen(PORT, () => {
   } catch (error) {
     console.error("Failed to start cron jobs:", error);
   }
+  mpesaReconciliationWorker.start();
 });
+
+const shutdown = () => mpesaReconciliationWorker.stop();
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);

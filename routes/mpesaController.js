@@ -28,6 +28,7 @@ if (INTASEND_DEPOSIT_CALLBACK_PATH) router.post(INTASEND_DEPOSIT_CALLBACK_PATH, 
 if (PAYSTACK_DEPOSIT_CALLBACK_PATH) router.post(PAYSTACK_DEPOSIT_CALLBACK_PATH, use("handlePaystackDepositCallback"));
 
 router.post("/confirm", use("checkPayment"));
+router.post("/admin/reconcile", use("reconcileStkPayment"));
 router.post("/payPPPoE", use("payPPPoE"));
 router.post("/paybill", use("payBill"));
 router.post("/paysms", use("paySMS"));
