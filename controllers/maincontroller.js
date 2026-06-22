@@ -2797,9 +2797,10 @@ class Controller {
       if (cached) {
         return res.json(cached);
       }
-      const [users, payments] = await Promise.all([
+      const [users, payments, pppoeUsers] = await Promise.all([
         this.db.getUserByPlatformToday(platformID),
         this.db.getMpesaPaymentsToday(platformID),
+        this.db.getPPPoE(platformID),
       ]);
 
       const stationMap = new Map(
@@ -2813,14 +2814,30 @@ class Controller {
         users.map((u) => [String(u.code || u.username || u.password), u.status])
       );
 
+      const pppoeStationMap = new Map();
+      (pppoeUsers || []).forEach((user) => {
+        [user.id, user.paymentLink, user.accountNumber, user.clientname]
+          .filter(Boolean)
+          .forEach((key) => pppoeStationMap.set(String(key), user.station));
+      });
+
       const enrichedPayments = payments.map((p) => {
         const codeStr = String(p.code);
         const userStatus = userCodes.get(codeStr);
         const hasCode = userStatus !== undefined;
+        const service = String(p.service || "").toLowerCase();
+        const station = service === "hotspot"
+          ? p.package?.routerHost || stationMap.get(codeStr) || null
+          : service === "pppoe"
+            ? [p.referenceID, p.account, p.reason]
+              .filter(Boolean)
+              .map((key) => pppoeStationMap.get(String(key)))
+              .find(Boolean) || null
+            : null;
 
         return {
           ...p,
-          station: p.package?.routerHost,
+          station,
           isUser: p.status === "COMPLETE" && p.service === "hotspot" && hasCode,
           isExpired:
             p.status === "COMPLETE" && p.service === "hotspot" && hasCode
@@ -3219,7 +3236,7 @@ class Controller {
 
   async fetchSettings(req, res) {
 
-    const { token } = req.body; if (!token) {
+    const { token, stationId } = req.body; if (!token) {
       return res.json({
         success: false, message: "Missing credentials required!",
       });
@@ -3297,6 +3314,22 @@ class Controller {
 
       platformSettings.brandingImage = normalizeBrandingImage(platformSettings.brandingImage);
 
+      let stationBranding = null;
+      if (stationId) {
+        const station = await this.db.getStation(stationId);
+        if (!station || station.platformID !== platformID) {
+          return res.json({ success: false, message: "Station not found." });
+        }
+        stationBranding = {
+          stationId: station.id,
+          stationName: station.name,
+          supportPhone: station.supportPhone || platformSettings.supportPhone || "",
+          brandingImage: normalizeBrandingImage(station.brandingImage || platformSettings.brandingImage),
+          inheritsSupportPhone: !station.supportPhone,
+          inheritsBrandingImage: !station.brandingImage,
+        };
+      }
+
       const response = {
         domain,
         success: true,
@@ -3304,7 +3337,8 @@ class Controller {
         name,
         url,
         settings: platformSettings,
-        platform_id
+        platform_id,
+        stationBranding,
       };
       return res.json(response);
     } catch (error) {
@@ -3431,7 +3465,7 @@ class Controller {
   }
 
   async saveBrandingSupport(req, res) {
-    const { token, supportPhone = "", brandingImage = "" } = req.body || {};
+    const { token, stationId, supportPhone = "", brandingImage = "" } = req.body || {};
     if (!token) {
       return res.json({
         success: false,
@@ -3452,7 +3486,6 @@ class Controller {
       });
     }
     const platformID = auth.admin.platformID;
-    const adminID = auth.admin.adminID;
     if (!platformID) {
       return res.json({
         success: false,
@@ -3460,23 +3493,18 @@ class Controller {
       });
     }
     try {
-      const payload = {
-        supportPhone,
-        brandingImage,
-      };
-      const existingConfig = await this.db.getPlatformConfig(platformID);
-      if (!existingConfig) {
-        await this.db.createPlatformConfig(platformID, {
-          adminID,
-          ...payload,
-        });
-      } else {
-        await this.db.updatePlatformConfig(platformID, payload);
+      if (!stationId) {
+        return res.json({ success: false, message: "Select a station first." });
       }
+      const station = await this.db.getStation(stationId);
+      if (!station || station.platformID !== platformID) {
+        return res.json({ success: false, message: "Station not found." });
+      }
+      await this.db.updateStation(stationId, { supportPhone, brandingImage });
       this.cache.del(`main:settings:${platformID}`);
       return res.json({
         success: true,
-        message: "Branding & support updated.",
+        message: `Branding & support updated for ${station.name}.`,
       });
     } catch (error) {
       console.log("An error occured", error);
@@ -10195,8 +10223,8 @@ class Controller {
   };
 
   async uploadBrandingLogo(req, res) {
-    const { token, file, filename } = req.body || {};
-    if (!token || !file) {
+    const { token, stationId, file, filename } = req.body || {};
+    if (!token || !stationId || !file) {
       return res.json({ success: false, message: "Missing credentials required!" });
     }
 
@@ -10210,9 +10238,12 @@ class Controller {
       }
 
       const platformID = auth.admin.platformID;
-      const adminID = auth.admin.adminID;
       if (!platformID) {
         return res.json({ success: false, message: "Missing platform ID" });
+      }
+      const station = await this.db.getStation(stationId);
+      if (!station || station.platformID !== platformID) {
+        return res.json({ success: false, message: "Station not found." });
       }
 
       const match = String(file).match(/^data:image\/(png|jpe?g);base64,/i);
@@ -10231,7 +10262,7 @@ class Controller {
       const safeNameBase = (filename || "branding-logo")
         .replace(/\.[^/.]+$/, "")
         .replace(/[^a-zA-Z0-9._-]/g, "_");
-      const finalName = `${safeNameBase}-${platformID}-${Date.now()}.${ext}`;
+      const finalName = `${safeNameBase}-${platformID}-${stationId}-${Date.now()}.${ext}`;
       const finalPath = path.join(folderPath, finalName);
       fs.writeFileSync(finalPath, Buffer.from(base64Data, "base64"));
 
@@ -10239,15 +10270,7 @@ class Controller {
       const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
       const host = (req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
       const absoluteUrl = host ? `${proto}://${host}${imageUrl}` : imageUrl;
-      const existingConfig = await this.db.getPlatformConfig(platformID);
-      if (existingConfig) {
-        await this.db.updatePlatformConfig(platformID, { brandingImage: imageUrl });
-      } else {
-        await this.db.createPlatformConfig(platformID, {
-          adminID,
-          brandingImage: imageUrl,
-        });
-      }
+      await this.db.updateStation(stationId, { brandingImage: imageUrl });
       this.cache.del(`main:settings:${platformID}`);
 
       return res.status(200).json({

@@ -42,15 +42,21 @@ class Socket {
             return platformData;
         }
         const station = await this.db.getStationByHost(platformData.platformID, host);
-        if (!station?.hotspotTemplateMode) return platformData;
-        const mode = String(station.hotspotTemplateMode).toLowerCase();
+        if (!station) return platformData;
+        const mode = String(station.hotspotTemplateMode || "").toLowerCase();
+        const stationSupportPhone = station.supportPhone || platformData.supportPhone || platformData.phone || "";
         return {
             ...platformData,
-            template: mode === "online" && station.hotspotTemplateName
-                ? station.hotspotTemplateName
-                : "Default",
-            hotspotTemplateMode: mode,
+            ...(mode ? {
+                template: mode === "online" && station.hotspotTemplateName
+                    ? station.hotspotTemplateName
+                    : "Default",
+                hotspotTemplateMode: mode,
+            } : {}),
             stationId: station.id,
+            supportPhone: stationSupportPhone,
+            phone: stationSupportPhone,
+            brandingImage: station.brandingImage || platformData.brandingImage || "",
         };
     }
 
