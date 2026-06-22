@@ -2001,6 +2001,7 @@ class MpesaController {
                         amount: String(transactionDetails.amount),
                         status: "COMPLETE",
                         service: mpesaCode.service || "hotspot",
+                        station: pkg?.routerHost || null,
                         packageName: pkg?.name || null,
                         createdAt: new Date().toISOString(),
                     });
@@ -2168,6 +2169,7 @@ class MpesaController {
                         amount: String(transactionDetails.amount),
                         status: "COMPLETE",
                         service: mpesaCode.service || "pppoe",
+                        station: client?.station || null,
                         packageName: client?.name || client?.servicename || null,
                         createdAt: new Date().toISOString(),
                     });
@@ -3473,6 +3475,7 @@ class MpesaController {
                     amount: String(amount),
                     status: "COMPLETE",
                     service: "hotspot",
+                    station: pkg?.routerHost || null,
                     packageName: pkg?.name || null,
                     createdAt: new Date().toISOString(),
                 });
@@ -3549,6 +3552,7 @@ class MpesaController {
                     amount: String(amount),
                     status: "COMPLETE",
                     service: "pppoe",
+                    station: pppoe?.station || null,
                     packageName: pppoe?.name || pppoe?.servicename || null,
                     createdAt: new Date().toISOString(),
                 });

@@ -4191,10 +4191,22 @@ class DataBase {
             list.push(pkg.id);
             packagesByHost.set(pkg.routerHost, list);
         }
+        const pppoeAccounts = await prisma.pppoe.findMany({
+            where: { platformID },
+            select: { id: true, paymentLink: true, station: true },
+        });
+        const pppoeReferencesByHost = new Map();
+        for (const account of pppoeAccounts) {
+            if (!account.station) continue;
+            const list = pppoeReferencesByHost.get(account.station) || [];
+            list.push(...[account.id, account.paymentLink].filter(Boolean));
+            pppoeReferencesByHost.set(account.station, list);
+        }
 
         for (const station of stations) {
             const ids = packagesByHost.get(station.mikrotikHost || "") || [];
-            if (ids.length === 0) {
+            const pppoeReferences = pppoeReferencesByHost.get(station.mikrotikHost || "") || [];
+            if (ids.length === 0 && pppoeReferences.length === 0) {
                 const existingStation = await this.getStationDashboardStats(platformID, station.id);
                 if (existingStation) {
                     const stats = { ...(existingStation.stats || {}) };
@@ -4215,6 +4227,14 @@ class DataBase {
                 continue;
             }
 
+            const stationRevenueConditions = [];
+            if (ids.length > 0) {
+                stationRevenueConditions.push(Prisma.sql`("service" = 'hotspot' AND "reason" IN (${Prisma.join(ids)}))`);
+            }
+            if (pppoeReferences.length > 0) {
+                stationRevenueConditions.push(Prisma.sql`("service" = 'pppoe' AND "referenceID" IN (${Prisma.join(pppoeReferences)}))`);
+            }
+
             const [stationRow] = await prisma.$queryRaw(Prisma.sql`
                 SELECT
                     COALESCE(SUM(CAST("amount" AS DOUBLE PRECISION)), 0) AS "total",
@@ -4223,7 +4243,7 @@ class DataBase {
                     COALESCE(SUM(CAST("amount" AS DOUBLE PRECISION)) FILTER (WHERE "createdAt" BETWEEN ${startOfThisMonth} AND ${now}), 0) AS "thisMonth",
                     COALESCE(SUM(CAST("amount" AS DOUBLE PRECISION)) FILTER (WHERE "createdAt" BETWEEN ${startOfLastMonth} AND ${endOfLastMonth}), 0) AS "lastMonth"
                 FROM "Mpesa"
-                WHERE ${baseWhere} AND "reason" IN (${Prisma.join(ids)})
+                WHERE ${baseWhere} AND (${Prisma.join(stationRevenueConditions, " OR ")})
             `);
 
             const existingStation = await this.getStationDashboardStats(platformID, station.id);
@@ -4261,6 +4281,13 @@ class DataBase {
                 select: { id: true },
             });
             const stationPackageIdList = stationPackages.map((pkg) => pkg.id);
+            const stationPppoeAccounts = await prisma.pppoe.findMany({
+                where: { platformID, station: station.mikrotikHost || "" },
+                select: { id: true, paymentLink: true },
+            });
+            const stationPppoeReferences = stationPppoeAccounts
+                .flatMap((account) => [account.id, account.paymentLink])
+                .filter(Boolean);
 
             const now = new Date(this.timestamp);
             const startOfToday = new Date(now);
@@ -4277,12 +4304,10 @@ class DataBase {
             const revenueWhere = {
                 platformID,
                 status: "COMPLETE",
-                service: {
-                    notIn: ["bill", "sms", "Mpesa B2B"],
-                },
-                reason: {
-                    in: stationPackageIdList,
-                },
+                OR: [
+                    { service: "hotspot", reason: { in: stationPackageIdList } },
+                    { service: "pppoe", referenceID: { in: stationPppoeReferences } },
+                ],
             };
 
             const [
