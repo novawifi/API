@@ -77,6 +77,7 @@ const buildMikrotikRescueScript = (config) => {
     const gateway = escapeRouterOsString(config.rescueGateway);
     const subnet = escapeRouterOsString(config.rescueSubnet);
     const ports = escapeRouterOsString(config.managementPorts);
+    const bootstrap = `${watchdog}-bootstrap`;
     const watchdogEvent = [
         `:local rescue [/interface/sstp-client/find name=${name}];`,
         `:if ([:len $rescue] > 0) do={`,
@@ -86,14 +87,21 @@ const buildMikrotikRescueScript = (config) => {
         `:if ($restart) do={ /interface/sstp-client disable $rescue; :delay 5s; /interface/sstp-client enable $rescue }`,
         `}`,
     ].join(" ");
+    const bootstrapEvent = [
+        `:local rescue [/interface/sstp-client/find name=${name}];`,
+        `:if ([:len $rescue] > 0) do={ /interface/sstp-client enable $rescue };`,
+        `:do { /system/scheduler remove [find name="${bootstrap}"] } on-error={}`,
+    ].join(" ");
 
     return [
         `:do { /interface/sstp-client remove [find name="${name}"] } on-error={}`,
-        `/interface/sstp-client add name="${name}" connect-to="${server}" port=${config.port} user="${username}" password="${password}" authentication=mschap2 profile=default-encryption add-default-route=no dial-on-demand=no keepalive-timeout=30 tls-version=only-1.2 verify-server-certificate=yes verify-server-address-from-certificate=yes disabled=no comment="Nova emergency rescue tunnel"`,
+        `/interface/sstp-client add name="${name}" connect-to="${server}" port=${config.port} user="${username}" password="${password}" authentication=mschap2 profile=default-encryption add-default-route=no dial-on-demand=no keepalive-timeout=30 tls-version=only-1.2 verify-server-certificate=yes verify-server-address-from-certificate=yes disabled=yes comment="Nova emergency rescue tunnel"`,
         `:do { /ip/firewall/filter remove [find comment="Nova rescue management"] } on-error={}`,
         `/ip/firewall/filter add chain=input in-interface="${name}" src-address="${subnet}" protocol=tcp dst-port="${ports}" action=accept comment="Nova rescue management" place-before=0`,
         `:do { /system/scheduler remove [find name="${watchdog}"] } on-error={}`,
         `/system/scheduler add name="${watchdog}" interval=2m start-time=startup on-event="${watchdogEvent}" policy=read,write,test`,
+        `:do { /system/scheduler remove [find name="${bootstrap}"] } on-error={}`,
+        `/system/scheduler add name="${bootstrap}" interval=10s start-time=startup on-event="${bootstrapEvent}" policy=read,write,test disabled=no`,
     ];
 };
 

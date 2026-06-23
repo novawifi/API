@@ -132,7 +132,6 @@ class Mikrotikcontroller {
             "=tls-version=only-1.2",
             "=verify-server-certificate=yes",
             "=verify-server-address-from-certificate=yes",
-            "=disabled=no",
             "=comment=Nova emergency rescue tunnel",
         ];
 
@@ -140,12 +139,14 @@ class Mikrotikcontroller {
             await channel.write("/interface/sstp-client/set", [
                 `=.id=${existing[".id"]}`,
                 ...interfaceArgs,
+                "=disabled=yes",
             ]);
             fixes.push("sstp_rescue_updated");
         } else {
             await channel.write("/interface/sstp-client/add", [
                 `=name=${config.interfaceName}`,
                 ...interfaceArgs,
+                "=disabled=yes",
             ]);
             fixes.push("sstp_rescue_added");
         }
@@ -226,6 +227,36 @@ class Mikrotikcontroller {
             ]);
         }
         fixes.push("sstp_rescue_watchdog_ready");
+
+        const bootstrapName = `${config.watchdogName}-bootstrap`;
+        const bootstrapEvent = [
+            `:local rescue [/interface/sstp-client/find name=\"${config.interfaceName}\"]`,
+            ":if ([:len $rescue] > 0) do={ /interface/sstp-client enable $rescue }",
+            `:do { /system/scheduler/remove [find name=\"${bootstrapName}\"] } on-error={}`,
+        ].join("; ");
+        const bootstrapSchedulers = await channel.write("/system/scheduler/print", []);
+        const existingBootstrap = (Array.isArray(bootstrapSchedulers) ? bootstrapSchedulers : [])
+            .find((entry) => entry.name === bootstrapName);
+        if (existingBootstrap?.[".id"]) {
+            await channel.write("/system/scheduler/set", [
+                `=.id=${existingBootstrap[".id"]}`,
+                "=interval=10s",
+                "=start-time=startup",
+                `=on-event=${bootstrapEvent}`,
+                "=policy=read,write,test",
+                "=disabled=no",
+            ]);
+        } else {
+            await channel.write("/system/scheduler/add", [
+                `=name=${bootstrapName}`,
+                "=interval=10s",
+                "=start-time=startup",
+                `=on-event=${bootstrapEvent}`,
+                "=policy=read,write,test",
+                "=disabled=no",
+            ]);
+        }
+        fixes.push("sstp_rescue_enable_scheduled");
 
         return {
             success: true,

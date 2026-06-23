@@ -166,6 +166,8 @@ router.post("/homeFibreCallbacks", use("fetchHomeFibreCallbacks"));
 router.post("/homeFibreCallback/resolve", use("resolveHomeFibreCallback"));
 router.post("/homeFibreCallback/delete", use("deleteHomeFibreCallback"));
 router.post("/radius-credentials", use("getRadiusCredentials"));
+router.post("/mikrotikInfo", use("fetchMikrotikInfo"));
+router.post("/saveMikrotikInfo", use("saveMikrotikInfo"));
 router.post("/migrateSystemBasis", use("migrateSystemBasis"));
 router.post("/systemBasisMigrations", use("fetchSystemBasisMigrations"));
 router.post("/managerAuthHealth", use("managerAuthHealth"));

@@ -343,6 +343,46 @@ model Station {
   updatedAt          DateTime @updatedAt
 }
 
+model MikrotikInfo {
+  id                   String   @id @default(uuid())
+  stationId            String   @unique
+  platformID           String
+  managementIp         String?
+  username             String?
+  password             String?
+  apiPort              String?  @default("8728")
+  webfigUrl            String?
+  radiusAddress        String?
+  radiusSecret         String?
+  radiusAccountingPort String?  @default("1813")
+  radiusAuthPort       String?  @default("1812")
+  cpuUsage             String?
+  memoryUsage          String?
+  memoryUsed           String?
+  memoryTotal          String?
+  diskUsage            String?
+  diskUsed             String?
+  diskTotal            String?
+  availabilityStatus   String?
+  uptimePercent        String?
+  monitoredPeriod      String?
+  totalDowntime        String?
+  currentUptime        String?
+  routerOsVersion      String?
+  deviceName           String?
+  hardwareModel        String?
+  icmpLoss             String?
+  icmpResponseTime     String?
+  snmpAvailability     String?
+  extra                Json?
+  lastRefreshedAt      DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([platformID])
+  @@index([stationId])
+}
+
 model Funds {
   id               String   @unique @default(uuid())
   balance          String

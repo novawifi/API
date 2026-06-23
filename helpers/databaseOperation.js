@@ -2739,6 +2739,44 @@ class DataBase {
         }
     }
 
+    async getMikrotikInfo(platformID, stationId) {
+        if (!platformID || !stationId) return null;
+        if (!prisma.mikrotikInfo) {
+            console.warn("MikrotikInfo Prisma delegate is unavailable. Run `npx prisma db push && npx prisma generate`.");
+            return null;
+        }
+        try {
+            return await prisma.mikrotikInfo.findFirst({
+                where: { platformID, stationId },
+            });
+        } catch (error) {
+            console.log("An error occurred getting MikroTik info", error);
+            return null;
+        }
+    }
+
+    async upsertMikrotikInfo(data) {
+        if (!data?.platformID || !data?.stationId) return null;
+        if (!prisma.mikrotikInfo) {
+            console.warn("MikrotikInfo Prisma delegate is unavailable. Run `npx prisma db push && npx prisma generate`.");
+            return null;
+        }
+        try {
+            return await prisma.mikrotikInfo.upsert({
+                where: { stationId: data.stationId },
+                update: {
+                    ...data,
+                    platformID: data.platformID,
+                    stationId: data.stationId,
+                },
+                create: data,
+            });
+        } catch (error) {
+            console.log("An error occurred upserting MikroTik info", error);
+            return null;
+        }
+    }
+
     async deleteStation(id) {
         if (!id) return null;
         try {

@@ -4698,6 +4698,164 @@ class Controller {
     }
   }
 
+  formatRouterBytes(value) {
+    const bytes = Number(value || 0);
+    if (!Number.isFinite(bytes) || bytes <= 0) return "";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const amount = bytes / (1024 ** index);
+    return `${amount >= 100 || index === 0 ? amount.toFixed(0) : amount.toFixed(2)}${units[index]}`;
+  }
+
+  percentageString(used, total) {
+    const usedNumber = Number(used || 0);
+    const totalNumber = Number(total || 0);
+    if (!Number.isFinite(usedNumber) || !Number.isFinite(totalNumber) || totalNumber <= 0) return "";
+    return `${((usedNumber / totalNumber) * 100).toFixed(1)}%`;
+  }
+
+  buildMikrotikInfoSnapshot(station, existing = {}, live = {}) {
+    const webfigHost = station?.mikrotikWebfigHost || station?.mikrotikPublicHost || "";
+    const isRadiusStation = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+    const totalMemory = live["total-memory"];
+    const freeMemory = live["free-memory"];
+    const usedMemory = Number(totalMemory || 0) - Number(freeMemory || 0);
+    const totalHdd = live["total-hdd-space"];
+    const freeHdd = live["free-hdd-space"];
+    const usedHdd = Number(totalHdd || 0) - Number(freeHdd || 0);
+    const cpuLoad = live["cpu-load"];
+
+    return {
+      stationId: station.id,
+      platformID: station.platformID,
+      managementIp: station.mikrotikHost || existing.managementIp || "",
+      username: station.mikrotikUser || existing.username || "",
+      password: station.mikrotikPassword || existing.password || "",
+      apiPort: existing.apiPort || "8728",
+      webfigUrl: webfigHost ? `http://${webfigHost}` : existing.webfigUrl || "",
+      radiusAddress: isRadiusStation ? station.radiusServerIp || existing.radiusAddress || "" : "",
+      radiusSecret: isRadiusStation ? station.radiusClientSecret || existing.radiusSecret || "" : "",
+      radiusAccountingPort: isRadiusStation ? existing.radiusAccountingPort || "1813" : "",
+      radiusAuthPort: isRadiusStation ? existing.radiusAuthPort || "1812" : "",
+      cpuUsage: cpuLoad !== undefined && cpuLoad !== "" ? `${cpuLoad}%` : existing.cpuUsage || "",
+      memoryUsage: totalMemory ? this.percentageString(usedMemory, totalMemory) : existing.memoryUsage || "",
+      memoryUsed: totalMemory ? this.formatRouterBytes(usedMemory) : existing.memoryUsed || "",
+      memoryTotal: totalMemory ? this.formatRouterBytes(totalMemory) : existing.memoryTotal || "",
+      diskUsage: totalHdd ? this.percentageString(usedHdd, totalHdd) : existing.diskUsage || "",
+      diskUsed: totalHdd ? this.formatRouterBytes(usedHdd) : existing.diskUsed || "",
+      diskTotal: totalHdd ? this.formatRouterBytes(totalHdd) : existing.diskTotal || "",
+      availabilityStatus: existing.availabilityStatus || "",
+      uptimePercent: existing.uptimePercent || "",
+      monitoredPeriod: existing.monitoredPeriod || "",
+      totalDowntime: existing.totalDowntime || "",
+      currentUptime: live.uptime || existing.currentUptime || "",
+      routerOsVersion: live.version || existing.routerOsVersion || "",
+      deviceName: live.identity || station.name || existing.deviceName || "",
+      hardwareModel: live["board-name"] || existing.hardwareModel || "",
+      icmpLoss: existing.icmpLoss || "",
+      icmpResponseTime: existing.icmpResponseTime || "",
+      snmpAvailability: existing.snmpAvailability || "",
+      extra: {
+        ...(existing.extra && typeof existing.extra === "object" ? existing.extra : {}),
+        architecture: live["architecture-name"] || existing?.extra?.architecture || "",
+        platform: live.platform || existing?.extra?.platform || "",
+        systemBasis: station.systemBasis || "API",
+      },
+      lastRefreshedAt: live.lastRefreshedAt || existing.lastRefreshedAt || null,
+    };
+  }
+
+  async fetchLiveMikrotikInfo(platformID, station) {
+    if (!platformID || !station?.mikrotikHost) return {};
+    const connection = await this.mikrotik.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
+    if (!connection?.channel) return {};
+    const { channel } = connection;
+    try {
+      const [resources, identities] = await Promise.all([
+        this.mikrotik.mikrotik.listSystemResource(channel).catch(() => []),
+        channel.write("/system/identity/print", []).catch(() => []),
+      ]);
+      const resource = Array.isArray(resources) ? resources[0] || {} : {};
+      const identity = Array.isArray(identities) ? identities[0]?.name || "" : "";
+      return { ...resource, identity, lastRefreshedAt: new Date() };
+    } finally {
+      await this.mikrotik.safeCloseChannel(channel);
+    }
+  }
+
+  async fetchMikrotikInfo(req, res) {
+    const { token, stationId, refresh } = req.body || {};
+    if (!token || !stationId) {
+      return res.status(400).json({ success: false, message: "Token and stationId are required." });
+    }
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.status(403).json({ success: false, message: "Unauthorised!" });
+
+      const platformID = auth.admin.platformID;
+      const station = await this.db.getStation(stationId);
+      if (!station || station.platformID !== platformID) {
+        return res.status(404).json({ success: false, message: "Station not found." });
+      }
+
+      const existing = await this.db.getMikrotikInfo(platformID, stationId);
+      let live = {};
+      if (refresh) {
+        live = await this.fetchLiveMikrotikInfo(platformID, station).catch((error) => ({
+          liveError: error?.message || String(error),
+        }));
+      }
+      const info = this.buildMikrotikInfoSnapshot(station, existing || {}, live || {});
+      const saved = await this.db.upsertMikrotikInfo(info);
+      return res.json({
+        success: true,
+        message: refresh ? "MikroTik information refreshed" : "MikroTik information fetched",
+        info: saved || info,
+        liveError: live?.liveError || "",
+      });
+    } catch (error) {
+      console.error("fetchMikrotikInfo error:", error);
+      return res.status(500).json({ success: false, message: "Failed to fetch MikroTik information." });
+    }
+  }
+
+  async saveMikrotikInfo(req, res) {
+    const { token, stationId, info } = req.body || {};
+    if (!token || !stationId || !info) {
+      return res.status(400).json({ success: false, message: "Token, stationId and info are required." });
+    }
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
+      if (auth.admin.role !== "superuser") return res.status(403).json({ success: false, message: "Unauthorised!" });
+
+      const platformID = auth.admin.platformID;
+      const station = await this.db.getStation(stationId);
+      if (!station || station.platformID !== platformID) {
+        return res.status(404).json({ success: false, message: "Station not found." });
+      }
+
+      const allowed = [
+        "managementIp", "username", "password", "apiPort", "webfigUrl",
+        "radiusAddress", "radiusSecret", "radiusAccountingPort", "radiusAuthPort",
+        "cpuUsage", "memoryUsage", "memoryUsed", "memoryTotal", "diskUsage", "diskUsed", "diskTotal",
+        "availabilityStatus", "uptimePercent", "monitoredPeriod", "totalDowntime", "currentUptime",
+        "routerOsVersion", "deviceName", "hardwareModel", "icmpLoss", "icmpResponseTime", "snmpAvailability",
+        "extra",
+      ];
+      const clean = { stationId, platformID };
+      for (const key of allowed) {
+        if (Object.prototype.hasOwnProperty.call(info, key)) clean[key] = info[key];
+      }
+      const saved = await this.db.upsertMikrotikInfo(clean);
+      return res.json({ success: true, message: "MikroTik information saved", info: saved });
+    } catch (error) {
+      console.error("saveMikrotikInfo error:", error);
+      return res.status(500).json({ success: false, message: "Failed to save MikroTik information." });
+    }
+  }
+
   async deleteStations(req, res) {
 
     const { token, id } = req.body;

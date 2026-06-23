@@ -14,8 +14,30 @@ const withTimeout = (promise, timeoutMs, message) => {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 };
 
+const parseArgs = () => {
+    const args = process.argv.slice(2);
+    const readValue = (name) => {
+        const prefix = `${name}=`;
+        const inline = args.find((arg) => arg.startsWith(prefix));
+        if (inline) return inline.slice(prefix.length).trim();
+        const index = args.indexOf(name);
+        if (index >= 0 && args[index + 1] && !args[index + 1].startsWith("--")) {
+            return args[index + 1].trim();
+        }
+        return "";
+    };
+
+    return {
+        apply: args.includes("--apply"),
+        platform: readValue("--platform"),
+        station: readValue("--station"),
+        stationId: readValue("--stationId") || readValue("--station-id"),
+    };
+};
+
 async function run() {
-    const apply = process.argv.includes("--apply");
+    const options = parseArgs();
+    const apply = options.apply;
     const db = new DataBase();
     const connectionManager = new MikrotikConnection();
     const controller = new Mikrotikcontroller();
@@ -27,11 +49,19 @@ async function run() {
         const host = String(station?.mikrotikHost || "").trim();
         const key = `${station?.platformID || ""}:${host}`;
         if (!host || seen.has(key)) continue;
+        if (options.platform && String(station?.platformID || "").trim() !== options.platform) continue;
+        if (options.station && host !== options.station) continue;
+        if (options.stationId && String(station?.id || "").trim() !== options.stationId) continue;
         seen.add(key);
         if (!getMikrotikRescueConfig(host).enabled) continue;
         targets.push(station);
     }
 
+    console.log("SSTP rescue rollout filter:", {
+        platform: options.platform || "all",
+        station: options.station || "all",
+        stationId: options.stationId || "all",
+    });
     console.log(`SSTP rescue rollout targets: ${targets.length}${apply ? "" : " (dry run; pass --apply to configure)"}`);
     if (!apply) return;
 
@@ -54,7 +84,7 @@ async function run() {
 
             const outcome = await withTimeout(
                 controller.ensureMikrotikRescue(connection.channel, host),
-                30000,
+                60000,
                 "Rescue configuration timed out"
             );
             if (!outcome?.success) throw new Error(outcome?.reason || "Rescue configuration was rejected");
