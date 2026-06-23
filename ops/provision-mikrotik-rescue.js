@@ -29,6 +29,7 @@ const parseArgs = () => {
 
     return {
         apply: args.includes("--apply"),
+        direct: args.includes("--direct"),
         platform: readValue("--platform"),
         station: readValue("--station"),
         stationId: readValue("--stationId") || readValue("--station-id"),
@@ -83,13 +84,15 @@ async function run() {
             }
 
             const outcome = await withTimeout(
-                controller.ensureMikrotikRescue(connection.channel, host),
-                60000,
-                "Rescue configuration timed out"
+                options.direct
+                    ? controller.ensureMikrotikRescue(connection.channel, host)
+                    : controller.installMikrotikRescueScript(connection.channel, host),
+                options.direct ? 60000 : 20000,
+                options.direct ? "Rescue configuration timed out" : "Rescue script upload timed out"
             );
             if (!outcome?.success) throw new Error(outcome?.reason || "Rescue configuration was rejected");
             results.configured += 1;
-            console.log(`[configured] ${host} -> ${outcome.rescueAddress}`);
+            console.log(`[configured] ${host} -> ${outcome.rescueAddress}${outcome.queued ? " (queued on router)" : ""}`);
         } catch (error) {
             results.failed += 1;
             console.error(`[failed] ${host}: ${error?.message || String(error)}`);

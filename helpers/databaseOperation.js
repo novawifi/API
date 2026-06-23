@@ -524,6 +524,28 @@ class DataBase {
         }
     }
 
+    async deleteRadiusUsers(usernames = []) {
+        const unique = Array.from(
+            new Set(
+                (Array.isArray(usernames) ? usernames : [])
+                    .map((username) => String(username || "").trim())
+                    .filter(Boolean)
+            )
+        );
+        if (unique.length === 0) return { deleted: 0 };
+        try {
+            await prisma.$transaction([
+                prisma.radcheck.deleteMany({ where: { username: { in: unique } } }),
+                prisma.radreply.deleteMany({ where: { username: { in: unique } } }),
+                prisma.radusergroup.deleteMany({ where: { username: { in: unique } } }),
+            ]);
+            return { deleted: unique.length };
+        } catch (error) {
+            console.error("Error bulk deleting RADIUS users:", error);
+            throw error;
+        }
+    }
+
     async getRadiusUsageByNasIps(nasIps = []) {
         if (!Array.isArray(nasIps) || nasIps.length === 0) {
             return { hotspot: { tx: 0, rx: 0 }, pppoe: { tx: 0, rx: 0 } };
@@ -2294,6 +2316,61 @@ class DataBase {
         }
     }
 
+    async getExpiredActivePlatformUsers(platformID, now = new Date()) {
+        if (!platformID) return [];
+        try {
+            return await prisma.user.findMany({
+                where: {
+                    status: "active",
+                    platformID,
+                    expireAt: { lte: now },
+                    package: {
+                        is: {
+                            category: { not: "Data" },
+                        },
+                    },
+                },
+                select: {
+                    id: true,
+                    username: true,
+                    code: true,
+                    mac: true,
+                    phone: true,
+                    expireAt: true,
+                    createdAt: true,
+                    status: true,
+                    packageID: true,
+                    package: {
+                        select: {
+                            category: true,
+                            routerHost: true,
+                        },
+                    },
+                },
+            });
+        } catch (error) {
+            console.error("Error getting expired active users:", error);
+            throw error;
+        }
+    }
+
+    async expireActiveUsersByIds(ids = []) {
+        const unique = Array.from(new Set((Array.isArray(ids) ? ids : []).filter(Boolean)));
+        if (unique.length === 0) return { count: 0 };
+        try {
+            return await prisma.user.updateMany({
+                where: {
+                    id: { in: unique },
+                    status: "active",
+                },
+                data: { status: "expired" },
+            });
+        } catch (error) {
+            console.error("Error bulk expiring users:", error);
+            throw error;
+        }
+    }
+
     async getRecentlyActivePlatformUsers(platformID) {
         if (!platformID) return null;
         try {
@@ -2569,6 +2646,31 @@ class DataBase {
         }
     }
 
+    async getPackageByOfflinePaymentReference(platformID, reference, amount = null) {
+        if (!platformID || !reference) return null;
+        const value = String(reference).trim();
+        if (!value) return null;
+        const amountVariants = this.getAmountVariants(amount);
+        try {
+            const pkg = await prisma.package.findFirst({
+                where: {
+                    platformID,
+                    OR: [
+                        { id: value },
+                        { accountNumber: value },
+                        { name: { equals: value, mode: "insensitive" } },
+                        { routerHost: value },
+                    ],
+                    ...(amountVariants.length ? { price: { in: amountVariants } } : {}),
+                },
+            });
+            return pkg;
+        } catch (error) {
+            console.log("An error occured", error);
+            return false;
+        }
+    }
+
     async getPPPoEByAccountNumber(platformID, accountNumber) {
         if (!platformID || !accountNumber) return null;
         try {
@@ -2582,6 +2684,83 @@ class DataBase {
         } catch (error) {
             console.log("An error occured", error);
             return false;
+        }
+    }
+
+    getAmountVariants(amount) {
+        if (amount === null || amount === undefined || amount === "") return [];
+        const raw = String(amount).trim();
+        const numeric = Number(raw);
+        const variants = [raw];
+        if (Number.isFinite(numeric)) {
+            variants.push(String(numeric));
+            variants.push(numeric.toFixed(0));
+            variants.push(numeric.toFixed(1));
+            variants.push(numeric.toFixed(2));
+        }
+        return Array.from(new Set(variants.filter(Boolean)));
+    }
+
+    async getPPPoEByOfflinePaymentReference(platformID, reference, amount = null) {
+        if (!platformID || !reference) return null;
+        const value = String(reference).trim();
+        if (!value) return null;
+        const amountVariants = this.getAmountVariants(amount);
+        try {
+            const pppoe = await prisma.pppoe.findFirst({
+                where: {
+                    platformID,
+                    OR: [
+                        { id: value },
+                        { paymentLink: value },
+                        { accountNumber: value },
+                        { clientname: { equals: value, mode: "insensitive" } },
+                        { name: { equals: value, mode: "insensitive" } },
+                    ],
+                    ...(amountVariants.length ? {
+                        OR: [
+                            { id: value },
+                            { paymentLink: value },
+                            { accountNumber: value },
+                            { clientname: { equals: value, mode: "insensitive" } },
+                            { name: { equals: value, mode: "insensitive" } },
+                        ],
+                        AND: [{
+                            OR: [
+                                { amount: { in: amountVariants } },
+                                { price: { in: amountVariants } },
+                            ],
+                        }],
+                    } : {}),
+                },
+            });
+            return pppoe;
+        } catch (error) {
+            console.log("An error occured", error);
+            return false;
+        }
+    }
+
+    async findRecentMpesaIntentByPhoneAmount(platformID, phone, amount, minutes = 180) {
+        if (!platformID || !phone || amount === null || amount === undefined) return null;
+        const amountVariants = this.getAmountVariants(amount);
+        if (amountVariants.length === 0) return null;
+        const since = new Date(Date.now() - Number(minutes || 180) * 60 * 1000);
+        try {
+            return await prisma.mpesa.findFirst({
+                where: {
+                    platformID,
+                    phone: String(phone),
+                    amount: { in: amountVariants },
+                    service: { in: ["hotspot", "pppoe"] },
+                    status: { in: ["PENDING", "PROCESSING", "FAILED"] },
+                    createdAt: { gte: since },
+                },
+                orderBy: { createdAt: "desc" },
+            });
+        } catch (error) {
+            console.log("An error occured", error);
+            return null;
         }
     }
 

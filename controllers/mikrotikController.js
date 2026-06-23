@@ -266,6 +266,60 @@ class Mikrotikcontroller {
         };
     }
 
+    async installMikrotikRescueScript(channel, routerHost) {
+        const config = getMikrotikRescueConfig(routerHost);
+        if (!config.enabled) {
+            return { success: false, configured: false, reason: config.reason };
+        }
+
+        const scriptName = "nova-rescue-install";
+        const schedulerName = "nova-rescue-install-run";
+        const source = buildMikrotikRescueScript(config).join("\n");
+        const runner = [
+            `:do { /system/script/run [find name="${scriptName}"] } on-error={}`,
+            `:delay 2s`,
+            `:do { /system/scheduler/remove [find name="${schedulerName}"] } on-error={}`,
+        ].join("; ");
+
+        const existingScripts = await channel.write("/system/script/print", [`?name=${scriptName}`]).catch(() => []);
+        for (const script of Array.isArray(existingScripts) ? existingScripts : []) {
+            if (script?.[".id"]) {
+                await channel.write("/system/script/remove", [`=.id=${script[".id"]}`]).catch(() => null);
+            }
+        }
+        const existingSchedulers = await channel.write("/system/scheduler/print", [`?name=${schedulerName}`]).catch(() => []);
+        for (const scheduler of Array.isArray(existingSchedulers) ? existingSchedulers : []) {
+            if (scheduler?.[".id"]) {
+                await channel.write("/system/scheduler/remove", [`=.id=${scheduler[".id"]}`]).catch(() => null);
+            }
+        }
+
+        await channel.write("/system/script/add", [
+            `=name=${scriptName}`,
+            `=source=${source}`,
+            "=policy=read,write,test,password,sensitive",
+            "=comment=Nova rescue SSTP installer",
+        ]);
+
+        await channel.write("/system/scheduler/add", [
+            `=name=${schedulerName}`,
+            "=interval=5s",
+            `=on-event=${runner}`,
+            "=policy=read,write,test,password,sensitive",
+            "=disabled=no",
+            "=comment=Nova rescue SSTP one-shot installer",
+        ]);
+
+        return {
+            success: true,
+            configured: true,
+            queued: true,
+            rescueAddress: config.rescueAddress,
+            scriptName,
+            schedulerName,
+        };
+    }
+
     async configureMikrotikRescue(req, res) {
         const auth = await this.authenticateStationRequest(req);
         if (!auth.success) {
@@ -6527,6 +6581,12 @@ function autoLogin() {
         }
 
         const { phone, packageID, platformID, code, mac, token } = data;
+        if (/^ws_CO_/i.test(String(code || "").trim())) {
+            return {
+                success: false,
+                message: "Invalid voucher code: M-Pesa checkout request IDs cannot be used as user codes.",
+            };
+        }
         const stationId = data?.stationId || data?.stationID;
         const stationHostFromPayload =
             data?.routerHost ||

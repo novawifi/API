@@ -5404,7 +5404,9 @@ class Controller {
           }
         }
 
-        await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+        this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
+          console.error("Dashboard stats refresh after addCode failed:", err?.message || err);
+        });
         return res.json({
           success: true,
           message: "Code added successfully",
@@ -7901,8 +7903,9 @@ class Controller {
         );
         if (mpesaPayments?.length > 0) {
           for (const payment of mpesaPayments) {
-            if (!payment?.code || !payment?.reason) continue;
-            const existing = await this.db.getUserByCodeAndPlatform(payment.code, platformID);
+            const paidCode = String(payment?.mpesaReceiptNumber || payment?.code || "").trim();
+            if (!paidCode || /^ws_CO_/i.test(paidCode) || !payment?.reason) continue;
+            const existing = await this.db.getUserByCodeAndPlatform(paidCode, platformID);
             if (existing && existing.status === "active" && (!existing.expireAt || moment(existing.expireAt).isAfter(moment()))) {
               foundcodes.push(existing);
               continue;
@@ -7915,7 +7918,7 @@ class Controller {
               platformID: payment.platformID,
               package: pkg,
               routerHost: pkg.routerHost,
-              code: payment.code.trim(),
+              code: paidCode,
               mac: "null",
               token: "null",
             };

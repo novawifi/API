@@ -456,6 +456,48 @@ test("concurrent STK success loser returns without fulfillment", async () => {
     assert.equal(res.payload.message, "Already processing.");
 });
 
+test("successful STK callback without receipt does not create voucher from checkout id", async () => {
+    const controller = new MpesaController();
+    let completed = false;
+    const updates = [];
+    controller.completePaymentForService = async () => {
+        completed = true;
+        return { status: "COMPLETE" };
+    };
+    controller.db = {
+        getMpesaByCheckoutRequestId: async () => ({
+            id: "pay-1",
+            platformID: "plat-1",
+            status: "PENDING",
+            service: "hotspot",
+            reason: "pkg-1",
+        }),
+        claimMpesaForSuccessfulFinalization: async () => true,
+        updateMpesaCodeByID: async (_id, data) => {
+            updates.push(data);
+            return data;
+        },
+    };
+    const res = createJsonResponse();
+    await controller.callBack({
+        body: { Body: { stkCallback: {
+            CheckoutRequestID: "ws_CO_no_receipt",
+            MerchantRequestID: "mr-1",
+            ResultCode: "0",
+            ResultDesc: "Success",
+            CallbackMetadata: { Item: [
+                { Name: "Amount", Value: 10 },
+                { Name: "PhoneNumber", Value: 254700000000 },
+            ] },
+        } } },
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.payload.success, false);
+    assert.equal(completed, false);
+    assert.equal(updates.at(-1).status, "MANUAL_REVIEW");
+    assert.match(updates.at(-1).lastReconciliationError, /checkout request id/i);
+});
+
 test("unknown CheckoutRequestID is acknowledged without creating a payment", async () => {
     const controller = new MpesaController();
     controller.db = { getMpesaByCheckoutRequestId: async () => null };

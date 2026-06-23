@@ -468,20 +468,14 @@ class CronJob {
         const routers = await this.db.getStations(platformID);
         if (!routers || routers.length === 0) return;
 
-        const users = await this.db.getActivePlatformUsers(platformID);
-        if (!users || users.length === 0) return;
-
-        const expiredUsers = users.filter((user) => {
-            if (!user.expireAt) return false;
-            if (user.package?.category === "Data") return false;
-            const expireAt = new Date(user.expireAt);
-            return expireAt <= now;
-        });
+        const expiredUsers = await this.db.getExpiredActivePlatformUsers(platformID, now);
         if (expiredUsers.length === 0) return;
 
-        await Promise.all(
-            expiredUsers.map((user) => this.db.updateUser(user.id, { status: "expired" }))
-        );
+        await this.db.expireActiveUsersByIds(expiredUsers.map((user) => user.id));
+        socketManager.log(platformID, `Cron: marked ${expiredUsers.length} hotspot users expired in database`, {
+            context: "cron",
+            level: "info",
+        });
 
         const stationByHost = new Map(
             routers
@@ -499,20 +493,14 @@ class CronJob {
         const apiExpiredUsers = expiredUsers.filter((user) => !isRadiusUser(user));
 
         if (radiusExpiredUsers.length > 0) {
-            for (const user of radiusExpiredUsers) {
-                const identifiers = Array.from(
-                    new Set(
-                        [user.username, user.code, user.mac]
-                            .filter((value) => typeof value === "string" && value !== "null" && value.trim() !== "")
-                    )
-                );
-                for (const username of identifiers) {
-                    try {
-                        await this.db.deleteRadiusUser(username);
-                    } catch {
-                        // Ignore per-user radius cleanup errors
-                    }
-                }
+            const identifiers = radiusExpiredUsers.flatMap((user) =>
+                [user.username, user.code, user.mac]
+                    .filter((value) => typeof value === "string" && value !== "null" && value.trim() !== "")
+            );
+            try {
+                await this.db.deleteRadiusUsers(identifiers);
+            } catch {
+                // Ignore radius cleanup errors; DB status is already expired.
             }
         }
 
