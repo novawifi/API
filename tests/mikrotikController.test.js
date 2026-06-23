@@ -52,8 +52,13 @@ test("collectBandwidthSamples collects per-station API and RADIUS counters", asy
             { id: "api-station", mikrotikHost: "10.10.10.2", systemBasis: "API" },
             { id: "radius-station", mikrotikHost: "10.10.10.3", radiusClientIp: "192.0.2.3", systemBasis: "RADIUS" },
         ]),
-        getRadiusBandwidthCounters: async (ips) => {
-            assert.deepEqual(ips, ["192.0.2.3", "10.10.10.3"]);
+        getRadiusUsernamesForStation: async (platformID, host) => {
+            assert.equal(platformID, "plat-1");
+            assert.equal(host, "10.10.10.3");
+            return ["radius-user"];
+        },
+        getRadiusBandwidthCountersByUsernames: async (usernames) => {
+            assert.deepEqual(usernames, ["radius-user"]);
             return [{ acctuniqueid: "rad-1", framedprotocol: "PPP", acctinputoctets: 30n, acctoutputoctets: 40n }];
         },
     };

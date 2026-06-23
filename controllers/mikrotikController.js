@@ -20,7 +20,7 @@ const { Mailer } = require("./mailerController");
 const { SMS } = require("./smsController");
 const { Auth } = require("./authController");
 const cache = require("../utils/cache");
-const { ensureRadiusClient, getRadiusClientIp, getRadiusServerIp } = require("../utils/radiusConfig");
+const { ensureRadiusClient, getRadiusClientIp, getRadiusClientSecret, getRadiusServerIp } = require("../utils/radiusConfig");
 const { apiCounterKey, radiusCounterKey, readBytes } = require("../utils/bandwidth");
 
 class Mikrotikcontroller {
@@ -4637,7 +4637,7 @@ function autoLogin() {
                     clientName = generateName();
                 }
                 session.radiusClientName = clientName;
-                session.radiusClientSecret = session.radiusClientSecret || crypto.randomBytes(12).toString("hex");
+                session.radiusClientSecret = getRadiusClientSecret(session.radiusClientSecret || crypto.randomBytes(12).toString("hex"));
                 session.radiusServerIp = radiusServerIp;
                 this.routerAutoSessions.set(token, session);
             }
@@ -5525,16 +5525,10 @@ function autoLogin() {
             try {
                 if (!station?.id) continue;
                 const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
-                const ipCandidates = [
-                    station?.radiusClientIp,
-                    station?.mikrotikPublicHost,
-                    station?.mikrotikHost,
-                ].filter(Boolean).map((val) => String(val).trim());
-                const ipRegex = /^(?:\d{1,3}\.){3}\d{1,3}$/;
-                const nasIps = Array.from(new Set(ipCandidates.filter((val) => ipRegex.test(val))));
 
                 if (isRadius) {
-                    const rows = await this.db.getRadiusBandwidthCounters(nasIps);
+                    const usernames = await this.db.getRadiusUsernamesForStation(platformID, station.mikrotikHost);
+                    const rows = await this.db.getRadiusBandwidthCountersByUsernames(usernames);
                     for (const row of rows) {
                         const counterKey = radiusCounterKey(row);
                         if (!counterKey) continue;

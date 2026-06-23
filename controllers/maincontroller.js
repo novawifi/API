@@ -22,7 +22,7 @@ const { Mikrotikcontroller } = require("./mikrotikController");
 const { MpesaController } = require("./mpesaController");
 const { socketManager } = require("./socketController");
 const cache = require("../utils/cache");
-const { ensureRadiusClient, getRadiusClientIp, getRadiusServerIp, isWireGuardMikrotikIp, removeRadiusClient } = require("../utils/radiusConfig");
+const { ensureRadiusClient, getRadiusClientIp, getRadiusClientSecret, getRadiusServerIp, removeRadiusClient } = require("../utils/radiusConfig");
 const { WebdockService } = require("../services/webdockService");
 
 class Controller {
@@ -942,10 +942,18 @@ class Controller {
           let mikrotikFailed = true;
           let codes = result?.rows || [];
           const stations = await this.db.getStations(platformID);
+          const stationAliasMap = new Map();
+          for (const st of Array.isArray(stations) ? stations : []) {
+            const canonicalHost = st?.mikrotikHost || st?.name || st?.id || "";
+            for (const alias of this.db.stationRouterAliases(st)) {
+              stationAliasMap.set(alias, canonicalHost);
+            }
+          }
           const stationsToCheck = station
-            ? stations.filter((s) => s.mikrotikHost === station)
+            ? stations.filter((s) => this.db.stationRouterAliases(s).includes(station))
             : stations;
           for (const st of stationsToCheck) {
+            if (String(st?.systemBasis || "").toUpperCase() === "RADIUS") continue;
             const activeRes = await this.mikrotik.checkHotspotUserStatus(platformID, st.mikrotikHost);
             if (activeRes.success) {
               mikrotikFailed = false;
@@ -957,9 +965,10 @@ class Controller {
             const newCodes = await Promise.all(
               codes.map(async (code) => {
                 const pkg = code.package;
+                const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
                 return {
                   ...code,
-                  station: pkg?.routerHost,
+                  station: rowStation,
                   package: pkg?.name,
                   active: "Offline",
                 };
@@ -972,10 +981,11 @@ class Controller {
           const newCodes = [];
           for (const code of codes) {
             const pkg = code.package;
+            const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
             if (code.status !== "active") {
               newCodes.push({
                 ...code,
-                station: pkg?.routerHost,
+                station: rowStation,
                 package: pkg?.name,
                 active: "Offline",
               });
@@ -985,7 +995,7 @@ class Controller {
             const isActive = allActiveUsers.some(u => u.user === code.username);
             newCodes.push({
               ...code,
-              station: pkg?.routerHost,
+              station: rowStation,
               package: pkg?.name,
               active: isActive ? "Online" : "Offline",
             });
@@ -3080,58 +3090,62 @@ class Controller {
       const stations = await this.db.getStations(platformID);
       const codes = await this.db.getUserByPlatformToday(platformID);
 
-      let allActiveUsers = [];
-      let mikrotikFailed = true;
+      const stationByHost = new Map(
+        (stations || []).map((station) => [station.mikrotikHost, station])
+      );
+      const apiStations = (stations || []).filter(
+        (station) => String(station?.systemBasis || "API").toUpperCase() !== "RADIUS"
+      );
+      const radiusUsernames = (codes || [])
+        .filter((code) => {
+          const station = stationByHost.get(code.package?.routerHost);
+          return String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+        })
+        .map((code) => code.username)
+        .filter(Boolean);
+      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames);
 
-      for (const station of stations) {
+      let allActiveUsers = [];
+      let reachableApiStations = 0;
+
+      for (const station of apiStations) {
         const activeRes = await this.mikrotik.checkHotspotUserStatus(platformID, station.mikrotikHost);
         if (activeRes.success) {
-          mikrotikFailed = false;
+          reachableApiStations += 1;
           allActiveUsers = allActiveUsers.concat(activeRes.users);
         }
-      }
-
-      if (mikrotikFailed) {
-        const newCodes = await Promise.all(
-          codes.map(async (code) => {
-            const pkg = code.package;
-            return {
-              ...code,
-              station: pkg?.routerHost,
-              package: pkg?.name,
-              active: "Offline",
-            };
-          })
-        );
-
-        const response = {
-          success: true,
-          message: "MikroTik unreachable, forced Offline for all",
-          codes: newCodes,
-        };
-        this.cache.set(cacheKey, response, 15000);
-        return res.json(response);
       }
 
       const newCodes = [];
       for (const code of codes) {
         const pkg = code.package;
+        const station = stationByHost.get(pkg?.routerHost);
+        const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+        const userRadiusUsage = isRadius
+          ? radiusUsage[code.username] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+          : null;
         if (code.status !== "active") {
           newCodes.push({
             ...code,
             station: pkg?.routerHost,
             package: pkg?.name,
             active: "Offline",
+            systemBasis: isRadius ? "RADIUS" : "API",
+            bandwidthUsage: userRadiusUsage,
           });
           continue;
         }
 
-        const isActive = allActiveUsers.some(u => u.user === code.username);
+        const isActive = isRadius
+          ? Boolean(userRadiusUsage?.online)
+          : allActiveUsers.some(u => u.user === code.username);
         newCodes.push({
           ...code,
           station: pkg?.routerHost,
           package: pkg?.name,
           active: isActive ? "Online" : "Offline",
+          systemBasis: isRadius ? "RADIUS" : "API",
+          bandwidthUsage: userRadiusUsage,
         });
       }
 
@@ -3139,7 +3153,9 @@ class Controller {
       const pagedCodes = newCodes.slice(offset, offset + limit);
       const response = {
         success: true,
-        message: "Codes fetched",
+        message: apiStations.length > 0 && reachableApiStations === 0
+          ? "Codes fetched; API MikroTik stations are unreachable"
+          : "Codes fetched",
         codes: pagedCodes,
         total,
         limit,
@@ -4433,7 +4449,7 @@ class Controller {
             radiusClientName = genName();
           }
           newData.radiusClientName = radiusClientName;
-          newData.radiusClientSecret = newData.radiusClientSecret || crypto.randomBytes(12).toString("hex");
+          newData.radiusClientSecret = getRadiusClientSecret(newData.radiusClientSecret || crypto.randomBytes(12).toString("hex"));
           const serverIp = getRadiusServerIp();
           newData.radiusServerIp = serverIp;
         }
@@ -4453,7 +4469,7 @@ class Controller {
             radiusClientName = genName();
           }
           updData.radiusClientName = radiusClientName;
-          updData.radiusClientSecret = updData.radiusClientSecret || station?.radiusClientSecret || crypto.randomBytes(12).toString("hex");
+          updData.radiusClientSecret = getRadiusClientSecret(updData.radiusClientSecret || station?.radiusClientSecret || crypto.randomBytes(12).toString("hex"));
           const serverIp = getRadiusServerIp();
           updData.radiusServerIp = serverIp;
         }
@@ -4667,7 +4683,7 @@ class Controller {
       while (existingNames.has(radiusClientName)) {
         radiusClientName = genName();
       }
-      const radiusClientSecret = crypto.randomBytes(12).toString("hex");
+      const radiusClientSecret = getRadiusClientSecret(crypto.randomBytes(12).toString("hex"));
       const radiusServerIp = getRadiusServerIp();
 
       return res.json({
@@ -11252,7 +11268,7 @@ class Controller {
           clientName = generateName();
         }
         existingNames.add(clientName);
-        const clientSecret = station.radiusClientSecret || crypto.randomBytes(12).toString("hex");
+        const clientSecret = getRadiusClientSecret(station.radiusClientSecret || crypto.randomBytes(12).toString("hex"));
         const publicIp = await this.resolveStationPublicIp(station);
         const radiusClientIp = getRadiusClientIp(station, publicIp || station.radiusClientIp || "");
         if (!radiusClientIp) {

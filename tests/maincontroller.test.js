@@ -24,6 +24,59 @@ const createJsonResponse = () => ({
     },
 });
 
+test("fetchCodes returns per-user RADIUS usage without opening RouterOS API", async () => {
+    const controller = new Controller();
+    let routerChecks = 0;
+    controller.auth = {
+        AuthenticateRequest: async () => ({ success: true, admin: { platformID: "plat-1" } }),
+    };
+    controller.cache = { get: () => null, set: () => {} };
+    controller.db = {
+        getStations: async () => ([
+            { id: "station-1", mikrotikHost: "router-1", systemBasis: "RADIUS" },
+        ]),
+        getUserByPlatformToday: async () => ([
+            {
+                id: "user-1",
+                username: "voucher-1",
+                status: "active",
+                package: { name: "5 Mbps", routerHost: "router-1" },
+            },
+        ]),
+        getRadiusUsageDetailsByUsernames: async (usernames) => {
+            assert.deepEqual(usernames, ["voucher-1"]);
+            return {
+                "voucher-1": {
+                    uploadBytes: 1024,
+                    downloadBytes: 4096,
+                    totalBytes: 5120,
+                    online: true,
+                },
+            };
+        },
+    };
+    controller.mikrotik = {
+        checkHotspotUserStatus: async () => {
+            routerChecks += 1;
+            return { success: false, users: [] };
+        },
+    };
+
+    const res = createJsonResponse();
+    await controller.fetchCodes({ body: { token: "token", limit: 100, offset: 0 } }, res);
+
+    assert.equal(routerChecks, 0);
+    assert.equal(res.body.success, true);
+    assert.equal(res.body.codes[0].active, "Online");
+    assert.equal(res.body.codes[0].systemBasis, "RADIUS");
+    assert.deepEqual(res.body.codes[0].bandwidthUsage, {
+        uploadBytes: 1024,
+        downloadBytes: 4096,
+        totalBytes: 5120,
+        online: true,
+    });
+});
+
 test("verifyCodes returns stored RADIUS credentials for mixed-case hotspot usernames", async () => {
     const controller = new Controller();
     const lookups = [];

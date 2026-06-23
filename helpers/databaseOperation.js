@@ -590,6 +590,50 @@ class DataBase {
         }
     }
 
+    async getRadiusBandwidthCountersByUsernames(usernames = [], since = new Date(Date.now() - 60 * 60 * 1000)) {
+        const uniqueUsernames = [...new Set((usernames || []).map((value) => String(value || "").trim()).filter(Boolean))];
+        if (uniqueUsernames.length === 0) return [];
+        try {
+            return await prisma.radacct.findMany({
+                where: {
+                    username: { in: uniqueUsernames },
+                    OR: [
+                        { acctstoptime: null },
+                        { acctupdatetime: { gte: since } },
+                        { acctstoptime: { gte: since } },
+                    ],
+                },
+                select: {
+                    radacctid: true,
+                    acctsessionid: true,
+                    acctuniqueid: true,
+                    username: true,
+                    framedprotocol: true,
+                    servicetype: true,
+                    acctinputoctets: true,
+                    acctoutputoctets: true,
+                },
+            });
+        } catch (error) {
+            console.error("Error fetching RADIUS bandwidth counters by usernames:", error);
+            throw error;
+        }
+    }
+
+    async getRadiusUsernamesForStation(platformID, routerHost) {
+        if (!platformID || !routerHost) return [];
+        const routerHosts = await this.resolveStationRouterHosts(platformID, routerHost);
+        const rows = await prisma.user.findMany({
+            where: {
+                platformID,
+                package: { routerHost: { in: routerHosts } },
+                username: { not: null },
+            },
+            select: { username: true },
+        });
+        return rows.map((row) => row.username).filter(Boolean);
+    }
+
     async applyBandwidthSamples(samples, observedAt = new Date()) {
         if (!Array.isArray(samples) || samples.length === 0) return [];
         const day = new Date(observedAt);
@@ -701,6 +745,54 @@ class DataBase {
             return totals;
         } catch (error) {
             console.error("Error aggregating RADIUS usage by usernames:", error);
+            return {};
+        }
+    }
+
+    async getRadiusUsageDetailsByUsernames(usernames = []) {
+        if (!Array.isArray(usernames) || usernames.length === 0) return {};
+        const uniqueUsernames = [...new Set(usernames.map((value) => String(value || "").trim()).filter(Boolean))];
+        if (uniqueUsernames.length === 0) return {};
+
+        try {
+            const [usageRows, activeRows] = await Promise.all([
+                prisma.radacct.groupBy({
+                    by: ["username"],
+                    where: { username: { in: uniqueUsernames } },
+                    _sum: {
+                        acctinputoctets: true,
+                        acctoutputoctets: true,
+                    },
+                }),
+                prisma.radacct.findMany({
+                    where: {
+                        username: { in: uniqueUsernames },
+                        acctstoptime: null,
+                    },
+                    select: { username: true },
+                    distinct: ["username"],
+                }),
+            ]);
+
+            const activeUsernames = new Set(activeRows.map((row) => row.username));
+            const usage = Object.fromEntries(uniqueUsernames.map((username) => [
+                username,
+                { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: activeUsernames.has(username) },
+            ]));
+
+            for (const row of usageRows) {
+                const uploadBytes = Number(row._sum?.acctinputoctets || 0n);
+                const downloadBytes = Number(row._sum?.acctoutputoctets || 0n);
+                usage[row.username] = {
+                    uploadBytes,
+                    downloadBytes,
+                    totalBytes: uploadBytes + downloadBytes,
+                    online: activeUsernames.has(row.username),
+                };
+            }
+            return usage;
+        } catch (error) {
+            console.error("Error fetching detailed RADIUS usage by usernames:", error);
             return {};
         }
     }
@@ -2536,6 +2628,32 @@ class DataBase {
             console.log("An error occured", error);
             return false;
         }
+    }
+
+    stationRouterAliases(station) {
+        if (!station) return [];
+        return [
+            station.mikrotikHost,
+            station.mikrotikPublicHost,
+            station.mikrotikDDNS,
+            station.radiusClientIp,
+            station.radiusClientName,
+            station.name,
+            station.id,
+        ]
+            .map((value) => String(value || "").trim())
+            .filter(Boolean);
+    }
+
+    async resolveStationRouterHosts(platformID, station) {
+        const selected = String(station || "").trim();
+        if (!selected) return [];
+        const stations = (await this.getStations(platformID)) || [];
+        const stationRecord = stations.find((item) =>
+            this.stationRouterAliases(item).includes(selected)
+        );
+        if (!stationRecord) return [selected];
+        return Array.from(new Set(this.stationRouterAliases(stationRecord)));
     }
 
     async getAdminStations() {
@@ -5782,11 +5900,14 @@ class DataBase {
     }
 
 	    async searchUsers({ platformID, search, station, limit, offset }) {
+            const stationRouterHosts = station
+                ? await this.resolveStationRouterHosts(platformID, station)
+                : [];
 	        const where = {
 	            platformID,
 	            ...(station && {
 	                package: {
-	                    is: { routerHost: station },
+	                    is: { routerHost: { in: stationRouterHosts } },
 	                },
 	            }),
 	            ...(search && {

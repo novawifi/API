@@ -1,4 +1,3 @@
-// @ts-check
 
 const { execFile } = require("child_process");
 const fsp = require("fs").promises;
@@ -25,22 +24,21 @@ const getClientsConfCandidates = () => {
 const getRadiusServiceName = () =>
   process.env.RADIUS_SERVICE_NAME || "freeradius";
 
-const isWireGuardMikrotikIp = (value) =>
-  /^10\.10\.10\.(?:[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/.test(String(value || "").trim());
-
 const getRadiusServerIp = () =>
   (
-    process.env.RADIUS_SERVER_WIREGUARD_IP ||
-    process.env.RADIUS_INTERNAL_SERVER_IP ||
-    process.env.WIREGUARD_SERVER_IP ||
-    "10.10.10.1"
+    process.env.RADIUS_SERVER_PUBLIC_IP ||
+    process.env.RADIUS_SERVER_IP ||
+    ""
   ).toString().split(":")[0];
 
+const getRadiusClientSecret = (fallbackSecret = "") =>
+  String(process.env.RADIUS_SHARED_SECRET || fallbackSecret || "").trim();
+
 const getRadiusClientIp = (stationOrHost, fallbackIp = "") => {
-  const host = typeof stationOrHost === "string"
-    ? stationOrHost
-    : stationOrHost?.mikrotikHost;
-  if (isWireGuardMikrotikIp(host)) return String(host).trim();
+  const configuredClientIp = typeof stationOrHost === "object"
+    ? stationOrHost?.radiusClientIp
+    : "";
+  if (configuredClientIp) return String(configuredClientIp).trim();
   return String(fallbackIp || "").trim();
 };
 
@@ -126,10 +124,15 @@ const writeClientsConf = async (confPath, updatedContent) => {
     await runSudo(["/bin/cp", confPath, backupPath]);
     await runSudo(["/usr/bin/install", "-m", "640", "-o", "root", "-g", "freerad", tmpPath, confPath]);
     await runSudo(["/usr/sbin/freeradius", "-XC"]);
-    await runSudo(["/usr/bin/systemctl", "reload", getRadiusServiceName()]);
+    await runSudo(["-u", "freerad", "/usr/sbin/freeradius", "-XC"]);
+    await runSudo(["/usr/bin/systemctl", "restart", getRadiusServiceName()]);
+    await runSudo(["/usr/bin/systemctl", "is-active", "--quiet", getRadiusServiceName()]);
   } catch (error) {
     try {
       await runSudo(["/usr/bin/install", "-m", "640", "-o", "root", "-g", "freerad", backupPath, confPath]);
+      await runSudo(["-u", "freerad", "/usr/sbin/freeradius", "-XC"]);
+      await runSudo(["/usr/bin/systemctl", "restart", getRadiusServiceName()]);
+      await runSudo(["/usr/bin/systemctl", "is-active", "--quiet", getRadiusServiceName()]);
     } catch (restoreError) {
       throw new Error(`RADIUS configuration failed and rollback failed: ${restoreError}`);
     }
@@ -177,6 +180,15 @@ const ensureRadiusClient = async ({
 }) => {
   if (!name || !ip || !secret) {
     return { success: false, message: "Missing RADIUS client data" };
+  }
+
+  const catchAllCidr = String(process.env.RADIUS_CLIENT_CIDR || "").trim();
+  if (catchAllCidr) {
+    return {
+      success: true,
+      message: `RADIUS clients are managed by catch-all ${catchAllCidr}`,
+      updated: false,
+    };
   }
 
   const readResult = await readClientsConf();
@@ -234,8 +246,8 @@ const removeRadiusClient = async ({ name }) => {
 module.exports = {
   ensureRadiusClient,
   getRadiusClientIp,
+  getRadiusClientSecret,
   getRadiusServerIp,
-  isWireGuardMikrotikIp,
   updateClientIp,
   removeRadiusClient,
 };
