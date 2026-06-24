@@ -1845,16 +1845,22 @@ class MpesaController {
 
     async finalizeReconciledStkPayment(payment, queryResponse, source = "MPESA_QUERY") {
         const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
+        const storedReceipt = [payment.mpesaReceiptNumber, payment.code]
+            .map((value) => String(value || "").trim())
+            .find((value) => value && value !== "null" && !/^ws_CO_/i.test(value));
+        const localReceipt = storedReceipt || `NOVA-${String(payment.id || crypto.randomBytes(8).toString("hex")).replace(/[^a-zA-Z0-9]/g, "").slice(0, 12).toUpperCase()}`;
+        const metadataItems = [
+            { Name: "Amount", Value: Number(payment.amount) },
+            { Name: "PhoneNumber", Value: payment.phone },
+            { Name: "MpesaReceiptNumber", Value: localReceipt },
+        ];
         const callback = {
             MerchantRequestID: queryResponse?.MerchantRequestID || payment.merchantRequestId || "",
             CheckoutRequestID: checkoutRequestId,
             ResultCode: 0,
             ResultDesc: queryResponse?.ResultDesc || "Confirmed by M-PESA Express Query",
             CallbackMetadata: {
-                Item: [
-                    { Name: "Amount", Value: Number(payment.amount) },
-                    { Name: "PhoneNumber", Value: payment.phone },
-                ],
+                Item: metadataItems,
             },
         };
         let responseBody = null;

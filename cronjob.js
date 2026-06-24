@@ -37,6 +37,7 @@ class CronJob {
         this.pm2RestartRunning = false;
         this.mikrotikBackupRunning = false;
         this.webdockRunning = false;
+        this.pppoeSmsIssueNotifications = new Map();
 
         this.mikrotikConnectionPool = new Map();
         this.routerLocks = new Map();
@@ -103,6 +104,94 @@ class CronJob {
         } catch {
             return false;
         }
+    }
+
+    async notifyPPPoESMSIssue(platformID, reason, details = {}) {
+        if (!platformID || !reason) return;
+        const key = `${platformID}:${reason}`;
+        const now = Date.now();
+        const throttleMs = 6 * 60 * 60 * 1000;
+        if ((this.pppoeSmsIssueNotifications.get(key) || 0) + throttleMs > now) return;
+        this.pppoeSmsIssueNotifications.set(key, now);
+
+        const title = "PPPoE SMS reminders not sent";
+        const message = `${reason}${details.phone ? ` Phone: ${details.phone}.` : ""}${details.serviceId ? ` PPPoE: ${details.serviceId}.` : ""}`;
+        try {
+            await this.db.upsertPlatformNotification(platformID, title, {
+                message,
+                level: "warning",
+                type: "pppoe_sms",
+                metadata: details,
+            });
+        } catch (error) {
+            console.error("Failed to create PPPoE SMS notification:", error?.message || error);
+        }
+        socketManager.log(platformID, message, {
+            context: "cron",
+            level: "warn",
+        });
+    }
+
+    async sendPPPoESMS({ service, platform, type, expiresAt }) {
+        if (!service?.phone || !service?.platformID || !platform) return false;
+        const platformID = service.platformID;
+        const label = type === "expired" ? "expired notice" : "reminder";
+
+        const platformConfig = await this.db.getPlatformConfig(platformID);
+        if (platformConfig?.sms !== true) return false;
+
+        const sms = await this.db.getPlatformSMS(platformID);
+        if (!sms) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS skipped: SMS configuration was not found.`, { serviceId: service.id, phone: service.phone });
+            return false;
+        }
+        if (sms.sentPPPoE === false) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS skipped: PPPoE SMS sending is disabled.`, { serviceId: service.id, phone: service.phone });
+            return false;
+        }
+
+        const costPerSMS = Number(sms.costPerSMS || 0);
+        const balance = Number(sms.balance || 0);
+        const remainingSMS = Number(sms.remainingSMS || 0);
+        if (sms.default === true && Number.isFinite(costPerSMS) && Number.isFinite(balance) && balance < costPerSMS) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS skipped: insufficient SMS balance.`, { serviceId: service.id, phone: service.phone, balance, costPerSMS });
+            return false;
+        }
+        if (sms.default === true && Number.isFinite(remainingSMS) && remainingSMS < 1) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS skipped: no remaining SMS credits.`, { serviceId: service.id, phone: service.phone, remainingSMS });
+            return false;
+        }
+
+        const template = type === "expired" ? sms.pppoeExpiredSMS : sms.pppoeReminderSMS;
+        if (!template) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS skipped: SMS template is empty.`, { serviceId: service.id, phone: service.phone });
+            return false;
+        }
+
+        const smsMessage = Utils.formatMessage(template, {
+            company: platform.name,
+            username: service.clientname || service.name,
+            period: service.period,
+            expiry: expiresAt ? expiresAt.toDateString() : service.expiresAt || service.expireAt,
+            package: service.profile,
+            amount: service.amount,
+            paymentLink: `https://${platform.url}/pppoe?info=${service.paymentLink}`,
+            accountNumber: service.accountNumber || "",
+        });
+
+        const result = await this.sms.sendSMS(service.phone, smsMessage, sms);
+        if (!result?.success) {
+            await this.notifyPPPoESMSIssue(platformID, `PPPoE ${label} SMS failed to send: ${result?.message || "provider error"}`, { serviceId: service.id, phone: service.phone });
+            return false;
+        }
+
+        if (sms.default === true) {
+            await this.db.updatePlatformSMS(platformID, {
+                balance: (balance - costPerSMS).toString(),
+                remainingSMS: Math.max(Math.floor(remainingSMS) - 1, 0).toString()
+            });
+        }
+        return true;
     }
 
     async getMikrotikChannel(platformID, host) {
@@ -679,42 +768,11 @@ Price: KSH ${service.price}</p>
                                 company: platform.name
                             });
 
-                            await this.db.updatePPPoE(service.id, { reminderSent: true });
                         }
                         if (service.phone) {
-                            const platformConfig = await this.db.getPlatformConfig(service.platformID);
-                            if (platformConfig?.sms === true) {
-                                const sms = await this.db.getPlatformSMS(service.platformID);
-                                if (!sms) return { success: false, message: "SMS not found!" };
-                                if (sms && sms.sentPPPoE === false) return { success: false, message: "PPPoE SMS sending is disabled!" };
-                                if (Number(sms.balance) < Number(sms.costPerSMS)) return { success: false, message: "Insufficient SMS Balance!" };
-
-                                const platform = await this.db.getPlatform(service.platformID);
-                                if (!platform) return { success: false, message: "Platform not found!" };
-
-                                const sms_message = Utils.formatMessage(sms.pppoeReminderSMS, {
-                                    company: platform.name,
-                                    username: service.name,
-                                    period: service.period,
-                                    expiry: service.expireAt,
-                                    package: service.profile,
-                                    amount: service.amount,
-                                    paymentLink: `https://${platform.url}/pppoe?info=${service.paymentLink}`,
-                                    accountNumber: service.accountNumber || "",
-                                });
-
-                                const is_send = await this.sms.sendSMS(service.phone, sms_message, sms);
-                                if (is_send.success && sms?.default === true) {
-                                    const newSMSBalance = Number(sms.balance) - Number(sms.costPerSMS);
-                                    const newSMS = Math.floor(Number(sms.remainingSMS)) - 1;
-
-                                    await this.db.updatePlatformSMS(service.platformID, {
-                                        balance: newSMSBalance.toString(),
-                                        remainingSMS: newSMS.toString()
-                                    });
-                                }
-                            }
+                            await this.sendPPPoESMS({ service, platform, type: "reminder", expiresAt });
                         }
+                        await this.db.updatePPPoE(service.id, { reminderSent: true });
                     }
 
                     if (now > gracePeriodEnd && service.status === "active") {
@@ -756,38 +814,7 @@ Price: KSH ${service.price}</p>
                         }
 
                         if (service.phone) {
-                            const platformConfig = await this.db.getPlatformConfig(service.platformID);
-                            if (platformConfig?.sms === true) {
-                                const sms = await this.db.getPlatformSMS(service.platformID);
-                                if (!sms) return { success: false, message: "SMS not found!" };
-                                if (sms && sms.sentPPPoE === false) return { success: false, message: "PPPoE SMS sending is disabled!" };
-                                if (Number(sms.balance) < Number(sms.costPerSMS)) return { success: false, message: "Insufficient SMS Balance!" };
-
-                                const platform = await this.db.getPlatform(service.platformID);
-                                if (!platform) return { success: false, message: "Platform not found!" };
-
-                                const sms_message = Utils.formatMessage(sms.pppoeExpiredSMS, {
-                                    company: platform.name,
-                                    username: service.name,
-                                    period: service.period,
-                                    expiry: service.expireAt,
-                                    package: service.profile,
-                                    amount: service.amount,
-                                    paymentLink: `https://${platform.url}/pppoe?info=${service.paymentLink}`,
-                                    accountNumber: service.accountNumber || "",
-                                });
-
-                                const is_send = await this.sms.sendSMS(service.phone, sms_message, sms);
-                                if (is_send.success && sms?.default === true) {
-                                    const newSMSBalance = Number(sms.balance) - Number(sms.costPerSMS);
-                                    const newSMS = Math.floor(Number(sms.remainingSMS)) - 1;
-
-                                    await this.db.updatePlatformSMS(service.platformID, {
-                                        balance: newSMSBalance.toString(),
-                                        remainingSMS: newSMS.toString()
-                                    });
-                                }
-                            }
+                            await this.sendPPPoESMS({ service, platform, type: "expired", expiresAt });
                         }
                     }
                 } catch (error) {

@@ -101,9 +101,9 @@ class MpesaReconciliationService {
             : paymentOrId;
         if (!payment) return { state: "SKIPPED", paymentId: String(paymentOrId), reason: "Payment not found" };
         const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
-        if (!checkoutRequestId) return { state: "SKIPPED", paymentId: payment.id, reason: "Missing CheckoutRequestID" };
+        if (!checkoutRequestId) return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: "Missing CheckoutRequestID" };
         if (!["PENDING", "MANUAL_REVIEW"].includes(String(payment.status).toUpperCase())) {
-            return { state: "SKIPPED", paymentId: payment.id, reason: `Payment is ${payment.status}` };
+            return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: `Payment is ${payment.status}` };
         }
 
         const settings = this.getSettings();
@@ -129,7 +129,7 @@ class MpesaReconciliationService {
                     nextReconciliationAt: null,
                     reconciliationLeaseUntil: null,
                 });
-                return { state: "SUCCESS", paymentId: payment.id, checkoutRequestId, resultCode, resultDescription };
+                return { state: "SUCCESS", paymentId: payment.id, platformID: payment.platformID, checkoutRequestId, resultCode, resultDescription };
             }
 
             if (resultCode !== undefined) {
@@ -141,7 +141,7 @@ class MpesaReconciliationService {
                     nextReconciliationAt: null,
                     lastReconciliationError: null,
                 });
-                return { state: "FAILED", paymentId: payment.id, checkoutRequestId, resultCode, resultDescription };
+                return { state: "FAILED", paymentId: payment.id, platformID: payment.platformID, checkoutRequestId, resultCode, resultDescription };
             }
 
             const retryAt = retryAtForAttempt(attempt);
@@ -152,7 +152,7 @@ class MpesaReconciliationService {
                     ? `${resultDescription || "Safaricom has not returned a final ResultCode"}; payment remains pending.`
                     : (resultDescription || "Safaricom has not returned a final ResultCode."),
             });
-            return { state: "PENDING", paymentId: payment.id, checkoutRequestId, resultDescription, retryAt };
+            return { state: "PENDING", paymentId: payment.id, platformID: payment.platformID, checkoutRequestId, resultDescription, retryAt };
         } catch (error) {
             const message = String(error?.response?.data?.errorMessage || error?.message || "M-PESA query failed").slice(0, 500);
             const retryAt = retryAtForAttempt(attempt);
@@ -162,7 +162,7 @@ class MpesaReconciliationService {
                     ? `Safaricom query failed; payment remains pending: ${message}`
                     : message,
             });
-            return { state: "PENDING", paymentId: payment.id, checkoutRequestId, resultDescription: message, retryAt };
+            return { state: "PENDING", paymentId: payment.id, platformID: payment.platformID, checkoutRequestId, resultDescription: message, retryAt };
         }
     }
 
@@ -181,7 +181,7 @@ class MpesaReconciliationService {
                 const claimed = await this.db.claimMpesaReconciliation(payment.id, new Date(Date.now() + 60_000));
                 return claimed
                     ? this.reconcileMpesaPayment({ ...payment, status: "PENDING" }, source)
-                    : { state: "SKIPPED", paymentId: payment.id, reason: "Claimed by another worker" };
+                    : { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: "Claimed by another worker" };
             }));
             results.push(...chunkResults);
         }

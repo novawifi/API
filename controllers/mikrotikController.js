@@ -3053,7 +3053,9 @@ function autoLogin() {
                 planId: plan ? plan.id : client.planId,
             };
             const result = await this.db.updatePPPoE(id, pppoeData);
-            await this.pushDashboardStats(platformID);
+            this.pushDashboardStats(platformID).catch((err) =>
+                console.error("Failed to refresh dashboard stats after PPPoE update:", err?.message || err)
+            );
             return res.json({
                 success: true,
                 message: "PPPoE updated successfully",
@@ -3449,30 +3451,43 @@ function autoLogin() {
             const stationRecord = stations.find((s) => s.mikrotikHost === client.station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
             const clientname = client.clientname;
-            if (!isRadius) {
-                const connection = await this.config.createSingleMikrotikClient(platformID, client.station);
-                if (!connection?.channel) return res.json({ success: false, message: `No valid MikroTik connection` });
-                const { channel } = connection;
-                try {
-                    const secrets = await this.mikrotik.listSecrets(channel);
-                    const secret = secrets.find(s => s.name === clientname);
-                    if (secret) await this.mikrotik.deleteSecret(channel, secret['.id']);
-                } finally {
-                    await this.safeCloseChannel(channel);
-                }
-            } else {
-                await this.db.deleteRadiusUser(clientname);
-            }
             await this.db.deletePPPoE(id);
             this.cache.delPrefix(`main:pppoe:${platformID}:`);
             this.cache.delPrefix(`main:search:${platformID}:pppoe`);
-            const email = client.email;
-            const subject = `PPPoE Credentials deleted from ${platform.name}!`;
-            const message = `<p>Your PPPoE credentials have been deleted by <strong>${platform.name}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${client.clientpassword}</p><p>For more status and information about this service, visit:<br /><a href="https://${platform.url}/pppoe?info=${client.paymentLink}">https://${platform.url}/pppoe?info=${client.paymentLink}</a></p>`;
-            const data = { name: email, type: "accounts", email: email, subject: subject, message: message, company: platform.name };
-            const sendpppoeemail = await this.mailer.EmailTemplate(data);
-            await this.pushDashboardStats(platformID);
-            return res.status(200).json({ success: true, message: `PPPoE deleted successfully${sendpppoeemail.success ? "" : `. ${sendpppoeemail.message}`}` });
+
+            (async () => {
+                try {
+                    if (!isRadius) {
+                        const connection = await this.config.createSingleMikrotikClient(platformID, client.station);
+                        if (connection?.channel) {
+                            const { channel } = connection;
+                            try {
+                                const secrets = await this.mikrotik.listSecrets(channel);
+                                const secret = secrets.find(s => s.name === clientname);
+                                if (secret) await this.mikrotik.deleteSecret(channel, secret['.id']);
+                            } finally {
+                                await this.safeCloseChannel(channel);
+                            }
+                        }
+                    } else {
+                        await this.db.deleteRadiusUser(clientname);
+                    }
+
+                    const email = client.email;
+                    if (email) {
+                        const subject = `PPPoE Credentials deleted from ${platform.name}!`;
+                        const message = `<p>Your PPPoE credentials have been deleted by <strong>${platform.name}</strong>.</p><p><strong>-- PPPoE Credentials --</strong><br />Name: ${clientname}<br />Password: ${client.clientpassword}</p><p>For more status and information about this service, visit:<br /><a href="https://${platform.url}/pppoe?info=${client.paymentLink}">https://${platform.url}/pppoe?info=${client.paymentLink}</a></p>`;
+                        const data = { name: email, type: "accounts", email: email, subject: subject, message: message, company: platform.name };
+                        await this.mailer.EmailTemplate(data);
+                    }
+                } catch (err) {
+                    console.error("PPPoE delete cleanup failed:", err?.message || err);
+                }
+                this.pushDashboardStats(platformID).catch((err) =>
+                    console.error("Failed to refresh dashboard stats after PPPoE delete:", err?.message || err)
+                );
+            })();
+            return res.status(200).json({ success: true, message: "PPPoE deleted successfully" });
         } catch (error) {
             return res.status(500).json({ success: false, message: "An error occurred, try again!" });
         }

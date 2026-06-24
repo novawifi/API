@@ -952,25 +952,51 @@ class Controller {
           const stationsToCheck = station
             ? stations.filter((s) => this.db.stationRouterAliases(s).includes(station))
             : stations;
-          for (const st of stationsToCheck) {
-            if (String(st?.systemBasis || "").toUpperCase() === "RADIUS") continue;
+          const radiusHosts = new Set(
+            (Array.isArray(stations) ? stations : [])
+              .filter((item) => String(item?.systemBasis || "API").toUpperCase() === "RADIUS")
+              .map((item) => stationAliasMap.get(item?.mikrotikHost) || item?.mikrotikHost)
+              .filter(Boolean)
+          );
+          const radiusUsernames = codes
+            .filter((code) => {
+              const pkg = code.package;
+              const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
+              return radiusHosts.has(rowStation);
+            })
+            .map((code) => code.username)
+            .filter(Boolean);
+          const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
+            requireRecentActivity: false,
+          });
+          const apiStationsToCheck = stationsToCheck.filter(
+            (st) => String(st?.systemBasis || "API").toUpperCase() !== "RADIUS"
+          );
+          for (const st of apiStationsToCheck) {
             const activeRes = await this.mikrotik.checkHotspotUserStatus(platformID, st.mikrotikHost);
             if (activeRes.success) {
               mikrotikFailed = false;
               allActiveUsers = allActiveUsers.concat(activeRes.users);
             }
           }
+          if (apiStationsToCheck.length === 0) mikrotikFailed = false;
 
           if (mikrotikFailed) {
             const newCodes = await Promise.all(
               codes.map(async (code) => {
                 const pkg = code.package;
                 const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
+                const isRadius = radiusHosts.has(rowStation);
+                const userRadiusUsage = isRadius
+                  ? radiusUsage[code.username] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+                  : null;
                 return {
                   ...code,
                   station: rowStation,
                   package: pkg?.name,
-                  active: "Offline",
+                  active: isRadius && code.status === "active" && userRadiusUsage?.online ? "Online" : "Offline",
+                  systemBasis: isRadius ? "RADIUS" : "API",
+                  bandwidthUsage: userRadiusUsage,
                 };
               })
             );
@@ -982,22 +1008,32 @@ class Controller {
           for (const code of codes) {
             const pkg = code.package;
             const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
+            const isRadius = radiusHosts.has(rowStation);
+            const userRadiusUsage = isRadius
+              ? radiusUsage[code.username] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+              : null;
             if (code.status !== "active") {
               newCodes.push({
                 ...code,
                 station: rowStation,
                 package: pkg?.name,
                 active: "Offline",
+                systemBasis: isRadius ? "RADIUS" : "API",
+                bandwidthUsage: userRadiusUsage,
               });
               continue;
             }
 
-            const isActive = allActiveUsers.some(u => u.user === code.username);
+            const isActive = isRadius
+              ? Boolean(userRadiusUsage?.online)
+              : allActiveUsers.some(u => u.user === code.username);
             newCodes.push({
               ...code,
               station: rowStation,
               package: pkg?.name,
               active: isActive ? "Online" : "Offline",
+              systemBasis: isRadius ? "RADIUS" : "API",
+              bandwidthUsage: userRadiusUsage,
             });
           }
 
@@ -1062,7 +1098,9 @@ class Controller {
               .filter((row) => radiusHosts.has(row.station))
               .map((row) => row.clientname)
               .filter(Boolean);
-            const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames);
+      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
+        requireRecentActivity: false,
+      });
             const apiStationHosts = stationHosts.filter((host) => !radiusHosts.has(host));
             const statusResults = await Promise.all(
               apiStationHosts.map((host) =>
@@ -3120,7 +3158,9 @@ class Controller {
         })
         .map((code) => code.username)
         .filter(Boolean);
-      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames);
+      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
+        requireRecentActivity: false,
+      });
 
       let allActiveUsers = [];
       let reachableApiStations = 0;

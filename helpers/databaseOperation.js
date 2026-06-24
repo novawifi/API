@@ -782,10 +782,13 @@ class DataBase {
         }
     }
 
-    async getRadiusUsageDetailsByUsernames(usernames = []) {
+    async getRadiusUsageDetailsByUsernames(usernames = [], options = {}) {
         if (!Array.isArray(usernames) || usernames.length === 0) return {};
         const uniqueUsernames = [...new Set(usernames.map((value) => String(value || "").trim()).filter(Boolean))];
         if (uniqueUsernames.length === 0) return {};
+        const staleSeconds = Math.max(Number(process.env.RADIUS_ONLINE_STALE_SECONDS || 600), 60);
+        const onlineSince = new Date(Date.now() - staleSeconds * 1000);
+        const requireRecentActivity = options?.requireRecentActivity !== false;
 
         try {
             const [usageRows, activeRows] = await Promise.all([
@@ -801,6 +804,12 @@ class DataBase {
                     where: {
                         username: { in: uniqueUsernames },
                         acctstoptime: null,
+                        ...(requireRecentActivity ? {
+                            OR: [
+                                { acctupdatetime: { gte: onlineSince } },
+                                { acctstarttime: { gte: onlineSince } },
+                            ],
+                        } : {}),
                     },
                     select: { username: true },
                     distinct: ["username"],
@@ -1010,8 +1019,16 @@ class DataBase {
 
     async claimMpesaForSuccessfulFinalization(id) {
         if (!id) return false;
+        const staleProcessingAt = new Date(Date.now() - 5 * 60 * 1000);
         const result = await prisma.mpesa.updateMany({
-            where: { id, status: "PENDING" },
+            where: {
+                id,
+                OR: [
+                    { status: "PENDING" },
+                    { status: "MANUAL_REVIEW" },
+                    { status: "PROCESSING", updatedAt: { lt: staleProcessingAt } },
+                ],
+            },
             data: { status: "PROCESSING" },
         });
         if (result.count === 1) {
@@ -1240,6 +1257,46 @@ class DataBase {
             orderBy: { createdAt: "asc" },
             take: batchSize,
         });
+    }
+
+    async getMpesaManualReviewSummary() {
+        const [totalRows, queryableRows] = await Promise.all([
+            prisma.mpesa.groupBy({
+                by: ["platformID"],
+                where: { status: "MANUAL_REVIEW" },
+                _count: { _all: true },
+            }),
+            prisma.mpesa.groupBy({
+                by: ["platformID"],
+                where: {
+                    status: "MANUAL_REVIEW",
+                    checkoutRequestId: { not: null },
+                },
+                _count: { _all: true },
+            }),
+        ]);
+
+        const summary = new Map();
+        for (const row of totalRows) {
+            summary.set(row.platformID, {
+                platformID: row.platformID,
+                total: row._count?._all || 0,
+                queryable: 0,
+                missingCheckoutRequestId: row._count?._all || 0,
+            });
+        }
+        for (const row of queryableRows) {
+            const item = summary.get(row.platformID) || {
+                platformID: row.platformID,
+                total: 0,
+                queryable: 0,
+                missingCheckoutRequestId: 0,
+            };
+            item.queryable = row._count?._all || 0;
+            item.missingCheckoutRequestId = Math.max(item.total - item.queryable, 0);
+            summary.set(row.platformID, item);
+        }
+        return Array.from(summary.values());
     }
 
     async claimMpesaReconciliation(id, leaseUntil) {
