@@ -78,19 +78,23 @@ const buildMikrotikRescueScript = (config) => {
     const subnet = escapeRouterOsString(config.rescueSubnet);
     const ports = escapeRouterOsString(config.managementPorts);
     const bootstrap = `${watchdog}-bootstrap`;
+    const eventName = (value) => String(value || "").replace(/[^a-zA-Z0-9._-]/g, "");
+    const eventInterfaceName = eventName(name);
+    const eventWatchdogName = eventName(watchdog);
+    const eventBootstrapName = eventName(bootstrap);
     const watchdogEvent = [
-        `:local rescue [/interface/sstp-client/find name=${name}];`,
+        `:local rescue [/interface/sstp-client/find name=${eventInterfaceName}];`,
         `:if ([:len $rescue] > 0) do={`,
         `:local restart false;`,
         `:if ([/interface/sstp-client/get $rescue running] = false) do={ :set restart true };`,
-        `:if (!$restart) do={ :if ([/ping address=${gateway} interface=${name} count=3 interval=1s] = 0) do={ :set restart true } };`,
+        `:if (!$restart) do={ :if ([/ping address=${gateway} interface=${eventInterfaceName} count=3 interval=1s] = 0) do={ :set restart true } };`,
         `:if ($restart) do={ /interface/sstp-client disable $rescue; :delay 5s; /interface/sstp-client enable $rescue }`,
         `}`,
     ].join(" ");
     const bootstrapEvent = [
-        `:local rescue [/interface/sstp-client/find name=${name}];`,
+        `:local rescue [/interface/sstp-client/find name=${eventInterfaceName}];`,
         `:if ([:len $rescue] > 0) do={ /interface/sstp-client enable $rescue };`,
-        `:do { /system/scheduler remove [find name="${bootstrap}"] } on-error={}`,
+        `:do { /system/scheduler remove [find name=${eventBootstrapName}] } on-error={}`,
     ].join(" ");
 
     return [

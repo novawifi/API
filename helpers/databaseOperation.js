@@ -19,6 +19,39 @@ class DataBase {
         this.timestamp = offsetDate;
     }
 
+    getPrismaModelFields(modelName) {
+        const runtimeModel = prisma?._runtimeDataModel?.models?.[modelName];
+        if (runtimeModel?.fields) {
+            return new Set(runtimeModel.fields.map((field) => field.name));
+        }
+
+        const dmmfModel = Prisma?.dmmf?.datamodel?.models?.find((model) => model.name === modelName);
+        if (dmmfModel?.fields) {
+            return new Set(dmmfModel.fields.map((field) => field.name));
+        }
+
+        return null;
+    }
+
+    stripUnsupportedModelFields(modelName, data) {
+        if (!data || typeof data !== "object") return data;
+        const fields = this.getPrismaModelFields(modelName);
+        if (!fields) return { ...data };
+        return Object.fromEntries(
+            Object.entries(data).filter(([key]) => fields.has(key))
+        );
+    }
+
+    normalizePackageData(data) {
+        if (!data || typeof data !== "object") return data;
+        const next = { ...data };
+        const usageText = String(next.usage ?? "").trim();
+        if (!usageText || usageText.toLowerCase() === "null null" || usageText.toLowerCase() === "undefined undefined") {
+            next.usage = "Unlimited";
+        }
+        return this.stripUnsupportedModelFields("Package", next);
+    }
+
     getTodayRange() {
         const start = new Date();
         start.setHours(0, 0, 0, 0);
@@ -1776,9 +1809,7 @@ class DataBase {
         if (!data) return null;
         try {
             const pkg = await prisma.package.create({
-                data: {
-                    ...data,
-                },
+                data: this.normalizePackageData(data),
             });
             return pkg;
         } catch (error) {
@@ -1793,9 +1824,7 @@ class DataBase {
         try {
             const pkg = await prisma.package.update({
                 where: { id: id },
-                data: {
-                    ...data,
-                },
+                data: this.normalizePackageData(data),
             });
             return pkg;
         } catch (error) {
@@ -2276,7 +2305,13 @@ class DataBase {
         if (!platformID) return [];
         try {
             return prisma.mpesa.findMany({
-                where: { platformID },
+                where: {
+                    platformID,
+                    status: "COMPLETE",
+                    service: "hotspot",
+                    reason: { not: null },
+                    package: { isNot: null },
+                },
                 orderBy: { createdAt: "desc" },
                 take: Math.max(1, Math.min(Number(limit) || 5, 20)),
                 include: { package: true },
@@ -3515,7 +3550,7 @@ class DataBase {
         if (!data) return null;
         try {
             const created = await prisma.pppoe.create({
-                data
+                data: this.stripUnsupportedModelFields("Pppoe", data)
             })
             notifyPPPoEChanged(created, "upsert");
             return created;
@@ -3529,7 +3564,7 @@ class DataBase {
         if (!data) return null;
         try {
             const created = await prisma.pPPoEPlan.create({
-                data
+                data: this.stripUnsupportedModelFields("PPPoEPlan", data)
             });
             notifyPPPoEChanged(created, "plan-upsert");
             return created;
@@ -3544,7 +3579,7 @@ class DataBase {
         try {
             const updated = await prisma.pPPoEPlan.update({
                 where: { id },
-                data,
+                data: this.stripUnsupportedModelFields("PPPoEPlan", data),
             });
             notifyPPPoEChanged(updated, "plan-upsert");
             return updated;
@@ -3575,7 +3610,7 @@ class DataBase {
                 where: {
                     id
                 },
-                data
+                data: this.stripUnsupportedModelFields("Pppoe", data)
             })
             notifyPPPoEChanged(upd, "upsert");
             return upd;

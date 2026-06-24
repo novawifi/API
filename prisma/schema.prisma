@@ -141,6 +141,7 @@ model Package {
   status     String?  @default("live")
   social     String?  @default("N/A")
   accountNumber String?
+  fupLimit   String?  @default("Unlimited")
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
   users      User[]
@@ -443,6 +444,7 @@ model Pppoe {
   paymentLink    String?
   reminderSent   Boolean   @default(false)
   accountNumber  String?
+  fupLimit       String?   @default("Unlimited")
   expiresAt      DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
@@ -579,6 +581,7 @@ model PPPoEPlan {
   pool       String
   price      String
   period     String
+  fupLimit   String?  @default("Unlimited")
   status     String   @default("active")
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt

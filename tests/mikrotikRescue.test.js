@@ -34,5 +34,6 @@ test("MikroTik SSTP rescue script does not modify WireGuard", () => {
     assert.match(script, /add-default-route=no/);
     assert.match(script, /on-event=":local rescue \[\/interface\/sstp-client\/find name=nova-rescue-sstp\]/);
     assert.doesNotMatch(script, /on-event="[^\n]*name="nova-rescue-sstp"/);
+    assert.doesNotMatch(script, /on-event="[^\n]*name="nova-rescue-watchdog-bootstrap"/);
     assert.doesNotMatch(script, /interface\/wireguard/);
 });

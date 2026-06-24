@@ -1563,7 +1563,7 @@ function autoLogin() {
 	                    password: record.clientpassword || record.clientname,
 	                    groupname: plan?.name || record.name,
 	                    rateLimit,
-	                    dataLimitBytes: null,
+	                    dataLimitBytes: this.parseDataLimitBytes(record.fupLimit || plan?.fupLimit),
 	                    expireAt: record.expiresAt || null,
 	                    period: plan?.period || record.period || null,
 	                    sessionTimeoutSeconds: null,
@@ -1681,6 +1681,19 @@ function autoLogin() {
         const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
         if (!unitMap[unit]) throw new Error(`Unsupported unit: ${unit}`);
         return Math.round(value * unitMap[unit]);
+    }
+
+    parseDataLimitBytes(value) {
+        if (!value) return null;
+        const text = String(value).trim();
+        if (!text || /^unlimited$/i.test(text)) return null;
+        const match = text.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i);
+        if (!match) return null;
+        try {
+            return this.convertToBytes(Number(match[1]), match[2].toUpperCase());
+        } catch {
+            return null;
+        }
     }
 
     async updateMikrotikProfile(platformID, currentProfileName, newProfileName, rateLimit, pool, host, sharedUsers, uptimeLimit, category) {
@@ -2353,8 +2366,8 @@ function autoLogin() {
     }
 
     async createPPPoEPlan(req, res) {
-        const { token, station, name, profile, servicename, pool, price, period, status } = req.body;
-        if (!token || !station || !name || !profile || !servicename || !price || !period) {
+        const { token, station, name, profile, servicename, pool, price, period, status, fupLimit } = req.body;
+        if (!token || !station || !name || !price || !period) {
             return res.status(400).json({ success: false, message: "Missing required fields" });
         }
         try {
@@ -2365,6 +2378,9 @@ function autoLogin() {
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
+            if (!isRadius && (!profile || !servicename)) {
+                return res.status(400).json({ success: false, message: "Missing required fields" });
+            }
             if (!isRadius && !pool) {
                 return res.status(400).json({ success: false, message: "Pool is required for API PPPoE plans" });
             }
@@ -2372,11 +2388,12 @@ function autoLogin() {
                 platformID,
                 station,
                 name,
-                profile,
-                servicename,
+                profile: isRadius ? (profile || "RADIUS") : profile,
+                servicename: isRadius ? (servicename || "RADIUS") : servicename,
                 pool: isRadius ? "" : pool,
                 price,
                 period,
+                fupLimit: isRadius ? (fupLimit || "Unlimited") : "Unlimited",
                 status: status || "active",
             });
             if (!created) return res.status(500).json({ success: false, message: "Failed to create plan" });
@@ -2402,8 +2419,8 @@ function autoLogin() {
     }
 
     async updatePPPoEPlan(req, res) {
-        const { token, id, station, name, profile, servicename, pool, price, period, status } = req.body;
-        if (!token || !id || !station || !name || !profile || !servicename || !price || !period || !status) {
+        const { token, id, station, name, profile, servicename, pool, price, period, status, fupLimit } = req.body;
+        if (!token || !id || !station || !name || !price || !period || !status) {
             return res.status(400).json({ success: false, message: "Missing required fields" });
         }
         try {
@@ -2420,6 +2437,9 @@ function autoLogin() {
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === station);
             const isRadius = stationRecord?.systemBasis === "RADIUS";
+            if (!isRadius && (!profile || !servicename)) {
+                return res.status(400).json({ success: false, message: "Missing required fields" });
+            }
             if (!isRadius && !pool) {
                 return res.status(400).json({ success: false, message: "Pool is required for API PPPoE plans" });
             }
@@ -2428,11 +2448,12 @@ function autoLogin() {
             const updated = await this.db.updatePPPoEPlan(id, {
                 station,
                 name,
-                profile,
-                servicename,
+                profile: isRadius ? (profile || "RADIUS") : profile,
+                servicename: isRadius ? (servicename || "RADIUS") : servicename,
                 pool: isRadius ? "" : pool,
                 price,
                 period,
+                fupLimit: isRadius ? (fupLimit || "Unlimited") : "Unlimited",
                 status: normalizedStatus,
             });
             if (!updated) {
@@ -2480,7 +2501,7 @@ function autoLogin() {
     }
 
 	    async createPPPoEUser(req, res) {
-	        const { token, station, planId, name, clientname, clientpassword, status, email, phone, customFields } = req.body;
+	        const { token, station, planId, name, clientname, clientpassword, status, email, phone, customFields, fupLimit } = req.body;
 	        if (!token || !station || !planId || !clientname || !clientpassword) {
 	            return res.status(400).json({ success: false, message: "Missing required fields" });
 	        }
@@ -2606,12 +2627,13 @@ function autoLogin() {
                         const speedSource = effectivePlan.profile || effectivePlan.name || "";
                         const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
                         const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
+                        const pppoeLimitBytes = this.parseDataLimitBytes(fupLimit || effectivePlan.fupLimit);
                         await this.db.upsertRadiusUser({
                             username: clientname,
                             password: clientpassword,
                             groupname: effectivePlan.name,
                             rateLimit,
-                            dataLimitBytes: null,
+                            dataLimitBytes: pppoeLimitBytes,
                             expireAt: normalizedStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
                             period: effectivePlan.period,
                             sessionTimeoutSeconds: null,
@@ -2635,6 +2657,7 @@ function autoLogin() {
                         maxsessions: "",
                         status: normalizedStatus,
                         amount,
+                        fupLimit: basis === "RADIUS" ? (fupLimit || effectivePlan.fupLimit || "Unlimited") : "Unlimited",
                         paymentLink,
                         email,
                         expiresAt: expireAt ? expireAt : null,
@@ -2925,7 +2948,7 @@ function autoLogin() {
 	    }
 
 	    async updatePPPoEUser(req, res) {
-	        const { token, id, planId, name, clientname, clientpassword, status, email, phone, customFields, expiresAt } = req.body;
+	        const { token, id, planId, name, clientname, clientpassword, status, email, phone, customFields, expiresAt, fupLimit } = req.body;
 	        if (!token || !id || !clientname || !clientpassword) {
 	            return res.status(400).json({ success: false, message: "Missing required fields" });
         }
@@ -3021,12 +3044,13 @@ function autoLogin() {
                 const speedSource = (plan ? plan.profile : client.profile) || plan?.name || currentPlan?.name || "";
                 const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
                 const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
+                const pppoeLimitBytes = this.parseDataLimitBytes(fupLimit || client.fupLimit || plan?.fupLimit || currentPlan?.fupLimit);
 	                await this.db.upsertRadiusUser({
 	                    username: clientname,
 	                    password: clientpassword,
 	                    groupname: plan ? plan.name : currentPlan?.name || client.profile || clientname,
 	                    rateLimit,
-	                    dataLimitBytes: null,
+	                    dataLimitBytes: pppoeLimitBytes,
 	                    expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
 	                    period: plan ? plan.period : client.period,
 	                    sessionTimeoutSeconds: null,
@@ -3046,6 +3070,7 @@ function autoLogin() {
                 clientpassword,
                 status: effectiveStatus,
                 amount,
+                fupLimit: isRadius ? (fupLimit || client.fupLimit || plan?.fupLimit || currentPlan?.fupLimit || "Unlimited") : "Unlimited",
                 email,
                 phone,
                 expiresAt: expireAt ? expireAt : null,
@@ -3115,7 +3140,7 @@ function autoLogin() {
                     password: client.clientpassword,
                     groupname: client.name,
                     rateLimit,
-                    dataLimitBytes: null,
+                    dataLimitBytes: this.parseDataLimitBytes(client.fupLimit),
                     expireAt: newStatus === "active" ? expireAt : new Date(Date.now() - 60000),
                     period: client.period,
                     sessionTimeoutSeconds: null,
@@ -3150,6 +3175,7 @@ function autoLogin() {
             status,
             paymentLink,
             phone,
+            fupLimit,
             customFields
         } = req.body;
         if (!token) return res.status(400).json({ success: false, message: "Missing authentication token" });
@@ -3283,7 +3309,7 @@ function autoLogin() {
                     password: clientpassword,
                     groupname: name,
                     rateLimit: rate,
-                    dataLimitBytes: null,
+                    dataLimitBytes: this.parseDataLimitBytes(fupLimit),
                     expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
                     period: period,
                     sessionTimeoutSeconds: null,
@@ -3335,6 +3361,7 @@ function autoLogin() {
                 maxsessions,
                 status: effectiveStatus,
                 amount: newamount,
+                fupLimit: isRadius ? (fupLimit || client?.fupLimit || "Unlimited") : "Unlimited",
                 paymentLink: paymentLink ? paymentLink : client?.paymentLink || pppoe_link,
                 email,
                 expiresAt: expireAt ? expireAt : null,
@@ -3845,7 +3872,9 @@ function autoLogin() {
                     password: finalUsername,
                     groupname: pkg.name,
                     rateLimit,
-                    dataLimitBytes: null,
+                    dataLimitBytes:
+                        this.parseDataLimitBytes(pkg.fupLimit) ||
+                        (String(pkg.category || "").toLowerCase() === "data" ? this.parseDataLimitBytes(pkg.usage) : null),
                     expireAt: status?.toLowerCase() === "active" ? existingDbUser.expireAt || null : new Date(Date.now() - 60000),
                     period: pkg.period,
                     sessionTimeoutSeconds: null,
@@ -5814,17 +5843,9 @@ function autoLogin() {
             if (isRadius) {
                 const speedVal = String(pkg.speed || "").replace(/[^0-9.]/g, "");
                 const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
-                let dataLimitBytes = null;
-                if (String(pkg.category || "").toLowerCase() === "data" && pkg.usage && pkg.usage !== "Unlimited") {
-                    const [value, unit] = String(pkg.usage).split(" ");
-                    if (value && unit) {
-                        try {
-                            dataLimitBytes = this.convertToBytes(parseFloat(value), unit.toUpperCase());
-                        } catch (error) {
-                            dataLimitBytes = null;
-                        }
-                    }
-                }
+                const dataLimitBytes =
+                    this.parseDataLimitBytes(pkg.fupLimit) ||
+                    (String(pkg.category || "").toLowerCase() === "data" ? this.parseDataLimitBytes(pkg.usage) : null);
 	                await this.db.upsertRadiusUser({
 	                    username,
 	                    password,
@@ -6837,17 +6858,9 @@ function autoLogin() {
             if (hasRadius) {
                 const speedVal = String(pkg.speed || "").replace(/[^0-9.]/g, "");
                 const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
-                let dataLimitBytes = null;
-                if (isData && pkg.usage && pkg.usage !== "Unlimited") {
-                    const [value, unit] = String(pkg.usage).split(" ");
-                    if (value && unit) {
-                        try {
-                            dataLimitBytes = this.convertToBytes(parseFloat(value), unit.toUpperCase());
-                        } catch (error) {
-                            dataLimitBytes = null;
-                        }
-                    }
-                }
+                const dataLimitBytes =
+                    this.parseDataLimitBytes(pkg.fupLimit) ||
+                    (isData ? this.parseDataLimitBytes(pkg.usage) : null);
 	                await this.db.upsertRadiusUser({
 	                    username: loginIdentifier,
 	                    password: loginIdentifier,

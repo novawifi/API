@@ -160,6 +160,20 @@ class Controller {
     return next;
   }
 
+  parseDataLimitBytes(value) {
+    if (!value) return null;
+    const text = String(value).trim();
+    if (!text || /^unlimited$/i.test(text)) return null;
+    const match = text.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i);
+    if (!match) return null;
+    const amount = Number(match[1]);
+    const unit = match[2].toUpperCase();
+    const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+    const factor = unitMap[unit];
+    if (!Number.isFinite(amount) || amount <= 0 || !factor) return null;
+    return Math.round(amount * factor);
+  }
+
   getBillingDueDate(platform, service, plan) {
     const normalizedPlan = this.normalizePlatformPlan(plan);
     if (this.isTrialLimitedPlan(normalizedPlan)) {
@@ -1135,13 +1149,22 @@ class Controller {
             }
             rows = rows.map((row) => {
               if (row.status !== "active") {
-                return { ...row, active: "Offline" };
+                return {
+                  ...row,
+                  active: "Offline",
+                  bandwidthUsage: radiusHosts.has(row.station)
+                    ? radiusUsage[row.clientname] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+                    : null,
+                };
               }
               const isRadius = radiusHosts.has(row.station);
+              const userRadiusUsage = isRadius
+                ? radiusUsage[row.clientname] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+                : null;
               const isActive = isRadius
-                ? Boolean(radiusUsage[row.clientname]?.online) || radiusActiveUsernames.has(row.clientname)
+                ? Boolean(userRadiusUsage?.online) || radiusActiveUsernames.has(row.clientname)
                 : !mikrotikFailed && activeUsernames.has(row.clientname);
-              return { ...row, active: isActive ? "Online" : "Offline" };
+              return { ...row, active: isActive ? "Online" : "Offline", bandwidthUsage: userRadiusUsage };
             });
             const summaryUsers = summary?.users || [];
             const onlineUsers = summaryUsers.filter((user) => {
@@ -3695,6 +3718,7 @@ class Controller {
       speed,
       devices,
       usage,
+      fupLimit,
       category,
       pool,
       station,
@@ -3790,6 +3814,7 @@ class Controller {
         speed,
         devices,
         usage,
+        fupLimit: isRadius ? (fupLimit || "Unlimited") : "Unlimited",
         category,
         routerHost: host,
         routerName: station,
@@ -3803,7 +3828,9 @@ class Controller {
         context: "packages",
         level: "success",
       });
-      await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+      this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
+        console.error("Dashboard stats refresh after package update failed:", err?.message || err);
+      });
       return res.json({ success: true, message: "Package updated", package: packages });
     } catch (error) {
       console.log("An error occured", error);
@@ -3830,6 +3857,7 @@ class Controller {
       speed,
       devices,
       usage,
+      fupLimit,
       category,
       pool,
       station,
@@ -3926,6 +3954,7 @@ class Controller {
         speed,
         devices: safeDevices,
         usage: safeUsage,
+        fupLimit: isRadius ? (fupLimit || "Unlimited") : "Unlimited",
         category,
         routerHost: host,
         routerName: station,
@@ -3942,7 +3971,9 @@ class Controller {
         context: "packages",
         level: "success",
       });
-      await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+      this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
+        console.error("Dashboard stats refresh after package creation failed:", err?.message || err);
+      });
       return res.json({
         success: true,
         message: "Package and MikroTik profile created successfully",
@@ -4024,7 +4055,9 @@ class Controller {
         context: "packages",
         level: "success",
       });
-      await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+      this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
+        console.error("Dashboard stats refresh after package delete failed:", err?.message || err);
+      });
       return res.json({
         success: true,
         message: "Package deleted successfully."
@@ -5426,17 +5459,9 @@ class Controller {
       if (hasRadius) {
         const speedVal = String(pkg.speed || "").replace(/[^0-9.]/g, "");
         const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
-        let dataLimitBytes = null;
-        if (String(pkg.category || "").toLowerCase() === "data" && pkg.usage && pkg.usage !== "Unlimited") {
-          const [value, unit] = String(pkg.usage).split(" ");
-          if (value && unit) {
-            const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
-            const factor = unitMap[unit.toUpperCase()];
-            if (factor) {
-              dataLimitBytes = Math.round(parseFloat(value) * factor);
-            }
-          }
-        }
+        const dataLimitBytes =
+          this.parseDataLimitBytes(pkg.fupLimit) ||
+          (String(pkg.category || "").toLowerCase() === "data" ? this.parseDataLimitBytes(pkg.usage) : null);
         await this.db.upsertRadiusUser({
           username: finalUsername,
           password: finalPassword,
@@ -11687,17 +11712,9 @@ class Controller {
           const password = user.password || username;
           const speedVal = String(pkg.speed || "").replace(/[^0-9.]/g, "");
           const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
-          let dataLimitBytes = null;
-          if (String(pkg.category || "").toLowerCase() === "data" && pkg.usage && pkg.usage !== "Unlimited") {
-            const [value, unit] = String(pkg.usage).split(" ");
-            if (value && unit) {
-              const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
-              const factor = unitMap[unit.toUpperCase()];
-              if (factor) {
-                dataLimitBytes = Math.round(parseFloat(value) * factor);
-              }
-            }
-          }
+          const dataLimitBytes =
+            this.parseDataLimitBytes(pkg.fupLimit) ||
+            (String(pkg.category || "").toLowerCase() === "data" ? this.parseDataLimitBytes(pkg.usage) : null);
           await this.db.upsertRadiusUser({
             username,
             password,
@@ -11716,12 +11733,13 @@ class Controller {
           const speedSource = plan?.profile || entry.profile || plan?.name || entry.name || "";
           const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
           const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
+          const pppoeLimitBytes = this.parseDataLimitBytes(entry.fupLimit || plan?.fupLimit);
           await this.db.upsertRadiusUser({
             username: entry.clientname,
             password: entry.clientpassword,
             groupname: plan?.name || entry.name,
             rateLimit,
-            dataLimitBytes: null,
+            dataLimitBytes: pppoeLimitBytes,
             expireAt: entry.expiresAt || null,
             period: plan?.period || entry.period || null,
             sessionTimeoutSeconds: null,

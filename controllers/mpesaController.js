@@ -398,6 +398,8 @@ class MpesaController {
 
     emitRecentPayment(platformID, payload) {
         if (!platformID || !payload) return;
+        if (String(payload.status || "").toUpperCase() !== "COMPLETE") return;
+        if (String(payload.service || "").toLowerCase() !== "hotspot") return;
         socketManager.emitToRoom(`platform-${platformID}`, "payments:recent", payload);
     }
 
