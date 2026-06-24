@@ -4685,12 +4685,13 @@ function autoLogin() {
             if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
             if (auth.admin.role !== "superuser") return res.status(403).json({ success: false, message: "Unauthorised!" });
             const sessionToken = crypto.randomBytes(16).toString("hex");
+            const normalizedSystemBasis = String(systemBasis || "RADIUS").toUpperCase() === "API" ? "API" : "RADIUS";
             this.routerAutoSessions.set(sessionToken, {
                 platformID: auth.admin.platformID,
                 adminID: auth.admin.adminID,
                 role: auth.admin.role,
                 name: typeof name === "string" ? name.trim() : "",
-                systemBasis: typeof systemBasis === "string" ? systemBasis : "API",
+                systemBasis: normalizedSystemBasis,
                 createdAt: Date.now(),
             });
             return res.json({ success: true, token: sessionToken });
@@ -4725,7 +4726,7 @@ function autoLogin() {
                 this.routerAutoSessions.set(token, session);
             }
             if (requestedBasis) {
-                session.systemBasis = requestedBasis;
+                session.systemBasis = String(requestedBasis).toUpperCase() === "API" ? "API" : "RADIUS";
                 this.routerAutoSessions.set(token, session);
             }
             const stations = session.role === "superuser"
@@ -5448,7 +5449,7 @@ function autoLogin() {
 
             let stationResult;
             const warnings = [];
-            const systemBasis = session.systemBasis || "API";
+            const systemBasis = session.systemBasis || "RADIUS";
             if (!existing) {
                 const sanitizeSubdomain = (value) => {
                     const lettersOnly = String(value || "")

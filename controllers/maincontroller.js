@@ -1094,26 +1094,42 @@ class Controller {
                 .map((item) => item.mikrotikHost)
                 .filter(Boolean)
             );
+            const radiusStationHosts = stationHosts.filter((host) => radiusHosts.has(host));
             const radiusUsernames = rows
               .filter((row) => radiusHosts.has(row.station))
               .map((row) => row.clientname)
               .filter(Boolean);
-      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
-        requireRecentActivity: false,
-      });
             const apiStationHosts = stationHosts.filter((host) => !radiusHosts.has(host));
-            const statusResults = await Promise.all(
-              apiStationHosts.map((host) =>
-                this.mikrotik.checkPPPUserStatus(platformID, host)
-              )
-            );
+            const [radiusUsage, apiStatusResults, radiusStatusResults] = await Promise.all([
+              this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
+                requireRecentActivity: false,
+              }),
+              Promise.all(
+                apiStationHosts.map((host) =>
+                  this.mikrotik.checkPPPUserStatus(platformID, host)
+                )
+              ),
+              Promise.all(
+                radiusStationHosts.map((host) =>
+                  this.mikrotik.checkPPPUserStatus(platformID, host)
+                )
+              ),
+            ]);
             const activeUsernames = new Set();
+            const radiusActiveUsernames = new Set();
             let mikrotikFailed = apiStationHosts.length > 0;
-            for (const status of statusResults) {
+            for (const status of apiStatusResults) {
               if (status?.success) {
                 mikrotikFailed = false;
                 for (const user of status.users || []) {
                   if (user?.name) activeUsernames.add(user.name);
+                }
+              }
+            }
+            for (const status of radiusStatusResults) {
+              if (status?.success) {
+                for (const user of status.users || []) {
+                  if (user?.name) radiusActiveUsernames.add(user.name);
                 }
               }
             }
@@ -1123,7 +1139,7 @@ class Controller {
               }
               const isRadius = radiusHosts.has(row.station);
               const isActive = isRadius
-                ? Boolean(radiusUsage[row.clientname]?.online)
+                ? Boolean(radiusUsage[row.clientname]?.online) || radiusActiveUsernames.has(row.clientname)
                 : !mikrotikFailed && activeUsernames.has(row.clientname);
               return { ...row, active: isActive ? "Online" : "Offline" };
             });
@@ -1132,7 +1148,7 @@ class Controller {
               if (user.status !== "active") return false;
               const isRadius = radiusHosts.has(user.station);
               return isRadius
-                ? Boolean(radiusUsage[user.clientname]?.online)
+                ? Boolean(radiusUsage[user.clientname]?.online) || radiusActiveUsernames.has(user.clientname)
                 : !mikrotikFailed && activeUsernames.has(user.clientname);
             }).length;
             summary = {
@@ -6294,21 +6310,30 @@ class Controller {
         new Set(updatedPppoes.map((pppoe) => pppoe.station).filter(Boolean))
       );
       const apiStationHosts = stationHosts.filter((host) => !radiusHosts.has(host));
+      const radiusStationHosts = stationHosts.filter((host) => radiusHosts.has(host));
       const radiusUsernames = updatedPppoes
         .filter((pppoe) => radiusHosts.has(pppoe.station))
         .map((pppoe) => pppoe.clientname)
         .filter(Boolean);
 
-      const [statusResults, radiusUsage] = await Promise.all([
+      const [statusResults, radiusStatusResults, radiusUsage] = await Promise.all([
         Promise.all(
           apiStationHosts.map((host) =>
             this.mikrotik.checkPPPUserStatus(platformID, host)
           )
         ),
-        this.db.getRadiusUsageDetailsByUsernames(radiusUsernames),
+        Promise.all(
+          radiusStationHosts.map((host) =>
+            this.mikrotik.checkPPPUserStatus(platformID, host)
+          )
+        ),
+        this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
+          requireRecentActivity: false,
+        }),
       ]);
 
       const activeUsernames = new Set();
+      const radiusActiveUsernames = new Set();
       let mikrotikFailed = apiStationHosts.length > 0;
 
       for (const result of statusResults) {
@@ -6316,6 +6341,13 @@ class Controller {
           mikrotikFailed = false;
           for (const user of result.users || []) {
             if (user?.name) activeUsernames.add(user.name);
+          }
+        }
+      }
+      for (const result of radiusStatusResults) {
+        if (result?.success) {
+          for (const user of result.users || []) {
+            if (user?.name) radiusActiveUsernames.add(user.name);
           }
         }
       }
@@ -6332,7 +6364,7 @@ class Controller {
 
         const isRadius = radiusHosts.has(pppoe.station);
         const isActive = isRadius
-          ? Boolean(radiusUsage[pppoe.clientname]?.online)
+          ? Boolean(radiusUsage[pppoe.clientname]?.online) || radiusActiveUsernames.has(pppoe.clientname)
           : !mikrotikFailed && activeUsernames.has(pppoe.clientname);
         newPPPoEs.push({
           ...pppoe,
@@ -8143,7 +8175,15 @@ class Controller {
           message: session.message,
         });
       }
-      const check = await this.db.getPlatformByURLData(url);
+      const sanitizedUrl = this.sanitizeDomain(url);
+      if (!sanitizedUrl) {
+        return res.json({
+          success: false,
+          message: "Invalid platform URL. Use letters, numbers, dots, and hyphens only.",
+        });
+      }
+
+      const check = await this.db.getPlatformByURLData(sanitizedUrl);
       if (check) {
         return res.json({
           success: false,
@@ -8167,7 +8207,8 @@ class Controller {
         });
       }
 
-      const addProxy = await this.addReverseProxySite(url, "http://localhost:3001");
+      const portalTarget = this.getSharedPortalTarget();
+      const addProxy = await this.addReverseProxySite(sanitizedUrl, portalTarget);
       if (!addProxy.success) {
         return res.json({
           success: false,
@@ -8176,11 +8217,15 @@ class Controller {
         });
       }
 
-      const addSSL = await this.installLetsEncryptCert(url);
-      if (!addSSL.success) {
+      const siteCheck = await this.verifyNginxSite(sanitizedUrl, portalTarget, {
+        path: "/admin/login",
+        rejectStatusCodes: ["404"],
+      });
+      if (!siteCheck.success) {
         return res.json({
           success: false,
-          message: addSSL.message
+          message: siteCheck.message || "Platform site did not become available.",
+          error: siteCheck.error,
         });
       }
 
@@ -8243,6 +8288,7 @@ class Controller {
 
       await this.db.createPlatformBilling(subdata);
 
+      data.url = sanitizedUrl;
       const add = await this.db.createPlatform(data);
       await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
         message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
@@ -8435,12 +8481,25 @@ class Controller {
         });
       }
 
-      const provision = await this.addReverseProxySite(sanitizedUrl, "http://127.0.0.1:3001");
+      const portalTarget = this.getSharedPortalTarget();
+      const provision = await this.addReverseProxySite(sanitizedUrl, portalTarget);
       if (!provision.success) {
         return res.json({
           success: false,
           message: provision.message || "Reverse proxy provisioning failed, try again.",
           error: provision.error,
+        });
+      }
+
+      const siteCheck = await this.verifyNginxSite(sanitizedUrl, portalTarget, {
+        path: "/admin/login",
+        rejectStatusCodes: ["404"],
+      });
+      if (!siteCheck.success) {
+        return res.json({
+          success: false,
+          message: siteCheck.message || "Platform site did not become available.",
+          error: siteCheck.error,
         });
       }
 
@@ -8545,12 +8604,12 @@ class Controller {
         message: message
       }
       const sendwithdrawalemail = await this.mailer.EmailTemplate(data);
+      let emailWarning = null;
       if (!sendwithdrawalemail.success) {
-        return res.status(200).json({
-          success: false,
-          message: sendwithdrawalemail.message,
-        });
+        emailWarning = sendwithdrawalemail.message || "Welcome email could not be sent.";
+        console.warn(`[Register] Platform ${platformID} created but welcome email failed:`, emailWarning);
       }
+      const loginUrl = `https://${sanitizedUrl}/admin/login?tutorial=true`;
 
       return res.status(201).json({
         success: true,
@@ -8562,7 +8621,9 @@ class Controller {
           role: "superuser"
         },
         token: token,
-        platform: newPlatform
+        platform: newPlatform,
+        loginUrl,
+        emailWarning,
       });
 
     } catch (error) {
@@ -8636,12 +8697,16 @@ class Controller {
     return `${prefix}${suffix}.${baseDomain}`;
   }
 
-  async verifyNginxSite(domain, targetUrl) {
+  async verifyNginxSite(domain, targetUrl, options = {}) {
     const safeDomain = this.sanitizeDomain(domain);
     const target = this.normalizeProxyTargetUrl(targetUrl);
     if (!safeDomain || !target) {
       return { success: false, message: "Invalid nginx site verification input." };
     }
+    const verifyPath = String(options.path || "/").startsWith("/")
+      ? String(options.path || "/")
+      : `/${String(options.path || "/")}`;
+    const rejectStatusCodes = new Set(options.rejectStatusCodes || []);
 
     const availablePath = `/etc/nginx/sites-available/${safeDomain}`;
     const enabledPath = `/etc/nginx/sites-enabled/${safeDomain}`;
@@ -8672,10 +8737,13 @@ class Controller {
         "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
         "--max-time", "8",
         "--resolve", `${safeDomain}:443:127.0.0.1`,
-        `https://${safeDomain}/`,
+        `https://${safeDomain}${verifyPath}`,
       ]);
       if (!/^\d{3}$/.test(httpCode) || httpCode === "000") {
         return { success: false, message: `Nginx site ${safeDomain} did not answer locally.` };
+      }
+      if (rejectStatusCodes.has(httpCode)) {
+        return { success: false, message: `Nginx site ${safeDomain}${verifyPath} returned ${httpCode}.` };
       }
       return { success: true, domain: safeDomain, target, httpCode };
     } catch (error) {
