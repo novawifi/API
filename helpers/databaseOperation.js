@@ -8,6 +8,7 @@ const {
     endOfMonth,
 } = require("date-fns");
 const { counterDelta } = require("../utils/bandwidth");
+const { notifyPaymentChanged, notifyUserChanged } = require("../utils/realtimeTables");
 const now = new Date();
 const offsetDate = new Date(
     now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
@@ -305,6 +306,7 @@ class DataBase {
                 },
             });
 
+            notifyUserChanged(user, "upsert");
             return user;
         } catch (error) {
             console.error("Error creating user:", error);
@@ -321,6 +323,7 @@ class DataBase {
                     ...data,
                 },
             });
+            notifyUserChanged(user, "upsert");
             return user;
         } catch (error) {
             console.error("Error updating user:", error);
@@ -353,6 +356,7 @@ class DataBase {
                 },
             });
 
+            notifyUserChanged(updated, "upsert");
             return updated;
         } catch (error) {
             console.error("Error expiring hotspot user:", error);
@@ -366,6 +370,7 @@ class DataBase {
             const user = await prisma.user.delete({
                 where: { id },
             });
+            notifyUserChanged(user, "delete");
             return user;
         } catch (error) {
             console.error("Error deleting user:", error);
@@ -912,6 +917,7 @@ class DataBase {
             const mpesaCode = await prisma.mpesa.create({
                 data: nextData,
             });
+            notifyPaymentChanged(mpesaCode, "upsert");
             return mpesaCode;
         } catch (error) {
             console.error("Error adding mpesa code:", error);
@@ -932,6 +938,7 @@ class DataBase {
                     ...nextData,
                 },
             });
+            notifyPaymentChanged(mpesaCode, "upsert");
             return mpesaCode;
         } catch (error) {
             console.error("Error updating mpesa code:", error);
@@ -952,6 +959,7 @@ class DataBase {
                     ...nextData,
                 },
             });
+            notifyPaymentChanged(mpesa, "upsert");
             return mpesa;
         } catch (error) {
             console.error("Error updating mpesa code:", error);
@@ -975,6 +983,18 @@ class DataBase {
                     ...nextData,
                 },
             });
+            if (result.count > 0) {
+                const mpesaCode = await prisma.mpesa.findFirst({
+                    where: {
+                        OR: [
+                            { code },
+                            data.code ? { code: data.code } : undefined,
+                            data.reqcode ? { reqcode: data.reqcode } : undefined,
+                        ].filter(Boolean),
+                    },
+                });
+                notifyPaymentChanged(mpesaCode || data, "upsert");
+            }
             return { updated: result.count };
         } catch (error) {
             console.error("Error updating mpesa code conditionally:", error);
@@ -988,6 +1008,10 @@ class DataBase {
             where: { id, status: "PENDING" },
             data: { status: "PROCESSING" },
         });
+        if (result.count === 1) {
+            const mpesaCode = await prisma.mpesa.findUnique({ where: { id } });
+            notifyPaymentChanged(mpesaCode, "upsert");
+        }
         return result.count === 1;
     }
 
@@ -997,6 +1021,10 @@ class DataBase {
             where: { id, status: "PENDING" },
             data,
         });
+        if (result.count === 1) {
+            const mpesaCode = await prisma.mpesa.findUnique({ where: { id } });
+            notifyPaymentChanged(mpesaCode, "upsert");
+        }
         return result.count === 1;
     }
 
@@ -2257,6 +2285,8 @@ class DataBase {
                     id,
                 },
             });
+            notifyPaymentChanged(del, "delete");
+            return del;
         } catch (error) {
             console.error("Error deleting payment:", error);
             throw error;

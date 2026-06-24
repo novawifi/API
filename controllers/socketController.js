@@ -8,6 +8,7 @@ const appRoot = require("app-root-path").path;
 const cache = require("../utils/cache");
 const { MikrotikConnection } = require("../configs/mikrotikConfig");
 const { Utils } = require("../utils/Functions");
+const { events: realtimeTableEvents } = require("../utils/realtimeTables");
 
 
 class Socket {
@@ -22,6 +23,22 @@ class Socket {
         this.supportPlatformSubscribers = new Map();
         this.supportManagers = new Set();
         this.cache = cache;
+        realtimeTableEvents.on("payment", ({ platformID, ...payload }) => {
+            this.emitToRoom(`platform-${platformID}`, "payments:changed", payload);
+            this.emitToRoom(`platform-${platformID}`, "tables:refresh", {
+                entity: "payments",
+                action: payload.action,
+                at: payload.at,
+            });
+        });
+        realtimeTableEvents.on("user", ({ platformID, ...payload }) => {
+            this.emitToRoom(`platform-${platformID}`, "users:changed", payload);
+            this.emitToRoom(`platform-${platformID}`, "tables:refresh", {
+                entity: "users",
+                action: payload.action,
+                at: payload.at,
+            });
+        });
 
         this.SUPPORT_UPLOADS_DIR = path.join(appRoot, "public", "support-uploads");
 
