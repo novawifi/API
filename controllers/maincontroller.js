@@ -23,6 +23,7 @@ const { MpesaController } = require("./mpesaController");
 const { socketManager } = require("./socketController");
 const cache = require("../utils/cache");
 const { ensureRadiusClient, getRadiusClientIp, getRadiusClientSecret, getRadiusServerIp, removeRadiusClient } = require("../utils/radiusConfig");
+const { getMikrotikRescueConfig } = require("../utils/mikrotikRescue");
 const { WebdockService } = require("../services/webdockService");
 
 class Controller {
@@ -8773,6 +8774,32 @@ class Controller {
     return internalHost ? `http://${internalHost}` : null;
   }
 
+  buildMikrotikWebfigTargets(host) {
+    const primaryHost = this.normalizeMikrotikInternalHost(host);
+    if (!primaryHost) return null;
+    const targets = { primary: `http://${primaryHost}`, rescue: null };
+    const rescueConfig = getMikrotikRescueConfig(primaryHost);
+    if (rescueConfig?.enabled && rescueConfig.rescueAddress) {
+      targets.rescue = `http://${rescueConfig.rescueAddress}`;
+    }
+    return targets;
+  }
+
+  getReverseProxyUpstreamName(domain) {
+    const safe = String(domain || "proxy").replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 80) || "proxy";
+    return `nova_${safe}`;
+  }
+
+  getProxyTargetServer(targetUrl) {
+    try {
+      const url = new URL(targetUrl);
+      const port = url.port || (url.protocol === "https:" ? "443" : "80");
+      return `${url.hostname}:${port}`;
+    } catch (_error) {
+      return "";
+    }
+  }
+
   generateMikrotikWebfigHost(name) {
     const prefix = String(name || "router")
       .toLowerCase()
@@ -8808,8 +8835,20 @@ class Controller {
         fsp.readFile(availablePath, "utf8"),
         fsp.readlink(enabledPath),
       ]);
-      if (!config.includes(`server_name ${safeDomain};`) || !config.includes(`proxy_pass ${target};`)) {
+      const backupTargets = Array.isArray(options.backupTargets)
+        ? options.backupTargets.map(item => this.normalizeProxyTargetUrl(item)).filter(Boolean).filter(item => item !== target)
+        : [];
+      const upstreamName = backupTargets.length ? this.getReverseProxyUpstreamName(safeDomain) : "";
+      const proxyPassTarget = upstreamName ? `http://${upstreamName}` : target;
+
+      if (!config.includes(`server_name ${safeDomain};`) || !config.includes(`proxy_pass ${proxyPassTarget};`)) {
         return { success: false, message: `Nginx mapping for ${safeDomain} does not match ${target}.` };
+      }
+      for (const backupTarget of backupTargets) {
+        const backupServer = this.getProxyTargetServer(backupTarget);
+        if (backupServer && !config.includes(`server ${backupServer} backup`)) {
+          return { success: false, message: `Nginx backup mapping for ${safeDomain} does not include ${backupTarget}.` };
+        }
       }
       if (path.resolve(path.dirname(enabledPath), enabledTarget) !== availablePath) {
         return { success: false, message: `Nginx enabled link for ${safeDomain} is incorrect.` };
@@ -8843,7 +8882,8 @@ class Controller {
 
   async ensureStationWebfigSite(station) {
     if (!station?.id) return { success: false, message: "Station is missing." };
-    const target = this.buildMikrotikWebfigTarget(station.mikrotikHost);
+    const targets = this.buildMikrotikWebfigTargets(station.mikrotikHost);
+    const target = targets?.primary;
     if (!target) {
       return { success: false, message: "Station requires a valid 10.10.10.x internal host." };
     }
@@ -8855,15 +8895,17 @@ class Controller {
       station.mikrotikWebfigHost = domain;
     }
 
-    const provision = await this.addReverseProxySite(domain, target);
+    const proxyOptions = targets.rescue ? { backupTargets: [targets.rescue] } : {};
+    const provision = await this.addReverseProxySite(domain, target, proxyOptions);
     if (!provision?.success) return provision;
-    const verification = await this.verifyNginxSite(domain, target);
+    const verification = await this.verifyNginxSite(domain, target, proxyOptions);
     if (!verification.success) return verification;
     return {
       success: true,
       message: `WebFig nginx site verified for ${domain}`,
       domain,
       target,
+      backupTarget: targets.rescue,
       httpCode: verification.httpCode,
     };
   }
@@ -8883,17 +8925,40 @@ class Controller {
     };
   }
 
-  buildNginxConfig(domain, targetUrl) {
+  buildNginxConfig(domain, targetUrl, options = {}) {
     const target = this.normalizeProxyTargetUrl(targetUrl);
     if (!target) return null;
     const { certPath, keyPath, hasWildcardCert } = this.getWildcardCertificatePaths(domain);
     const optionsSslPath = "/etc/letsencrypt/options-ssl-nginx.conf";
     const dhParamPath = "/etc/letsencrypt/ssl-dhparams.pem";
+    const backupTargets = Array.isArray(options.backupTargets)
+      ? options.backupTargets.map(item => this.normalizeProxyTargetUrl(item)).filter(Boolean).filter(item => item !== target)
+      : [];
+    const upstreamName = backupTargets.length ? this.getReverseProxyUpstreamName(domain) : "";
+    const proxyPassTarget = upstreamName ? `http://${upstreamName}` : target;
+    const upstreamLines = upstreamName
+      ? [
+        `upstream ${upstreamName} {`,
+        `    server ${this.getProxyTargetServer(target)} max_fails=1 fail_timeout=3s;`,
+        ...backupTargets
+          .map(item => this.getProxyTargetServer(item))
+          .filter(Boolean)
+          .map(server => `    server ${server} backup max_fails=1 fail_timeout=3s;`),
+        "}",
+        "",
+      ]
+      : [];
 
     const proxyLines = [
       "    location / {",
-      `        proxy_pass ${target};`,
+      `        proxy_pass ${proxyPassTarget};`,
       "        proxy_http_version 1.1;",
+      ...(upstreamName ? [
+        "        proxy_next_upstream error timeout http_502 http_503 http_504;",
+        "        proxy_connect_timeout 3s;",
+        "        proxy_send_timeout 30s;",
+        "        proxy_read_timeout 30s;",
+      ] : []),
       "",
       "        proxy_set_header Host $host;",
       "        proxy_set_header X-Real-IP $remote_addr;",
@@ -8908,6 +8973,7 @@ class Controller {
 
     if (!hasWildcardCert) {
       return [
+        ...upstreamLines,
         "server {",
         "    listen 80;",
         `    server_name ${domain};`,
@@ -8919,6 +8985,7 @@ class Controller {
     }
 
     return [
+      ...upstreamLines,
       "server {",
       "    listen 80;",
       `    server_name ${domain};`,
@@ -8940,7 +9007,7 @@ class Controller {
     ].join("\n");
   }
 
-  async addReverseProxySite(domain, targetUrl) {
+  async addReverseProxySite(domain, targetUrl, options = {}) {
     const safeDomain = this.sanitizeDomain(domain);
     if (!safeDomain) {
       return { success: false, message: "Invalid domain provided." };
@@ -8951,7 +9018,7 @@ class Controller {
       return { success: false, message: "Invalid reverse proxy target URL." };
     }
 
-    const config = this.buildNginxConfig(safeDomain, target);
+    const config = this.buildNginxConfig(safeDomain, target, options);
     if (!config) {
       return {
         success: false,

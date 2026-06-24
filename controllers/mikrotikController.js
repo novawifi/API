@@ -5372,6 +5372,32 @@ function autoLogin() {
         return internalHost ? `http://${internalHost}` : null;
     }
 
+    buildMikrotikWebfigTargets(host) {
+        const primaryHost = this.normalizeMikrotikInternalHost(host);
+        if (!primaryHost) return null;
+        const targets = { primary: `http://${primaryHost}`, rescue: null };
+        const rescueConfig = getMikrotikRescueConfig(primaryHost);
+        if (rescueConfig?.enabled && rescueConfig.rescueAddress) {
+            targets.rescue = `http://${rescueConfig.rescueAddress}`;
+        }
+        return targets;
+    }
+
+    getReverseProxyUpstreamName(domain) {
+        const safe = String(domain || "proxy").replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 80) || "proxy";
+        return `nova_${safe}`;
+    }
+
+    getProxyTargetServer(targetUrl) {
+        try {
+            const url = new URL(targetUrl);
+            const port = url.port || (url.protocol === "https:" ? "443" : "80");
+            return `${url.hostname}:${port}`;
+        } catch (_error) {
+            return "";
+        }
+    }
+
     getWildcardCertificatePaths(domain) {
         const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
         const certDir = process.env.WILDCARD_CERT_DIR || `/etc/letsencrypt/live/${baseDomain}`;
@@ -5385,16 +5411,39 @@ function autoLogin() {
         };
     }
 
-    buildNginxConfig(domain, targetUrl) {
+    buildNginxConfig(domain, targetUrl, options = {}) {
         const target = this.normalizeProxyTargetUrl(targetUrl);
         if (!target) return null;
         const { certPath, keyPath, hasWildcardCert } = this.getWildcardCertificatePaths(domain);
         const sslOptions = process.env.SSL_OPTIONS_PATH || "/etc/letsencrypt/options-ssl-nginx.conf";
         const sslDhParam = process.env.SSL_DHPARAM_PATH || "/etc/letsencrypt/ssl-dhparams.pem";
+        const backupTargets = Array.isArray(options.backupTargets)
+            ? options.backupTargets.map(item => this.normalizeProxyTargetUrl(item)).filter(Boolean).filter(item => item !== target)
+            : [];
+        const upstreamName = backupTargets.length ? this.getReverseProxyUpstreamName(domain) : "";
+        const proxyPassTarget = upstreamName ? `http://${upstreamName}` : target;
+        const upstreamLines = upstreamName
+            ? [
+                `upstream ${upstreamName} {`,
+                `    server ${this.getProxyTargetServer(target)} max_fails=1 fail_timeout=3s;`,
+                ...backupTargets
+                    .map(item => this.getProxyTargetServer(item))
+                    .filter(Boolean)
+                    .map(server => `    server ${server} backup max_fails=1 fail_timeout=3s;`),
+                "}",
+                "",
+            ]
+            : [];
         const proxyLines = [
             "    location / {",
-            `        proxy_pass ${target};`,
+            `        proxy_pass ${proxyPassTarget};`,
             "        proxy_http_version 1.1;",
+            ...(upstreamName ? [
+                "        proxy_next_upstream error timeout http_502 http_503 http_504;",
+                "        proxy_connect_timeout 3s;",
+                "        proxy_send_timeout 30s;",
+                "        proxy_read_timeout 30s;",
+            ] : []),
             "",
             "        proxy_set_header Host $host;",
             "        proxy_set_header X-Real-IP $remote_addr;",
@@ -5409,6 +5458,7 @@ function autoLogin() {
 
         if (!hasWildcardCert) {
             return [
+                ...upstreamLines,
                 "server {",
                 "    listen 80;",
                 `    server_name ${domain};`,
@@ -5420,6 +5470,7 @@ function autoLogin() {
         }
 
         return [
+            ...upstreamLines,
             "server {",
             "    listen 80;",
             `    server_name ${domain};`,
@@ -5441,7 +5492,7 @@ function autoLogin() {
         ].join("\n");
     }
 
-    async addReverseProxySite(domain, targetUrl) {
+    async addReverseProxySite(domain, targetUrl, options = {}) {
         const safeDomain = this.sanitizeDomain(domain);
         if (!safeDomain) {
             return { success: false, message: "Invalid domain provided." };
@@ -5452,7 +5503,7 @@ function autoLogin() {
             return { success: false, message: "Invalid reverse proxy target URL." };
         }
 
-        const config = this.buildNginxConfig(safeDomain, target);
+        const config = this.buildNginxConfig(safeDomain, target, options);
         if (!config) {
             return { success: false, message: "Failed to build nginx config." };
         }

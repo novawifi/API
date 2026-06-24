@@ -14,6 +14,10 @@ const withTimeout = (promise, timeoutMs, message) => {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 };
 
+const closeConnection = async (controller, connection) => {
+    await controller.safeCloseChannel(connection?.channel);
+};
+
 const parseArgs = () => {
     const args = process.argv.slice(2);
     const readValue = (name) => {
@@ -83,21 +87,45 @@ async function run() {
                 continue;
             }
 
-            const outcome = await withTimeout(
-                options.direct
-                    ? controller.ensureMikrotikRescue(connection.channel, host)
-                    : controller.installMikrotikRescueScript(connection.channel, host),
-                options.direct ? 60000 : 20000,
-                options.direct ? "Rescue configuration timed out" : "Rescue script upload timed out"
-            );
+            let outcome;
+            if (options.direct) {
+                try {
+                    outcome = await withTimeout(
+                        controller.ensureMikrotikRescue(connection.channel, host),
+                        60000,
+                        "Rescue configuration timed out"
+                    );
+                } catch (directError) {
+                    console.warn(`[direct-slow] ${host}: ${directError?.message || String(directError)}. Queueing installer script instead.`);
+                    await closeConnection(controller, connection);
+                    connection = await connectionManager.createSingleMikrotikClient(station.platformID, host);
+                    if (!connection?.channel) {
+                        throw new Error("Direct configure timed out and reconnect for queued installer failed");
+                    }
+                    outcome = await withTimeout(
+                        controller.installMikrotikRescueScript(connection.channel, host),
+                        45000,
+                        "Rescue script upload timed out after direct fallback"
+                    );
+                    if (outcome?.success) {
+                        outcome.fallbackQueued = true;
+                    }
+                }
+            } else {
+                outcome = await withTimeout(
+                    controller.installMikrotikRescueScript(connection.channel, host),
+                    45000,
+                    "Rescue script upload timed out"
+                );
+            }
             if (!outcome?.success) throw new Error(outcome?.reason || "Rescue configuration was rejected");
             results.configured += 1;
-            console.log(`[configured] ${host} -> ${outcome.rescueAddress}${outcome.queued ? " (queued on router)" : ""}`);
+            console.log(`[configured] ${host} -> ${outcome.rescueAddress}${outcome.queued ? " (queued on router)" : ""}${outcome.fallbackQueued ? " (direct fallback)" : ""}`);
         } catch (error) {
             results.failed += 1;
             console.error(`[failed] ${host}: ${error?.message || String(error)}`);
         } finally {
-            await controller.safeCloseChannel(connection?.channel);
+            await closeConnection(controller, connection);
             await sleep(500);
         }
     }

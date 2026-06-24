@@ -17,6 +17,8 @@ cd /home/kyan/apps/nova-server
 node ops/provision-mikrotik-rescue.js --apply --direct --station 10.10.10.13
 ```
 
+If direct configuration is slow or times out after the router is reachable, the provisioner falls back to uploading the one-shot installer script and marks that router configured once the installer is queued.
+
 Preview eligible routers without changing anything:
 
 ```bash
