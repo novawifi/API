@@ -494,8 +494,8 @@ test("successful STK callback without receipt does not create voucher from check
     assert.equal(res.statusCode, 200);
     assert.equal(res.payload.success, false);
     assert.equal(completed, false);
-    assert.equal(updates.at(-1).status, "MANUAL_REVIEW");
-    assert.match(updates.at(-1).lastReconciliationError, /checkout request id/i);
+    assert.equal(updates.at(-1).status, "PENDING");
+    assert.match(updates.at(-1).lastReconciliationError, /missing completed M-Pesa receipt number/i);
 });
 
 test("unknown CheckoutRequestID is acknowledged without creating a payment", async () => {

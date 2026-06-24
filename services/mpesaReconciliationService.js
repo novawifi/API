@@ -29,7 +29,7 @@ class MpesaReconciliationService {
     getSettings() {
         return {
             batchSize: Math.max(1, Number(process.env.MPESA_RECONCILIATION_BATCH_SIZE || 25)),
-            minAgeSeconds: Math.max(30, Number(process.env.MPESA_RECONCILIATION_MIN_AGE_SECONDS || 90)),
+            minAgeSeconds: Math.max(120, Number(process.env.MPESA_RECONCILIATION_MIN_AGE_SECONDS || 120)),
             maxAttempts: Math.max(1, Number(process.env.MPESA_RECONCILIATION_MAX_ATTEMPTS || 20)),
             maxAgeHours: Math.max(1, Number(process.env.MPESA_RECONCILIATION_MAX_AGE_HOURS || 24)),
             concurrency: Math.max(1, Math.min(10, Number(process.env.MPESA_RECONCILIATION_CONCURRENCY || 3))),
@@ -102,20 +102,13 @@ class MpesaReconciliationService {
         if (!payment) return { state: "SKIPPED", paymentId: String(paymentOrId), reason: "Payment not found" };
         const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
         if (!checkoutRequestId) return { state: "SKIPPED", paymentId: payment.id, reason: "Missing CheckoutRequestID" };
-        if (!["PENDING"].includes(String(payment.status).toUpperCase())) {
+        if (!["PENDING", "MANUAL_REVIEW"].includes(String(payment.status).toUpperCase())) {
             return { state: "SKIPPED", paymentId: payment.id, reason: `Payment is ${payment.status}` };
         }
 
         const settings = this.getSettings();
         const ageMs = Date.now() - new Date(payment.createdAt).getTime();
-        if (payment.reconciliationAttempts >= settings.maxAttempts || ageMs >= settings.maxAgeHours * 3_600_000) {
-            await this.db.updateMpesaCodeByID(payment.id, {
-                status: "MANUAL_REVIEW",
-                lastReconciliationError: "Automatic reconciliation limit reached; payment requires manual review.",
-                reconciliationLeaseUntil: null,
-            });
-            return { state: "SKIPPED", paymentId: payment.id, reason: "Manual review required" };
-        }
+        const finalAttempt = payment.reconciliationAttempts >= settings.maxAttempts || ageMs >= settings.maxAgeHours * 3_600_000;
 
         const attempt = Number(payment.reconciliationAttempts || 0) + 1;
         try {
@@ -141,7 +134,7 @@ class MpesaReconciliationService {
 
             if (resultCode !== undefined) {
                 await this.db.recordMpesaReconciliation(payment.id, {
-                    status: resultCode === "1032" ? "CANCELLED" : "FAILED",
+                    status: "FAILED",
                     resultCode,
                     resultDescription,
                     failed_reason: resultDescription,
@@ -155,7 +148,9 @@ class MpesaReconciliationService {
             await this.db.recordMpesaReconciliation(payment.id, {
                 resultDescription,
                 nextReconciliationAt: retryAt,
-                lastReconciliationError: resultDescription || "Safaricom has not returned a final ResultCode.",
+                lastReconciliationError: finalAttempt
+                    ? `${resultDescription || "Safaricom has not returned a final ResultCode"}; payment remains pending.`
+                    : (resultDescription || "Safaricom has not returned a final ResultCode."),
             });
             return { state: "PENDING", paymentId: payment.id, checkoutRequestId, resultDescription, retryAt };
         } catch (error) {
@@ -163,7 +158,9 @@ class MpesaReconciliationService {
             const retryAt = retryAtForAttempt(attempt);
             await this.db.recordMpesaReconciliation(payment.id, {
                 nextReconciliationAt: retryAt,
-                lastReconciliationError: message,
+                lastReconciliationError: finalAttempt
+                    ? `Safaricom query failed; payment remains pending: ${message}`
+                    : message,
             });
             return { state: "PENDING", paymentId: payment.id, checkoutRequestId, resultDescription: message, retryAt };
         }

@@ -55,7 +55,7 @@ test("cancelled STK transaction is final", async () => {
     const { service, calls } = harness({ ResultCode: 1032, ResultDesc: "Request cancelled by user" });
     const result = await service.reconcileMpesaPayment(payment());
     assert.equal(result.state, "FAILED");
-    assert.equal(calls.records[0].status, "CANCELLED");
+    assert.equal(calls.records[0].status, "FAILED");
     assert.equal(calls.finalized, 0);
 });
 
@@ -97,11 +97,19 @@ test("unknown payment id is skipped", async () => {
     assert.equal(result.state, "SKIPPED");
 });
 
-test("maximum age moves an uncertain payment to manual review", async () => {
+test("maximum age still queries Safaricom before settling", async () => {
     const { service, calls } = harness({ ResultCode: "0" });
     const result = await service.reconcileMpesaPayment(payment({ createdAt: new Date(Date.now() - 25 * 3_600_000) }));
-    assert.equal(result.state, "SKIPPED");
-    assert.equal(calls.updates[0].status, "MANUAL_REVIEW");
+    assert.equal(result.state, "SUCCESS");
+    assert.equal(calls.finalized, 1);
+});
+
+test("maximum age without Safaricom final status remains pending", async () => {
+    const { service, calls } = harness({ ResponseCode: "0", ResponseDescription: "Accepted" });
+    const result = await service.reconcileMpesaPayment(payment({ createdAt: new Date(Date.now() - 25 * 3_600_000) }));
+    assert.equal(result.state, "PENDING");
+    assert.equal(calls.records[0].status, undefined);
+    assert.match(calls.records[0].lastReconciliationError, /remains pending/i);
 });
 
 test("worker prevents overlapping runs", async () => {

@@ -23,6 +23,7 @@ class Socket {
         this.supportPlatformSubscribers = new Map();
         this.supportManagers = new Set();
         this.cache = cache;
+        this.liveTableTicker = null;
         realtimeTableEvents.on("payment", ({ platformID, ...payload }) => {
             this.emitToRoom(`platform-${platformID}`, "payments:changed", payload);
             this.emitToRoom(`platform-${platformID}`, "tables:refresh", {
@@ -35,6 +36,14 @@ class Socket {
             this.emitToRoom(`platform-${platformID}`, "users:changed", payload);
             this.emitToRoom(`platform-${platformID}`, "tables:refresh", {
                 entity: "users",
+                action: payload.action,
+                at: payload.at,
+            });
+        });
+        realtimeTableEvents.on("pppoe", ({ platformID, ...payload }) => {
+            this.emitToRoom(`platform-${platformID}`, "pppoe:changed", payload);
+            this.emitToRoom(`platform-${platformID}`, "tables:refresh", {
+                entity: "pppoe",
                 action: payload.action,
                 at: payload.at,
             });
@@ -133,6 +142,7 @@ class Socket {
         if (!this.io) {
             // @ts-ignore
             this.io = socketIo(server, { cors: { origin: "*" } });
+            this.startLiveTableTicker();
 
             this.io.use(async (socket, next) => {
                 const token = socket.handshake.auth?.token;
@@ -606,6 +616,23 @@ class Socket {
         }
         return this.io;
     };
+
+    startLiveTableTicker() {
+        if (this.liveTableTicker) return;
+        this.liveTableTicker = setInterval(() => {
+            if (!this.io) return;
+            for (const room of this.io.sockets.adapter.rooms.keys()) {
+                if (!String(room).startsWith("platform-")) continue;
+                this.io.to(room).emit("live-tables:tick", {
+                    entities: ["users"],
+                    at: new Date().toISOString(),
+                });
+            }
+        }, 15000);
+        if (typeof this.liveTableTicker.unref === "function") {
+            this.liveTableTicker.unref();
+        }
+    }
 
     emitPlatformPresence(platformID) {
         if (!this.io || !platformID) return;

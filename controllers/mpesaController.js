@@ -1942,12 +1942,13 @@ class MpesaController {
                 }
                 if (!transactionDetails.mpesaReceiptNumber) {
                     await this.db.updateMpesaCodeByID(mpesaCode.id, {
-                        status: "MANUAL_REVIEW",
+                        status: "PENDING",
                         checkoutRequestId: transactionDetails.checkoutRequestId,
                         merchantRequestId: transactionDetails.merchantRequestId || mpesaCode.merchantRequestId,
                         resultCode: "0",
                         resultDescription: message || "Payment successful but callback did not include MpesaReceiptNumber.",
-                        lastReconciliationError: "Payment successful but missing completed M-Pesa receipt number; refused to create voucher from checkout request id.",
+                        lastReconciliationError: "Payment successful but missing completed M-Pesa receipt number; waiting for Safaricom confirmation or manual receipt entry.",
+                        nextReconciliationAt: new Date(Date.now() + 2 * 60 * 1000),
                     });
                     this.logPayment(
                         mpesaCode.platformID,
@@ -2003,7 +2004,8 @@ class MpesaController {
                     const pkg = await this.db.getPackagesByAmount(mpesaCode.platformID, `${parseInt(transactionDetails.amount)}`, mpesaCode.reason);
                     if (!pkg) {
                         await this.db.updateMpesaCodeByID(mpesaCode.id, {
-                            status: "MANUAL_REVIEW",
+                            status: "PENDING",
+                            nextReconciliationAt: new Date(Date.now() + 5 * 60 * 1000),
                             lastReconciliationError: "Payment confirmed but its package could not be resolved.",
                         });
                         return res.status(400).json({
@@ -2032,8 +2034,9 @@ class MpesaController {
                     const baseCode = String(transactionDetails.mpesaReceiptNumber || "").trim();
                     if (!baseCode || /^ws_CO_/i.test(baseCode)) {
                         await this.db.updateMpesaCodeByID(mpesaCode.id, {
-                            status: "MANUAL_REVIEW",
-                            lastReconciliationError: "Invalid paid transaction code; refused to create voucher from checkout request id.",
+                            status: "PENDING",
+                            nextReconciliationAt: new Date(Date.now() + 2 * 60 * 1000),
+                            lastReconciliationError: "Invalid paid transaction code; waiting for a valid M-Pesa receipt number.",
                         });
                         return res.status(200).json({
                             success: false,
@@ -2992,6 +2995,13 @@ class MpesaController {
             if (payment.status === "COMPLETE") {
                 const result = await this.completePaymentForService(payment);
                 if (payment.service === "hotspot") {
+                    if (result?.status === "PENDING") {
+                        return res.status(200).json({
+                            success: false,
+                            status: "PENDING",
+                            message: result?.message || "Payment is still pending.",
+                        });
+                    }
                     if (result?.status === "FAILED") {
                         this.logPayment(payment.platformID, `Payment activation failed (ref ${code})`, "warn");
                         return res.status(200).json({
@@ -4674,7 +4684,7 @@ class MpesaController {
         if (service === "hotspot") {
             if (!payment.reason) return null;
             if (!paidTransactionCode) {
-                return { status: "FAILED", message: "Missing completed M-Pesa receipt number." };
+                return { status: "PENDING", message: "Missing completed M-Pesa receipt number." };
             }
             const existingUser = await this.db.getUserByCodeAndPlatform(paidTransactionCode, platformID);
             if (existingUser) {

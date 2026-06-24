@@ -2480,7 +2480,7 @@ function autoLogin() {
     }
 
 	    async createPPPoEUser(req, res) {
-	        const { token, station, planId, clientname, clientpassword, status, email, phone, customFields } = req.body;
+	        const { token, station, planId, name, clientname, clientpassword, status, email, phone, customFields } = req.body;
 	        if (!token || !station || !planId || !clientname || !clientpassword) {
 	            return res.status(400).json({ success: false, message: "Missing required fields" });
 	        }
@@ -2494,6 +2494,7 @@ function autoLogin() {
             if (!auth.success) return res.status(401).json({ success: false, message: auth.message });
             if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
             const platformID = auth.admin.platformID;
+            const displayName = String(name || "").trim() || clientname;
             const sourcePlan = await this.db.getPPPoEPlanById(planId);
             if (!sourcePlan || sourcePlan.platformID !== platformID) {
                 return res.status(404).json({ success: false, message: "PPPoE plan not found" });
@@ -2619,7 +2620,7 @@ function autoLogin() {
                     }
 
                     const pppoeData = {
-                        name: effectivePlan.name,
+                        name: displayName,
                         profile: effectivePlan.profile,
                         servicename: effectivePlan.servicename,
                         station: stationHost,
@@ -2755,7 +2756,7 @@ function autoLogin() {
             return res.json({
                 success: true,
                 message: targets.length > 1 ? `PPPoE created on ${targets.length} linked stations` : "PPPoE created successfully",
-                pppoe: primary,
+                pppoe: primary ? { ...primary, planName: sourcePlan.name } : primary,
                 linkedStations: targets.map((t) => t?.mikrotikHost).filter(Boolean),
             });
         } catch (error) {
@@ -2924,7 +2925,7 @@ function autoLogin() {
 	    }
 
 	    async updatePPPoEUser(req, res) {
-	        const { token, id, planId, clientname, clientpassword, status, email, phone, customFields, expiresAt } = req.body;
+	        const { token, id, planId, name, clientname, clientpassword, status, email, phone, customFields, expiresAt } = req.body;
 	        if (!token || !id || !clientname || !clientpassword) {
 	            return res.status(400).json({ success: false, message: "Missing required fields" });
         }
@@ -2950,6 +2951,8 @@ function autoLogin() {
             if (plan && plan.station !== client.station) {
                 return res.status(400).json({ success: false, message: "Selected plan belongs to a different station" });
             }
+            const currentPlan = !plan && client.planId ? await this.db.getPPPoEPlanById(client.planId) : null;
+            const displayName = String(name || "").trim() || client.name || clientname;
 
             const stations = await this.db.getStations(platformID);
             const stationRecord = stations.find((s) => s.mikrotikHost === client.station);
@@ -3015,13 +3018,13 @@ function autoLogin() {
                 if (client.clientname && client.clientname !== clientname) {
                     await this.db.deleteRadiusUser(client.clientname);
                 }
-                const speedSource = (plan ? plan.profile : client.profile) || plan?.name || client.name || "";
+                const speedSource = (plan ? plan.profile : client.profile) || plan?.name || currentPlan?.name || "";
                 const speedVal = String(speedSource).replace(/[^0-9.]/g, "");
                 const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
 	                await this.db.upsertRadiusUser({
 	                    username: clientname,
 	                    password: clientpassword,
-	                    groupname: plan ? plan.name : client.name,
+	                    groupname: plan ? plan.name : currentPlan?.name || client.profile || clientname,
 	                    rateLimit,
 	                    dataLimitBytes: null,
 	                    expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
@@ -3033,7 +3036,7 @@ function autoLogin() {
             const amount = effectiveStatus === "active" ? "0" : String(price || "0");
 
             const pppoeData = {
-                name: plan ? plan.name : client.name,
+                name: displayName,
                 profile: plan ? plan.profile : client.profile,
                 servicename: plan ? plan.servicename : client.servicename,
                 pool: plan ? plan.pool : client.pool,
@@ -3051,7 +3054,11 @@ function autoLogin() {
             };
             const result = await this.db.updatePPPoE(id, pppoeData);
             await this.pushDashboardStats(platformID);
-            return res.json({ success: true, message: "PPPoE updated successfully", pppoe: result });
+            return res.json({
+                success: true,
+                message: "PPPoE updated successfully",
+                pppoe: { ...result, planName: plan ? plan.name : currentPlan?.name },
+            });
         } catch (error) {
             return res.status(500).json({ success: false, message: "An error occured, try again!" });
         }
@@ -3803,9 +3810,53 @@ function autoLogin() {
             if (auth.admin.role !== "superuser") return res.json({ success: false, message: "Unauthorised!" });
             const platformID = auth.admin.platformID;
             const pkg = await this.db.getPackage(packageID);
+            if (!pkg) return res.json({ success: false, message: "Package not found" });
             const host = pkg.routerHost;
+            const stations = await this.db.getStations(platformID);
+            const stationRecord = (stations || []).find((station) => station.mikrotikHost === host);
+            const isRadius = String(stationRecord?.systemBasis || "API").toUpperCase() === "RADIUS";
+            const existingDbUser = await this.db.getUserByUsernameAndPlatform(username, platformID);
+            if (!existingDbUser) return res.json({ success: false, message: `User '${username}' not found in database` });
+
+            if (isRadius) {
+                const finalUsername = new_username || username;
+                if (username && finalUsername !== username) {
+                    await this.db.deleteRadiusUser(username);
+                }
+                const speedVal = String(pkg.speed || "").replace(/[^0-9.]/g, "");
+                const rateLimit = speedVal ? `${speedVal}M/${speedVal}M` : "";
+                await this.db.upsertRadiusUser({
+                    username: finalUsername,
+                    password: finalUsername,
+                    groupname: pkg.name,
+                    rateLimit,
+                    dataLimitBytes: null,
+                    expireAt: status?.toLowerCase() === "active" ? existingDbUser.expireAt || null : new Date(Date.now() - 60000),
+                    period: pkg.period,
+                    sessionTimeoutSeconds: null,
+                });
+                const updatedUser = await this.db.updateUser(existingDbUser.id, {
+                    username: finalUsername,
+                    password: finalUsername,
+                    code: finalUsername,
+                    phone,
+                    status,
+                    packageID,
+                });
+                return res.json({
+                    success: true,
+                    message: "User updated successfully",
+                    user: {
+                        ...updatedUser,
+                        station: host,
+                        package: pkg.name,
+                        packageID,
+                        systemBasis: "RADIUS",
+                    },
+                });
+            }
             const connection = await this.config.createSingleMikrotikClient(platformID, host);
-            if (!connection?.channel) return { success: false, message: "No valid MikroTik connection" };
+            if (!connection?.channel) return res.json({ success: false, message: "No valid MikroTik connection" });
             const { channel } = connection;
             try {
                 const profiles = await this.mikrotik.listHotspotProfiles(channel);
@@ -3817,7 +3868,7 @@ function autoLogin() {
                     const newuser = { platformID, action: "add", profileName: profile, host, username, code: username };
                     const isadded = await this.manageMikrotikUser(newuser);
                     if (!isadded.success) return res.json({ success: false, message: isadded.message });
-                } else {
+                } else if (existingUser) {
                     await this.mikrotik.updateHotspotUser(channel, existingUser[".id"], { name: new_username || username, profile: profile });
                     const activeUsers = await this.mikrotik.listHotspotActiveUsers(channel);
                     const activeUser = activeUsers.find(u => u.name === username);
@@ -3826,10 +3877,18 @@ function autoLogin() {
             } finally {
                 await this.safeCloseChannel(channel);
             }
-            const user = await this.db.getUserByUsername(username);
-            if (!user) return res.json({ success: false, message: `User '${username}' not found in database` });
-            await this.db.updateUser(user.id, { username: new_username, password: new_username, code: new_username, phone: phone, status });
-            return res.json({ success: true, message: "User updated successfully" });
+            const updatedUser = await this.db.updateUser(existingDbUser.id, { username: new_username, password: new_username, code: new_username, phone: phone, status, packageID });
+            return res.json({
+                success: true,
+                message: "User updated successfully",
+                user: {
+                    ...updatedUser,
+                    station: host,
+                    package: pkg.name,
+                    packageID,
+                    systemBasis: "API",
+                },
+            });
         } catch (error) {
             return res.json({ success: false, message: "An error occurred, try again!", error });
         }

@@ -31,8 +31,23 @@ function notifyUserChanged(user, action = "upsert") {
     });
 }
 
+function notifyPPPoEChanged(pppoe, action = "upsert") {
+    const platformID = pppoe?.platformID;
+    if (!platformID) return;
+
+    cache.delPrefix(`main:pppoe:${platformID}:`);
+    cache.delPrefix(`main:search:${platformID}:pppoe:`);
+    events.emit("pppoe", {
+        platformID,
+        action,
+        pppoe,
+        at: new Date().toISOString(),
+    });
+}
+
 module.exports = {
     events,
     notifyPaymentChanged,
     notifyUserChanged,
+    notifyPPPoEChanged,
 };

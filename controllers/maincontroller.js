@@ -1030,6 +1030,8 @@ class Controller {
           {
             const platform = await this.db.getPlatform(platformID);
             const platformUrl = platform?.url;
+            const plans = (await this.db.getPPPoEPlans(platformID)) || [];
+            const planById = new Map(plans.map((plan) => [plan.id, plan]));
             await Promise.all(
               rows.map(async (row) => {
                 if (!row?.paymentLink) {
@@ -1042,16 +1044,33 @@ class Controller {
                 }
               })
             );
+            rows = rows.map((row) => ({
+              ...row,
+              planName: planById.get(row.planId)?.name || (row.planId ? "Unknown plan" : row.name || "-"),
+            }));
             const stationHosts = station
               ? [station]
               : Array.from(new Set(rows.map((row) => row.station).filter(Boolean)));
+            const stations = await this.db.getStations(platformID);
+            const radiusHosts = new Set(
+              (Array.isArray(stations) ? stations : [])
+                .filter((item) => String(item?.systemBasis || "API").toUpperCase() === "RADIUS")
+                .map((item) => item.mikrotikHost)
+                .filter(Boolean)
+            );
+            const radiusUsernames = rows
+              .filter((row) => radiusHosts.has(row.station))
+              .map((row) => row.clientname)
+              .filter(Boolean);
+            const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames);
+            const apiStationHosts = stationHosts.filter((host) => !radiusHosts.has(host));
             const statusResults = await Promise.all(
-              stationHosts.map((host) =>
+              apiStationHosts.map((host) =>
                 this.mikrotik.checkPPPUserStatus(platformID, host)
               )
             );
             const activeUsernames = new Set();
-            let mikrotikFailed = true;
+            let mikrotikFailed = apiStationHosts.length > 0;
             for (const status of statusResults) {
               if (status?.success) {
                 mikrotikFailed = false;
@@ -1060,33 +1079,31 @@ class Controller {
                 }
               }
             }
-            if (mikrotikFailed) {
-              rows = rows.map((row) => ({
-                ...row,
-                active: "Offline",
-              }));
-            } else {
-              rows = rows.map((row) => {
-                if (row.status !== "active") {
-                  return { ...row, active: "Offline" };
-                }
-                const isActive = activeUsernames.has(row.clientname);
-                return { ...row, active: isActive ? "Online" : "Offline" };
-              });
-            }
+            rows = rows.map((row) => {
+              if (row.status !== "active") {
+                return { ...row, active: "Offline" };
+              }
+              const isRadius = radiusHosts.has(row.station);
+              const isActive = isRadius
+                ? Boolean(radiusUsage[row.clientname]?.online)
+                : !mikrotikFailed && activeUsernames.has(row.clientname);
+              return { ...row, active: isActive ? "Online" : "Offline" };
+            });
             const summaryUsers = summary?.users || [];
-            const onlineUsers = mikrotikFailed
-              ? 0
-              : summaryUsers.filter(
-                  (user) => user.status === "active" && activeUsernames.has(user.clientname)
-                ).length;
+            const onlineUsers = summaryUsers.filter((user) => {
+              if (user.status !== "active") return false;
+              const isRadius = radiusHosts.has(user.station);
+              return isRadius
+                ? Boolean(radiusUsage[user.clientname]?.online)
+                : !mikrotikFailed && activeUsernames.has(user.clientname);
+            }).length;
             summary = {
               totalUsers: result?.totalCount || 0,
               activeUsers: summary?.activeAccounts || 0,
               expiredUsers: summary?.expiredAccounts || 0,
               onlineUsers,
               offlineUsers: Math.max((result?.totalCount || 0) - onlineUsers, 0),
-              mikrotikReachable: !mikrotikFailed,
+              mikrotikReachable: !mikrotikFailed || apiStationHosts.length === 0,
             };
           }
           break;
@@ -5407,10 +5424,21 @@ class Controller {
         this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
           console.error("Dashboard stats refresh after addCode failed:", err?.message || err);
         });
+        const mappedUser = {
+          ...createdUser,
+          station: pkg.routerHost,
+          package: pkg.name,
+          active: "Offline",
+          systemBasis: hasRadius ? "RADIUS" : "API",
+          bandwidthUsage: hasRadius
+            ? { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+            : null,
+        };
         return res.json({
           success: true,
           message: "Code added successfully",
-          code: createdUser,
+          code: mappedUser,
+          user: mappedUser,
         });
       } else {
         return res.json({
@@ -6058,46 +6086,49 @@ class Controller {
         });
       }
       const platformID = auth.admin.platformID;
-      const user = await this.db.getUserByUsername(username);
-      const pkg = await this.db.getPackagesByID(user.packageID)
-      const stations = await this.db.getStations(platformID);
-      const stationRecord = stations.find((s) => s.mikrotikHost === pkg?.routerHost);
-      const isRadius = stationRecord?.systemBasis === "RADIUS";
-
-      const deleteuser = await this.db.deleteUser(id);
+      const user = await this.db.getUserByUsernameAndPlatform(username, platformID);
+      const pkg = user?.packageID ? await this.db.getPackagesByID(user.packageID) : null;
+      await this.db.deleteUser(id);
       this.cache.delPrefix(`main:search:${platformID}:users:`);
-      if (!pkg) {
-        await this.refreshDashboardStats(platformID, { role: auth.admin.role });
-        return res.json({
-          success: true,
-          message: "User removed but No package found!",
-        });
-      }
 
-      if (isRadius) {
-        await this.db.deleteRadiusUser(username);
-      } else {
-        const userdata = {
-          platformID: platformID,
-          action: "remove",
-          profileName: "none",
-          host: pkg.routerHost,
-          username: username
-        }
-        const removeuserfrommikrotik = await this.mikrotik.manageMikrotikUser(userdata)
-        if (!removeuserfrommikrotik.success) {
-          return res.json({
-            success: true,
-            message: "User deleted from Database but NOT removed from MikroTik.",
-            mikrotikError: removeuserfrommikrotik.message,
-          });
-        }
-      }
+      void (async () => {
+        try {
+          if (pkg) {
+            const stations = await this.db.getStations(platformID);
+            const stationRecord = stations.find((s) => s.mikrotikHost === pkg?.routerHost);
+            const isRadius = stationRecord?.systemBasis === "RADIUS";
 
-      await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+            if (isRadius) {
+              await this.db.deleteRadiusUser(username);
+            } else {
+              const userdata = {
+                platformID: platformID,
+                action: "remove",
+                profileName: "none",
+                host: pkg.routerHost,
+                username: username
+              };
+              const removeuserfrommikrotik = await this.mikrotik.manageMikrotikUser(userdata);
+              if (!removeuserfrommikrotik.success) {
+                console.warn("User deleted from database but not removed from MikroTik:", {
+                  username,
+                  platformID,
+                  message: removeuserfrommikrotik.message,
+                });
+              }
+            }
+          }
+          await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+        } catch (cleanupError) {
+          console.error("User delete cleanup failed:", cleanupError);
+        }
+      })();
+
       return res.json({
         success: true,
-        message: "User deleted from Database and Mikrotik.",
+        message: pkg
+          ? "User deleted. Router cleanup is running in the background."
+          : "User deleted.",
       })
     } catch (err) {
       console.error("An error occured", err)
@@ -6188,9 +6219,21 @@ class Controller {
       const scopedPppoes = station
         ? pppoes.filter((pppoe) => pppoe.station === station)
         : pppoes;
+      const [plans, stations] = await Promise.all([
+        this.db.getPPPoEPlans(platformID),
+        this.db.getStations(platformID),
+      ]);
+      const planById = new Map((plans || []).map((plan) => [plan.id, plan]));
+      const radiusHosts = new Set(
+        (Array.isArray(stations) ? stations : [])
+          .filter((item) => String(item?.systemBasis || "API").toUpperCase() === "RADIUS")
+          .map((item) => item.mikrotikHost)
+          .filter(Boolean)
+      );
 
       const updatedPppoes = scopedPppoes.map((pppoe) => ({
         ...pppoe,
+        planName: planById.get(pppoe.planId)?.name || (pppoe.planId ? "Unknown plan" : pppoe.name || "-"),
         link: `https://${platform.url}/pppoe?info=${pppoe.paymentLink}`,
       }));
 
@@ -6203,22 +6246,30 @@ class Controller {
           limit,
           offset,
         };
-        this.cache.set(cacheKey, response, 10000);
+        this.cache.set(cacheKey, response, 3000);
         return res.json(response);
       }
 
       const stationHosts = Array.from(
         new Set(updatedPppoes.map((pppoe) => pppoe.station).filter(Boolean))
       );
+      const apiStationHosts = stationHosts.filter((host) => !radiusHosts.has(host));
+      const radiusUsernames = updatedPppoes
+        .filter((pppoe) => radiusHosts.has(pppoe.station))
+        .map((pppoe) => pppoe.clientname)
+        .filter(Boolean);
 
-      const statusResults = await Promise.all(
-        stationHosts.map((host) =>
-          this.mikrotik.checkPPPUserStatus(platformID, host)
-        )
-      );
+      const [statusResults, radiusUsage] = await Promise.all([
+        Promise.all(
+          apiStationHosts.map((host) =>
+            this.mikrotik.checkPPPUserStatus(platformID, host)
+          )
+        ),
+        this.db.getRadiusUsageDetailsByUsernames(radiusUsernames),
+      ]);
 
       const activeUsernames = new Set();
-      let mikrotikFailed = true;
+      let mikrotikFailed = apiStationHosts.length > 0;
 
       for (const result of statusResults) {
         if (result?.success) {
@@ -6227,26 +6278,6 @@ class Controller {
             if (user?.name) activeUsernames.add(user.name);
           }
         }
-      }
-
-      if (mikrotikFailed) {
-        const newPPPoEs = updatedPppoes.map((pppoe) => ({
-          ...pppoe,
-          active: "Offline",
-        }));
-
-        const total = newPPPoEs.length;
-        const pagedPPPoE = newPPPoEs.slice(offset, offset + limit);
-        const response = {
-          success: true,
-          message: "MikroTik unreachable, forced Offline for all",
-          pppoe: pagedPPPoE,
-          total,
-          limit,
-          offset,
-        };
-        this.cache.set(cacheKey, response, 10000);
-        return res.json(response);
       }
 
       const newPPPoEs = [];
@@ -6259,7 +6290,10 @@ class Controller {
           continue;
         }
 
-        const isActive = activeUsernames.has(pppoe.clientname);
+        const isRadius = radiusHosts.has(pppoe.station);
+        const isActive = isRadius
+          ? Boolean(radiusUsage[pppoe.clientname]?.online)
+          : !mikrotikFailed && activeUsernames.has(pppoe.clientname);
         newPPPoEs.push({
           ...pppoe,
           active: isActive ? "Online" : "Offline",
@@ -6276,7 +6310,7 @@ class Controller {
         limit,
         offset,
       };
-      this.cache.set(cacheKey, response, 10000);
+      this.cache.set(cacheKey, response, 3000);
       return res.json(response);
     } catch (err) {
       console.error("An error occurred", err);
@@ -7250,7 +7284,9 @@ class Controller {
         code: paymentData.code
       });
 
-      await this.refreshDashboardStats(platformID, { role: auth.admin.role });
+      this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
+        console.error("Dashboard stats refresh after payment update failed:", err?.message || err);
+      });
       return res.json({
         success: true,
         message: "Payment updated successfully",

@@ -8,7 +8,7 @@ const {
     endOfMonth,
 } = require("date-fns");
 const { counterDelta } = require("../utils/bandwidth");
-const { notifyPaymentChanged, notifyUserChanged } = require("../utils/realtimeTables");
+const { notifyPaymentChanged, notifyPPPoEChanged, notifyUserChanged } = require("../utils/realtimeTables");
 const now = new Date();
 const offsetDate = new Date(
     now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
@@ -304,6 +304,9 @@ class DataBase {
                         ? { connect: { id: packageID } }
                         : { create: data.package },
                 },
+                include: {
+                    package: true,
+                },
             });
 
             notifyUserChanged(user, "upsert");
@@ -321,6 +324,9 @@ class DataBase {
                 where: { id },
                 data: {
                     ...data,
+                },
+                include: {
+                    package: true,
                 },
             });
             notifyUserChanged(user, "upsert");
@@ -1217,7 +1223,7 @@ class DataBase {
         const now = dueAt || new Date();
         return prisma.mpesa.findMany({
             where: {
-                status: { in: ["PENDING", "PROCESSING"] },
+                status: { in: ["PENDING", "PROCESSING", "MANUAL_REVIEW"] },
                 checkoutRequestId: { not: null },
                 createdAt: { lte: minCreatedAt },
                 OR: [
@@ -1245,6 +1251,7 @@ class DataBase {
                 OR: [
                     { status: "PENDING" },
                     { status: "PROCESSING", updatedAt: { lt: staleProcessingAt } },
+                    { status: "MANUAL_REVIEW" },
                 ],
                 AND: [{ OR: [
                     { reconciliationLeaseUntil: null },
@@ -1257,7 +1264,7 @@ class DataBase {
     }
 
     async recordMpesaReconciliation(id, data) {
-        return prisma.mpesa.update({
+        const mpesaCode = await prisma.mpesa.update({
             where: { id },
             data: {
                 ...data,
@@ -1266,6 +1273,8 @@ class DataBase {
                 reconciliationLeaseUntil: null,
             },
         });
+        notifyPaymentChanged(mpesaCode, "upsert");
+        return mpesaCode;
     }
 
     async getMpesaByPlatform(platformID) {
@@ -3447,6 +3456,7 @@ class DataBase {
             const created = await prisma.pppoe.create({
                 data
             })
+            notifyPPPoEChanged(created, "upsert");
             return created;
         } catch (error) {
             console.error("An error occured:", error);
@@ -3460,6 +3470,7 @@ class DataBase {
             const created = await prisma.pPPoEPlan.create({
                 data
             });
+            notifyPPPoEChanged(created, "plan-upsert");
             return created;
         } catch (error) {
             console.error("An error occured:", error);
@@ -3474,6 +3485,7 @@ class DataBase {
                 where: { id },
                 data,
             });
+            notifyPPPoEChanged(updated, "plan-upsert");
             return updated;
         } catch (error) {
             console.error("An error occured:", error);
@@ -3487,6 +3499,7 @@ class DataBase {
             const deleted = await prisma.pPPoEPlan.delete({
                 where: { id },
             });
+            notifyPPPoEChanged(deleted, "plan-delete");
             return deleted;
         } catch (error) {
             console.error("An error occured:", error);
@@ -3503,6 +3516,7 @@ class DataBase {
                 },
                 data
             })
+            notifyPPPoEChanged(upd, "upsert");
             return upd;
         } catch (error) {
             console.error("An error occured:", error);
@@ -3622,6 +3636,7 @@ class DataBase {
                     id
                 }
             })
+            notifyPPPoEChanged(del, "delete");
             return del;
         } catch (error) {
             console.error("An error occured:", error);
@@ -6295,7 +6310,7 @@ class DataBase {
         const [users, activeAccounts, expiredAccounts] = await Promise.all([
             prisma.pppoe.findMany({
                 where,
-                select: { clientname: true, status: true },
+                select: { clientname: true, station: true, status: true },
             }),
             prisma.pppoe.count({ where: { ...where, status: "active" } }),
             prisma.pppoe.count({ where: { ...where, status: "expired" } }),
