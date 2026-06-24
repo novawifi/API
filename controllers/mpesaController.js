@@ -60,6 +60,43 @@ class MpesaController {
         return next;
     }
 
+    async getPaymentPlatformConfig(platformID, stationHost = null) {
+        const platform = await this.db.getPlatformConfig(platformID);
+        if (!platform || !stationHost) return platform;
+
+        try {
+            const station = await this.db.getStationByHost(platformID, stationHost);
+            if (!station?.mpesaConfigEnabled) return platform;
+
+            const mpesaFields = [
+                "IsC2B",
+                "IsAPI",
+                "IsB2B",
+                "mpesaConsumerKey",
+                "mpesaConsumerSecret",
+                "mpesaShortCode",
+                "mpesaShortCodeType",
+                "mpesaAccountNumber",
+                "mpesaC2BShortCode",
+                "mpesaC2BShortCodeType",
+                "mpesaC2BAccountNumber",
+                "mpesaAccountInitiator",
+                "mpesaAccountInitiatorPassword",
+                "mpesaPassKey",
+            ];
+            const config = { ...platform, stationId: station.id, stationName: station.name };
+            for (const field of mpesaFields) {
+                if (station[field] !== undefined && station[field] !== null) {
+                    config[field] = station[field];
+                }
+            }
+            return config;
+        } catch (error) {
+            console.log("Station MPESA config lookup failed:", error?.message || error);
+            return platform;
+        }
+    }
+
     async provisionPaidProfessionalServer(platformID) {
         if (!this.webdock.isConfigured()) return null;
         const platform = await this.db.getPlatformByplatformID(platformID);
@@ -1238,7 +1275,7 @@ class MpesaController {
         }
 
         try {
-            const platform = await this.db.getPlatformConfig(platformID);
+            const platform = await this.getPaymentPlatformConfig(platformID, pkg.routerHost);
             const client = await this.db.getPlatform(platformID);
             if (!platform) {
                 return res.status(400).json({
@@ -1489,7 +1526,7 @@ class MpesaController {
         const platformID = pkg.platformID;
 
         try {
-            const platform = await this.db.getPlatformConfig(platformID);
+            const platform = await this.getPaymentPlatformConfig(platformID, pkg.station);
             if (!platform) {
                 return res.status(400).json({
                     success: false,

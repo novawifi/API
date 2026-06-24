@@ -3323,6 +3323,92 @@ class Controller {
 
   }
 
+  getMpesaSettingsPayload(data = {}) {
+    const b2bShortCodeType = ["till", "paybill"].includes(String(data.mpesaShortCodeType || "").toLowerCase())
+      ? data.mpesaShortCodeType
+      : "Till";
+    const c2bShortCodeType = ["till", "paybill"].includes(String(data.mpesaC2BShortCodeType || "").toLowerCase())
+      ? data.mpesaC2BShortCodeType
+      : "Till";
+
+    return {
+      IsC2B: data.IsC2B === true,
+      IsAPI: data.IsAPI === true,
+      IsB2B: data.IsB2B === true,
+      mpesaConsumerKey: data.mpesaConsumerKey || "",
+      mpesaConsumerSecret: data.mpesaConsumerSecret || "",
+      mpesaShortCode: data.mpesaShortCode || "",
+      mpesaShortCodeType: b2bShortCodeType,
+      mpesaAccountNumber: data.mpesaAccountNumber || "",
+      mpesaC2BShortCode: data.mpesaC2BShortCode || "",
+      mpesaC2BShortCodeType: c2bShortCodeType,
+      mpesaC2BAccountNumber: data.mpesaC2BAccountNumber || "",
+      mpesaAccountInitiator: data.mpesaAccountInitiator || "",
+      mpesaAccountInitiatorPassword: data.mpesaAccountInitiatorPassword || "",
+      mpesaPassKey: data.mpesaPassKey || "",
+    };
+  }
+
+  validateMpesaSettings(data = {}, adminID) {
+    if (data.IsC2B === true) {
+      if (!data.mpesaC2BShortCode || !data.mpesaC2BShortCodeType || !adminID) {
+        return "All MPESA fields must be filled out!";
+      }
+      if (String(data.mpesaC2BShortCodeType).toLowerCase() === "paybill" && !data.mpesaC2BAccountNumber) {
+        return "Account Number is required for Paybill!";
+      }
+    } else if (data.IsAPI === true) {
+      if (!data.mpesaConsumerKey || !data.mpesaConsumerSecret || !data.mpesaShortCode || !data.mpesaShortCodeType || !data.mpesaPassKey || !adminID) {
+        return "All MPESA fields must be filled out!";
+      }
+    } else if (data.IsB2B === true) {
+      if (!data.mpesaShortCode || !data.mpesaShortCodeType || !adminID) {
+        return "All MPESA fields must be filled out!";
+      }
+    }
+    return null;
+  }
+
+  buildStationMpesaSettings(station, platformSettings) {
+    if (!station?.mpesaConfigEnabled) {
+      return {
+        ...platformSettings,
+        stationId: station?.id || "",
+        stationName: station?.name || "",
+        inheritsMpesa: true,
+      };
+    }
+
+    const mpesaFields = [
+      "IsC2B",
+      "IsAPI",
+      "IsB2B",
+      "mpesaConsumerKey",
+      "mpesaConsumerSecret",
+      "mpesaShortCode",
+      "mpesaShortCodeType",
+      "mpesaAccountNumber",
+      "mpesaC2BShortCode",
+      "mpesaC2BShortCodeType",
+      "mpesaC2BAccountNumber",
+      "mpesaAccountInitiator",
+      "mpesaAccountInitiatorPassword",
+      "mpesaPassKey",
+    ];
+    const stationSettings = { ...platformSettings };
+    for (const field of mpesaFields) {
+      if (station[field] !== undefined && station[field] !== null) {
+        stationSettings[field] = station[field];
+      }
+    }
+    return {
+      ...stationSettings,
+      stationId: station.id,
+      stationName: station.name,
+      inheritsMpesa: false,
+    };
+  }
+
   async fetchSettings(req, res) {
 
     const { token, stationId } = req.body; if (!token) {
@@ -3404,6 +3490,7 @@ class Controller {
       platformSettings.brandingImage = normalizeBrandingImage(platformSettings.brandingImage);
 
       let stationBranding = null;
+      let stationMpesa = null;
       if (stationId) {
         const station = await this.db.getStation(stationId);
         if (!station || station.platformID !== platformID) {
@@ -3417,6 +3504,7 @@ class Controller {
           inheritsSupportPhone: !station.supportPhone,
           inheritsBrandingImage: !station.brandingImage,
         };
+        stationMpesa = this.buildStationMpesaSettings(station, platformSettings);
       }
 
       const response = {
@@ -3428,6 +3516,7 @@ class Controller {
         settings: platformSettings,
         platform_id,
         stationBranding,
+        stationMpesa,
       };
       return res.json(response);
     } catch (error) {
@@ -3468,66 +3557,38 @@ class Controller {
         message: "Missing credentials required!",
       });
     }
-    const {
-      mpesaConsumerKey,
-      mpesaConsumerSecret,
-      mpesaShortCode,
-      mpesaShortCodeType,
-      mpesaAccountNumber,
-      mpesaC2BShortCode,
-      mpesaC2BShortCodeType,
-      mpesaC2BAccountNumber,
-      mpesaPassKey,
-      IsC2B,
-      IsAPI,
-      IsB2B,
-      supportPhone,
-      brandingImage,
-    } = data;
+    const { stationId } = data;
     try {
       const existingConfig = await this.db.getPlatformConfig(platformID);
-      const b2bShortCodeType = ["till", "paybill"].includes(String(mpesaShortCodeType || "").toLowerCase())
-        ? mpesaShortCodeType
-        : "Till";
-      const c2bShortCodeType = ["till", "paybill"].includes(String(mpesaC2BShortCodeType || "").toLowerCase())
-        ? mpesaC2BShortCodeType
-        : "Till";
-      if (IsC2B === true) {
-        if (!mpesaC2BShortCode || !mpesaC2BShortCodeType || !adminID) {
-          return res.json({
-            success: false,
-            message: "All MPESA fields must be filled out!",
-          });
-        }
-        if (String(mpesaC2BShortCodeType).toLowerCase() === "paybill" && !mpesaC2BAccountNumber) {
-          return res.json({
-            success: false,
-            message: "Account Number is required for Paybill!",
-          });
-        }
-      } else if (IsAPI === true) {
-        if (!mpesaConsumerKey || !mpesaConsumerSecret || !mpesaShortCode || !mpesaShortCodeType || !mpesaPassKey || !adminID) {
-          return res.json({
-            success: false,
-            message: "All MPESA fields must be filled out!",
-          });
-        }
-      } else if (IsB2B === true) {
-        if (!mpesaShortCode || !mpesaShortCodeType || !adminID) {
-          return res.json({
-            success: false,
-            message: "All MPESA fields must be filled out!",
-          });
-        }
+      const validationMessage = this.validateMpesaSettings(data, adminID);
+      if (validationMessage) {
+        return res.json({
+          success: false,
+          message: validationMessage,
+        });
       }
+
+      const mpesaPayload = this.getMpesaSettingsPayload(data);
+      if (stationId) {
+        const station = await this.db.getStation(stationId);
+        if (!station || station.platformID !== platformID) {
+          return res.json({ success: false, message: "Station not found." });
+        }
+        const updatedStation = await this.db.updateStation(stationId, {
+          ...mpesaPayload,
+          mpesaConfigEnabled: true,
+        });
+        this.cache.del(`main:settings:${platformID}`);
+        return res.json({
+          success: true,
+          message: `MPESA Settings updated for ${updatedStation.name}.`,
+          stationMpesa: this.buildStationMpesaSettings(updatedStation, existingConfig || mpesaPayload),
+        });
+      }
+
       const payload = {
-        ...data,
+        ...mpesaPayload,
         adminID,
-        IsC2B: IsC2B === true,
-        IsAPI: IsAPI === true,
-        IsB2B: IsB2B === true,
-        mpesaShortCodeType: b2bShortCodeType,
-        mpesaC2BShortCodeType: c2bShortCodeType,
       };
       if (!existingConfig) {
         const add = await this.db.createPlatformConfig(platformID, payload);

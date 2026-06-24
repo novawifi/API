@@ -338,6 +338,21 @@ model Station {
   hotspotTemplateName String?
   supportPhone        String?
   brandingImage       String?
+  mpesaConfigEnabled  Boolean? @default(false)
+  IsC2B               Boolean?
+  IsAPI               Boolean?
+  IsB2B               Boolean?
+  mpesaConsumerKey    String?
+  mpesaConsumerSecret String?
+  mpesaShortCode      String?
+  mpesaShortCodeType  String?
+  mpesaAccountNumber  String?
+  mpesaC2BShortCode   String?
+  mpesaC2BShortCodeType String?
+  mpesaC2BAccountNumber String?
+  mpesaAccountInitiator String?
+  mpesaAccountInitiatorPassword String?
+  mpesaPassKey        String?
   reminderSent       Boolean? @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
