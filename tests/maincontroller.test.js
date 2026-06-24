@@ -278,6 +278,19 @@ test("buildNginxConfig contains server_name and proxy_pass", async () => {
     assert.ok(config.includes("proxy_pass http://localhost:3000;"));
 });
 
+test("buildNginxConfig supports a WebFig rescue backup upstream", async () => {
+    const controller = new Controller();
+    const config = controller.buildNginxConfig("router.example.com", "http://10.10.10.34", {
+        backupTargets: ["http://10.250.0.34"],
+    });
+
+    assert.ok(config.includes("upstream nova_router_example_com"));
+    assert.ok(config.includes("server 10.10.10.34:80 max_fails=1 fail_timeout=3s;"));
+    assert.ok(config.includes("server 10.250.0.34:80 backup max_fails=1 fail_timeout=3s;"));
+    assert.ok(config.includes("proxy_pass http://nova_router_example_com;"));
+    assert.ok(config.includes("proxy_next_upstream error timeout http_502 http_503 http_504;"));
+});
+
 test("getStationTemplateSelection keeps station template modes independent", () => {
     const controller = new Controller();
     const config = { template: "Default" };
@@ -311,28 +324,54 @@ test("getStationTemplateSelection supports legacy platform defaults", () => {
 test("ensureStationWebfigSite repairs the selected station mapping", async () => {
     const controller = new Controller();
     const calls = [];
-    controller.addReverseProxySite = async (domain, target) => {
-        calls.push({ type: "provision", domain, target });
+    const previousEnv = {
+        MIKROTIK_RESCUE_SSTP_ENABLED: process.env.MIKROTIK_RESCUE_SSTP_ENABLED,
+        MIKROTIK_RESCUE_SSTP_SERVER: process.env.MIKROTIK_RESCUE_SSTP_SERVER,
+        MIKROTIK_RESCUE_SSTP_PASSWORD: process.env.MIKROTIK_RESCUE_SSTP_PASSWORD,
+    };
+    process.env.MIKROTIK_RESCUE_SSTP_ENABLED = "true";
+    process.env.MIKROTIK_RESCUE_SSTP_SERVER = "api.novawifi.co.ke";
+    process.env.MIKROTIK_RESCUE_SSTP_PASSWORD = "secret";
+    controller.addReverseProxySite = async (domain, target, options) => {
+        calls.push({ type: "provision", domain, target, options });
         return { success: true };
     };
-    controller.verifyNginxSite = async (domain, target) => {
-        calls.push({ type: "verify", domain, target });
+    controller.verifyNginxSite = async (domain, target, options) => {
+        calls.push({ type: "verify", domain, target, options });
         return { success: true, httpCode: "502" };
     };
 
-    const result = await controller.ensureStationWebfigSite({
-        id: "station-1",
-        name: "Office",
-        mikrotikHost: "10.10.10.42",
-        mikrotikWebfigHost: "office-webfig.novawifi.co.ke",
-    });
+    try {
+        const result = await controller.ensureStationWebfigSite({
+            id: "station-1",
+            name: "Office",
+            mikrotikHost: "10.10.10.42",
+            mikrotikWebfigHost: "office-webfig.novawifi.co.ke",
+        });
 
-    assert.equal(result.success, true);
-    assert.equal(result.target, "http://10.10.10.42");
-    assert.deepEqual(calls, [
-        { type: "provision", domain: "office-webfig.novawifi.co.ke", target: "http://10.10.10.42" },
-        { type: "verify", domain: "office-webfig.novawifi.co.ke", target: "http://10.10.10.42" },
-    ]);
+        assert.equal(result.success, true);
+        assert.equal(result.target, "http://10.10.10.42");
+        assert.equal(result.backupTarget, "http://10.250.0.42");
+        assert.deepEqual(calls, [
+            {
+                type: "provision",
+                domain: "office-webfig.novawifi.co.ke",
+                target: "http://10.10.10.42",
+                options: { backupTargets: ["http://10.250.0.42"] },
+            },
+            {
+                type: "verify",
+                domain: "office-webfig.novawifi.co.ke",
+                target: "http://10.10.10.42",
+                options: { backupTargets: ["http://10.250.0.42"] },
+            },
+        ]);
+    } finally {
+        for (const [key, value] of Object.entries(previousEnv)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
 });
 
 test("ensureStationWebfigSite creates and stores a missing hostname", async () => {

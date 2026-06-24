@@ -4774,9 +4774,15 @@ class Controller {
 
                 const webfigSite = await this.ensureStationWebfigSite(stationResult);
                 if (!webfigSite.success) {
+                  if (!station && stationResult?.id) {
+                    await this.db.updateStation(stationResult.id, { mikrotikWebfigHost: null }).catch(() => null);
+                    stationResult.mikrotikWebfigHost = null;
+                  }
                   return res.json({
                     success: false,
                     message: webfigSite.message || "WebFig reverse proxy verification failed.",
+                    station: stationResult,
+                    webfigSite,
                   });
                 }
 
@@ -8858,11 +8864,25 @@ class Controller {
       const serviceState = await run("sudo", ["-n", "/usr/bin/systemctl", "is-active", "nginx"]);
       if (serviceState !== "active") return { success: false, message: "Nginx is not active." };
 
+      const { hasWildcardCert } = this.getWildcardCertificatePaths(safeDomain);
+      const verifyScheme = hasWildcardCert ? "https" : "http";
+      const verifyPort = hasWildcardCert ? "443" : "80";
+      const responseBody = await run("/usr/bin/curl", [
+        "-k", "-sS",
+        "--max-time", "8",
+        "--resolve", `${safeDomain}:${verifyPort}:127.0.0.1`,
+        `${verifyScheme}://${safeDomain}${verifyPath}`,
+      ]);
+      const defaultNginxPage = /Welcome to nginx!/i.test(responseBody) && /Further configuration is required/i.test(responseBody);
+      if (defaultNginxPage) {
+        return { success: false, message: `Nginx site ${safeDomain} is still serving the default nginx page.` };
+      }
+
       const httpCode = await run("/usr/bin/curl", [
         "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
         "--max-time", "8",
-        "--resolve", `${safeDomain}:443:127.0.0.1`,
-        `https://${safeDomain}${verifyPath}`,
+        "--resolve", `${safeDomain}:${verifyPort}:127.0.0.1`,
+        `${verifyScheme}://${safeDomain}${verifyPath}`,
       ]);
       if (!/^\d{3}$/.test(httpCode) || httpCode === "000") {
         return { success: false, message: `Nginx site ${safeDomain} did not answer locally.` };

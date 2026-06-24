@@ -5755,7 +5755,8 @@ function autoLogin() {
             const endpointHost = Utils.normalizeMikrotikPublicHost(payload.ddns || payload.publicIp);
             if (!endpointHost) return { success: false, message: "Public router host is required." };
             const internalHost = this.normalizeMikrotikInternalHost(payload.mikrotikHost);
-            const webfigTargetUrl = this.buildMikrotikWebfigTarget(internalHost);
+            const webfigTargets = this.buildMikrotikWebfigTargets(internalHost);
+            const webfigTargetUrl = webfigTargets?.primary;
             if (!internalHost || !webfigTargetUrl) {
                 return { success: false, message: "MikroTik internal host must be a 10.10.10.x address." };
             }
@@ -5827,7 +5828,8 @@ function autoLogin() {
                     hotspotTemplateName: null,
                 });
 
-                const proxy = await this.addReverseProxySite(mikrotikWebfigHost, webfigTargetUrl);
+                const proxyOptions = webfigTargets.rescue ? { backupTargets: [webfigTargets.rescue] } : {};
+                const proxy = await this.addReverseProxySite(mikrotikWebfigHost, webfigTargetUrl, proxyOptions);
                 if (!proxy.success) {
                     warnings.push(proxy.message || "Failed to create reverse proxy site");
                 }
