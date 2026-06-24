@@ -8787,11 +8787,13 @@ class Controller {
     const certDir = process.env.WILDCARD_CERT_DIR || `/etc/letsencrypt/live/${baseDomain}`;
     const certPath = process.env.WILDCARD_CERT_PATH || `${certDir}/fullchain.pem`;
     const keyPath = process.env.WILDCARD_KEY_PATH || `${certDir}/privkey.pem`;
+    const isBaseDomainSubdomain = domain.endsWith(`.${baseDomain}`) || domain === baseDomain;
+    const hasConfiguredCertificate = Boolean(certPath && keyPath);
     return {
       baseDomain,
       certPath,
       keyPath,
-      hasWildcardCert: domain.endsWith(baseDomain) && fs.existsSync(certPath) && fs.existsSync(keyPath),
+      hasWildcardCert: isBaseDomainSubdomain && hasConfiguredCertificate,
     };
   }
 

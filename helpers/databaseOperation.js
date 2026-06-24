@@ -139,6 +139,10 @@ class DataBase {
             const config = await prisma.platformSetting.create({
                 data: {
                     platformID,
+                    IsC2B: true,
+                    IsB2B: false,
+                    IsAPI: false,
+                    mpesaC2BShortCodeType: "Till",
                     ...data,
                 },
             });

@@ -290,9 +290,9 @@ model PlatformSetting {
   supportPhone                  String?  @default("")
   brandingImage                 String?  @default("")
   adminID                       String
-  IsC2B                         Boolean? @default(false)
+  IsC2B                         Boolean? @default(true)
   IsAPI                         Boolean? @default(false)
-  IsB2B                         Boolean? @default(true)
+  IsB2B                         Boolean? @default(false)
   mpesaConsumerKey              String?
   mpesaConsumerSecret           String?
   mpesaShortCode                String?
