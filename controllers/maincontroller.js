@@ -11649,7 +11649,12 @@ class Controller {
 
       if (normalizedTarget === "RADIUS") {
         const stations = (await this.db.getStations(platformID)) || [];
-        const existingNames = new Set(stations.map((s) => s.radiusClientName).filter(Boolean));
+        const existingNames = new Set(
+          stations
+            .filter((s) => String(s.id || "") !== String(station.id || ""))
+            .map((s) => s.radiusClientName)
+            .filter(Boolean)
+        );
         const generateName = () => {
           const base = `rad-${platformID.slice(0, 6)}`;
           const suffix = crypto.randomBytes(3).toString("hex");

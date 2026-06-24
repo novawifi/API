@@ -922,6 +922,182 @@ function autoLogin() {
         return true;
     }
 
+    getWireguardEndpointAddress() {
+        return String(
+            process.env.SERVER_WIREGUARD_ENDPOINT ||
+            process.env.NEXT_PUBLIC_SERVER_IP ||
+            process.env.SERVER_IP ||
+            process.env.RADIUS_SERVER_IP ||
+            process.env.RADIUS_SERVER_PUBLIC_IP ||
+            ""
+        ).trim();
+    }
+
+    getWireguardPublicKey() {
+        return String(process.env.WIREGUARD_PUBLIC_KEY || "xPCGwCHqAGaAbBlYHs6Af7OIAdoBsAQ5PVvEjmZb2zo=").trim();
+    }
+
+    getWireguardPort() {
+        const port = Number(process.env.SERVER_WIREGUARD_PORT || 51820);
+        return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 51820;
+    }
+
+    async inspectWireguard(channel, stationHost) {
+        const [interfaces, addresses, peers, firewall, ipServices, ping] = await Promise.all([
+            channel.write("/interface/wireguard/print", []).catch(() => []),
+            channel.write("/ip/address/print", []).catch(() => []),
+            channel.write("/interface/wireguard/peers/print", []).catch(() => []),
+            channel.write("/ip/firewall/filter/print", []).catch(() => []),
+            channel.write("/ip/service/print", ["?name=api"]).catch(() => []),
+            channel.write("/ping", ["=address=10.10.10.1", "=count=3", "=interval=500ms"]).catch(() => []),
+        ]);
+        const wireguard = (Array.isArray(interfaces) ? interfaces : [])
+            .find((item) => item.name === "wireguard" || String(item.name || "").toLowerCase().includes("wireguard"));
+        const wireguardName = wireguard?.name || "wireguard";
+        const address = (Array.isArray(addresses) ? addresses : [])
+            .find((item) => String(item.interface || "") === wireguardName && String(item.address || "").startsWith(`${stationHost}/`));
+        const peer = (Array.isArray(peers) ? peers : [])
+            .find((item) => String(item.interface || "") === wireguardName || String(item.name || "") === "novapeer");
+        const api = Array.isArray(ipServices) ? ipServices[0] : null;
+        const hasApiAddress = String(api?.address || "").split(",").map((entry) => entry.trim()).includes("10.10.10.0/24");
+        const hasApiFirewall = (Array.isArray(firewall) ? firewall : []).some((rule) => {
+            const src = String(rule["src-address"] || "");
+            const dstPort = String(rule["dst-port"] || "");
+            const protocol = String(rule.protocol || "");
+            return src === "10.10.10.0/24" && dstPort.includes("8728") && protocol === "tcp" && !this.normalizeRouterDisabled(rule.disabled);
+        });
+        const pingReplies = Array.isArray(ping)
+            ? ping.filter((row) => String(row.status || "").toLowerCase() !== "timeout" && (row.time || row["time"])).length
+            : 0;
+        return {
+            interface: {
+                exists: Boolean(wireguard),
+                name: wireguardName,
+                enabled: Boolean(wireguard) && !this.normalizeRouterDisabled(wireguard.disabled),
+                running: String(wireguard?.running || "").toLowerCase() === "true" || String(wireguard?.running || "").toLowerCase() === "yes",
+                listenPort: wireguard?.["listen-port"] || "",
+            },
+            address: {
+                exists: Boolean(address),
+                value: address?.address || "",
+            },
+            peer: {
+                exists: Boolean(peer),
+                enabled: Boolean(peer) && !this.normalizeRouterDisabled(peer.disabled),
+                endpointAddress: peer?.["endpoint-address"] || "",
+                endpointPort: peer?.["endpoint-port"] || "",
+                allowedAddress: peer?.["allowed-address"] || "",
+                lastHandshake: peer?.["last-handshake"] || "",
+            },
+            api: {
+                enabled: Boolean(api) && !this.normalizeRouterDisabled(api.disabled),
+                allowsWireguardSubnet: hasApiAddress,
+                port: api?.port || "",
+            },
+            firewall: {
+                allowsApiFromWireguard: hasApiFirewall,
+            },
+            serverPing: {
+                success: pingReplies > 0,
+                replies: pingReplies,
+            },
+        };
+    }
+
+    async ensureWireguardManagement(channel, stationHost) {
+        const repairs = [];
+        const before = await this.inspectWireguard(channel, stationHost);
+        const endpointAddress = this.getWireguardEndpointAddress();
+        const endpointPort = this.getWireguardPort();
+        const serverWgPublicKey = this.getWireguardPublicKey();
+
+        if (!before.interface.exists) {
+            await channel.write("/interface/wireguard/add", [
+                "=name=wireguard",
+                "=listen-port=13231",
+                "=mtu=1420",
+            ]);
+            repairs.push("wireguard_interface_added");
+        } else if (!before.interface.enabled) {
+            const interfaces = await channel.write("/interface/wireguard/print", ["?name=wireguard"]).catch(() => []);
+            const iface = Array.isArray(interfaces) ? interfaces[0] : null;
+            if (iface?.[".id"]) {
+                await channel.write("/interface/wireguard/set", [`=.id=${iface[".id"]}`, "=disabled=no"]);
+                repairs.push("wireguard_interface_enabled");
+            }
+        }
+
+        const afterInterface = await this.inspectWireguard(channel, stationHost);
+        if (!afterInterface.address.exists) {
+            await channel.write("/ip/address/add", [
+                `=address=${stationHost}/24`,
+                `=interface=${afterInterface.interface.name || "wireguard"}`,
+            ]);
+            repairs.push("wireguard_address_added");
+        }
+
+        const peers = await channel.write("/interface/wireguard/peers/print", []).catch(() => []);
+        const peer = (Array.isArray(peers) ? peers : [])
+            .find((item) => String(item.interface || "") === (afterInterface.interface.name || "wireguard") || String(item.name || "") === "novapeer");
+        const peerArgs = [
+            `=interface=${afterInterface.interface.name || "wireguard"}`,
+            "=name=novapeer",
+            `=public-key=${serverWgPublicKey}`,
+            ...(endpointAddress ? [`=endpoint-address=${endpointAddress}`] : []),
+            `=endpoint-port=${endpointPort}`,
+            "=allowed-address=10.10.10.1/32",
+            "=persistent-keepalive=10",
+            "=disabled=no",
+        ];
+        if (peer?.[".id"]) {
+            await channel.write("/interface/wireguard/peers/set", [`=.id=${peer[".id"]}`, ...peerArgs.filter((arg) => !arg.startsWith("=name="))]);
+            repairs.push("wireguard_peer_updated");
+        } else {
+            await channel.write("/interface/wireguard/peers/add", peerArgs);
+            repairs.push("wireguard_peer_added");
+        }
+
+        const services = await channel.write("/ip/service/print", ["?name=api"]).catch(() => []);
+        const api = Array.isArray(services) ? services[0] : null;
+        if (api?.[".id"]) {
+            const allowed = new Set(
+                String(api.address || "")
+                    .split(",")
+                    .map((entry) => entry.trim())
+                    .filter(Boolean)
+            );
+            allowed.add("10.10.10.0/24");
+            await channel.write("/ip/service/set", [`=.id=${api[".id"]}`, `=address=${[...allowed].join(",")}`, "=disabled=no"]);
+            repairs.push("api_allowed_from_wireguard");
+        }
+
+        const firewall = await channel.write("/ip/firewall/filter/print", []).catch(() => []);
+        const apiRule = (Array.isArray(firewall) ? firewall : [])
+            .find((rule) => rule.comment === "Allow API from WireGuard" || (
+                String(rule["src-address"] || "") === "10.10.10.0/24" &&
+                String(rule["dst-port"] || "").includes("8728") &&
+                String(rule.protocol || "") === "tcp"
+            ));
+        const firewallArgs = [
+            "=chain=input",
+            "=src-address=10.10.10.0/24",
+            "=protocol=tcp",
+            "=dst-port=8728",
+            "=action=accept",
+            "=comment=Allow API from WireGuard",
+            "=disabled=no",
+        ];
+        if (apiRule?.[".id"]) {
+            await channel.write("/ip/firewall/filter/set", [`=.id=${apiRule[".id"]}`, ...firewallArgs]);
+        } else {
+            await channel.write("/ip/firewall/filter/add", [...firewallArgs, "=place-before=0"]);
+        }
+        repairs.push("wireguard_api_firewall_ready");
+
+        const final = await this.inspectWireguard(channel, stationHost);
+        return { repairs: [...new Set(repairs)], before, after: final };
+    }
+
     async getRouterQuickSettings(req, res) {
         try {
             const result = await this.withAuthenticatedStationChannel(req, res, async (channel, auth) => {
@@ -930,6 +1106,7 @@ function autoLogin() {
                 const ipServices = await channel.write("/ip/service/print", []).catch(() => []);
                 const dnsSettings = await channel.write("/ip/dns/print", []).catch(() => []);
                 const cloudSettings = await channel.write("/ip/cloud/print", []).catch(() => []);
+                const wireguardStatus = await this.inspectWireguard(channel, auth.host).catch(() => null);
 
                 const serviceByName = new Map((Array.isArray(ipServices) ? ipServices : []).map((service) => [service.name, service]));
                 const dns = Array.isArray(dnsSettings) ? dnsSettings[0] : null;
@@ -967,6 +1144,14 @@ function autoLogin() {
                             enabled: String(cloud?.["ddns-enabled"] || "").toLowerCase() === "yes",
                             dnsName: cloud?.["dns-name"] || "",
                         },
+                        wireguard: wireguardStatus || {
+                            interface: { exists: false, enabled: false, running: false },
+                            address: { exists: false },
+                            peer: { exists: false, enabled: false },
+                            api: { enabled: false, allowsWireguardSubnet: false },
+                            firewall: { allowsApiFromWireguard: false },
+                            serverPing: { success: false, replies: 0 },
+                        },
                     },
                 };
             });
@@ -981,7 +1166,7 @@ function autoLogin() {
         try {
             const setting = String(req.body?.setting || "").trim();
             const enabled = req.body?.enabled === true || req.body?.enabled === "true";
-            const allowed = new Set(["hotspot", "pppoe", "api", "webfig", "dnsRemote", "ipCloud"]);
+            const allowed = new Set(["hotspot", "pppoe", "api", "webfig", "dnsRemote", "ipCloud", "wireguard"]);
             if (!allowed.has(setting)) {
                 return res.status(400).json({ success: false, message: "Invalid router setting" });
             }
@@ -1026,6 +1211,43 @@ function autoLogin() {
 
                 if (setting === "ipCloud") {
                     await channel.write("/ip/cloud/set", [`=ddns-enabled=${boolValue}`]);
+                    touched = 1;
+                }
+
+                if (setting === "wireguard") {
+                    const interfaces = await channel.write("/interface/wireguard/print", []).catch(() => []);
+                    const wireguard = (Array.isArray(interfaces) ? interfaces : [])
+                        .find((item) => item.name === "wireguard" || String(item.name || "").toLowerCase().includes("wireguard"));
+                    if (!wireguard?.[".id"]) {
+                        if (!enabled) {
+                            return { success: true, message: "wireguard already disabled", touched: 0 };
+                        }
+                        const host = String(req.body?.host || "").trim();
+                        const outcome = await this.ensureWireguardManagement(channel, host);
+                        return {
+                            success: true,
+                            message: "wireguard created and enabled successfully",
+                            touched: outcome.repairs.length,
+                            details: outcome,
+                        };
+                    }
+                    await channel.write("/interface/wireguard/set", [
+                        `=.id=${wireguard[".id"]}`,
+                        `=disabled=${disabledValue}`,
+                    ]);
+                    const peers = await channel.write("/interface/wireguard/peers/print", []).catch(() => []);
+                    for (const peer of Array.isArray(peers) ? peers : []) {
+                        if (!peer[".id"]) continue;
+                        if (String(peer.interface || "") !== String(wireguard.name || "wireguard") && String(peer.name || "") !== "novapeer") continue;
+                        await channel.write("/interface/wireguard/peers/set", [
+                            `=.id=${peer[".id"]}`,
+                            `=disabled=${disabledValue}`,
+                        ]).catch(() => null);
+                    }
+                    if (enabled) {
+                        const host = String(req.body?.host || "").trim();
+                        await this.ensureWireguardManagement(channel, host).catch(() => null);
+                    }
                     touched = 1;
                 }
 
@@ -4622,86 +4844,123 @@ function autoLogin() {
                 return res.status(404).json({ success: false, message: "Station not found" });
             }
 
-            const tcpResult = await new Promise((resolve) => {
-                const socket = new net.Socket();
-                let resolved = false;
-                const finish = (ok, error) => {
-                    if (resolved) return;
-                    resolved = true;
-                    try { socket.destroy(); } catch (e) { }
-                    resolve({ ok, error });
-                };
-                socket.setTimeout(3000);
-                socket.once("connect", () => finish(true, null));
-                socket.once("timeout", () => finish(false, "Connection timeout"));
-                socket.once("error", (err) => finish(false, err?.message || "Connection error"));
-                socket.connect(8728, station);
-            });
+            const decryptedPassword = Utils.decryptPasswordSafe(stationRecord.mikrotikPassword);
+            const rescueConfig = getMikrotikRescueConfig(station);
+            const diagnosis = {
+                primary: {
+                    host: station,
+                    apiPort: 8728,
+                    reachable: false,
+                    connected: false,
+                    error: "",
+                },
+                rescue: {
+                    enabled: Boolean(rescueConfig.enabled),
+                    host: rescueConfig.enabled ? rescueConfig.rescueAddress : "",
+                    connected: false,
+                    error: rescueConfig.enabled ? "" : rescueConfig.reason,
+                },
+                activeTransport: "",
+                wireguard: null,
+                hotspot: { configured: false, servers: [] },
+                repairs: [],
+                recommendations: [],
+            };
 
-            if (!tcpResult.ok) {
+            let connection = null;
+            try {
+                const channel = await this.config.connectRouterApi(station, stationRecord.mikrotikUser, decryptedPassword, 3500);
+                connection = { channel, host: station, transport: "wireguard" };
+                diagnosis.primary.reachable = true;
+                diagnosis.primary.connected = true;
+            } catch (primaryError) {
+                diagnosis.primary.error = primaryError?.message || "Primary WireGuard API connection failed";
+                if (rescueConfig.enabled) {
+                    try {
+                        const channel = await this.config.connectRouterApi(
+                            rescueConfig.rescueAddress,
+                            stationRecord.mikrotikUser,
+                            decryptedPassword,
+                            6000
+                        );
+                        connection = { channel, host: rescueConfig.rescueAddress, transport: "sstp-rescue" };
+                        diagnosis.rescue.connected = true;
+                    } catch (rescueError) {
+                        diagnosis.rescue.error = rescueError?.message || "SSTP rescue API connection failed";
+                    }
+                }
+            }
+
+            if (!connection?.channel) {
+                const primaryMessage = diagnosis.primary.error || "WireGuard API failed";
+                const rescueMessage = diagnosis.rescue.enabled
+                    ? diagnosis.rescue.error || "SSTP rescue failed"
+                    : "SSTP rescue is not configured";
                 return res.json({
                     success: false,
                     status: "unreachable",
-                    diagnosis: "Router offline or network unreachable (or wrong host).",
-                    message: "Unable to reach router API port.",
-                    details: { error: tcpResult.error },
+                    diagnosis: `Router unavailable. WireGuard: ${primaryMessage}. SSTP: ${rescueMessage}.`,
+                    message: "Unable to reach router through WireGuard or SSTP rescue.",
+                    details: diagnosis,
                 });
             }
 
-            const connection = await this.config.createSingleMikrotikClient(platformID, station);
-            if (!connection?.channel) {
-                return res.json({
-                    success: false,
-                    status: "auth_failed",
-                    diagnosis: "Router reachable but login failed (bad credentials or API disabled).",
-                    message: "Router reachable but login failed.",
-                });
-            }
+            diagnosis.activeTransport = connection.transport;
 
-            let hotspotConfigured = false;
-            let hotspotServers = [];
             try {
-                const servers = await this.mikrotik.listHotspotServers(connection.channel);
-                hotspotServers = servers.map((s) => s.name).filter(Boolean);
-                hotspotConfigured = servers.length > 0;
+                diagnosis.wireguard = await this.inspectWireguard(connection.channel, station);
+                if (connection.transport === "sstp-rescue") {
+                    const repair = await this.ensureWireguardManagement(connection.channel, station);
+                    diagnosis.repairs.push(...repair.repairs);
+                    diagnosis.wireguard = repair.after;
+                }
+
+                const servers = await this.mikrotik.listHotspotServers(connection.channel).catch(() => []);
+                diagnosis.hotspot.servers = servers.map((s) => s.name).filter(Boolean);
+                diagnosis.hotspot.configured = servers.length > 0;
+
+                if (!diagnosis.wireguard?.interface?.exists) {
+                    diagnosis.recommendations.push("WireGuard interface is missing.");
+                }
+                if (diagnosis.wireguard?.interface?.exists && !diagnosis.wireguard?.interface?.enabled) {
+                    diagnosis.recommendations.push("WireGuard interface is disabled.");
+                }
+                if (!diagnosis.wireguard?.peer?.exists) {
+                    diagnosis.recommendations.push("WireGuard server peer is missing.");
+                }
+                if (!diagnosis.wireguard?.api?.allowsWireguardSubnet) {
+                    diagnosis.recommendations.push("RouterOS API service did not allow 10.10.10.0/24.");
+                }
+                if (!diagnosis.wireguard?.firewall?.allowsApiFromWireguard) {
+                    diagnosis.recommendations.push("Firewall did not explicitly allow API from WireGuard.");
+                }
+                if (!diagnosis.wireguard?.serverPing?.success) {
+                    diagnosis.recommendations.push("Router could not ping Nova WireGuard gateway 10.10.10.1.");
+                }
             } finally {
                 await this.safeCloseChannel(connection.channel);
             }
 
-            if (!hotspotConfigured) {
-                const autoConfigResult = await new Promise((resolve) => {
-                    const fakeRes = {
-                        status: () => fakeRes,
-                        json: (payload) => resolve(payload),
-                    };
-                    this.autoConfigureHotspot({ body: { token, station } }, fakeRes);
-                });
-
-                if (autoConfigResult?.success) {
-                    return res.json({
-                        success: true,
-                        status: "repaired",
-                        diagnosis: "Hotspot was not configured. Auto-configuration applied.",
-                        message: autoConfigResult.message || "Auto configuration applied.",
-                        details: autoConfigResult,
-                    });
-                }
-
-                return res.json({
-                    success: false,
-                    status: "repair_failed",
-                    diagnosis: "Router reachable but hotspot configuration failed.",
-                    message: autoConfigResult?.message || "Failed to auto configure hotspot.",
-                    details: autoConfigResult,
-                });
-            }
+            const usedRescue = diagnosis.activeTransport === "sstp-rescue";
+            const repaired = diagnosis.repairs.length > 0;
+            const healthyPrimary = diagnosis.primary.connected || (
+                diagnosis.wireguard?.interface?.enabled &&
+                diagnosis.wireguard?.peer?.exists &&
+                diagnosis.wireguard?.api?.allowsWireguardSubnet &&
+                diagnosis.wireguard?.firewall?.allowsApiFromWireguard
+            );
+            const summary = usedRescue
+                ? repaired
+                    ? "SSTP rescue connected and repaired WireGuard management settings."
+                    : "SSTP rescue connected. WireGuard still needs attention."
+                : "WireGuard API connected. Router management path looks reachable.";
 
             return res.json({
                 success: true,
-                status: "configured",
-                diagnosis: "Router reachable and hotspot configuration looks OK.",
-                message: "Router OK.",
-                details: { hotspotServers },
+                status: usedRescue ? (repaired ? "repaired_via_sstp" : "rescue_connected") : "healthy",
+                diagnosis: summary,
+                message: healthyPrimary ? "Router diagnosis complete." : "Router diagnosis found issues.",
+                details: diagnosis,
             });
         } catch (error) {
             return res.status(500).json({ success: false, message: "Failed to diagnose router", error: error?.message });
