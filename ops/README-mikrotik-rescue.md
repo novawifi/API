@@ -1,6 +1,7 @@
 # MikroTik SSTP Rescue
 
 The central SSTP service must be active before installing rescue configuration on a router.
+The service uses a dedicated RSA certificate at `/etc/nova/sstp-rescue-rsa.crt` because some MikroTik SSTP clients only negotiate the legacy RSA cipher configured here. The generated MikroTik client disables certificate verification for this rescue-only tunnel.
 
 Generate one RouterOS script for a router's existing WireGuard address:
 

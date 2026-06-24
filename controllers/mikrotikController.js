@@ -130,8 +130,10 @@ class Mikrotikcontroller {
             "=dial-on-demand=no",
             "=keepalive-timeout=30",
             "=tls-version=only-1.2",
-            "=verify-server-certificate=yes",
-            "=verify-server-address-from-certificate=yes",
+            "=ciphers=aes256-sha",
+            "=add-sni=yes",
+            "=verify-server-certificate=no",
+            "=verify-server-address-from-certificate=no",
             "=comment=Nova emergency rescue tunnel",
         ];
 
@@ -139,14 +141,14 @@ class Mikrotikcontroller {
             await channel.write("/interface/sstp-client/set", [
                 `=.id=${existing[".id"]}`,
                 ...interfaceArgs,
-                "=disabled=yes",
+                "=disabled=no",
             ]);
             fixes.push("sstp_rescue_updated");
         } else {
             await channel.write("/interface/sstp-client/add", [
                 `=name=${config.interfaceName}`,
                 ...interfaceArgs,
-                "=disabled=yes",
+                "=disabled=no",
             ]);
             fixes.push("sstp_rescue_added");
         }
@@ -4963,17 +4965,21 @@ function autoLogin() {
                 `:if ([:len $userId] = 0) do={ /user/add name=$apiUser password=$apiPass group=full } else={ /user/set $userId password=$apiPass }`,
                 `$safeFetch ($logBase . "api-user-ready")`,
                 ...radiusScript,
+                `$safeFetch ($logBase . "finalizing-router-details")`,
                 `/ip cloud set ddns-enabled=yes`,
                 `:delay 5s`,
                 `:local ddns [/ip/cloud/get dns-name]`,
                 `:local publicIp [/ip/cloud/get public-address]`,
                 `:if ([:len $publicIp] = 0) do={`,
+                `$safeFetch ($logBase . "public-ip-lookup")`,
                 `:local ipify [/tool fetch url="https://api64.ipify.org" as-value output=user]`,
                 `:if ([:typeof ($ipify->"data")] = "str") do={ :set publicIp ($ipify->"data") }`,
                 `}`,
                 `:if ([:len $ddns] = 0) do={ :set ddns $publicIp }`,
                 `:local pubkey [/interface wireguard/get [find name=wireguard] public-key]`,
+                `$safeFetch ($logBase . "saving-station")`,
                 `$safeFetch ($completeUrl . "&publicKey=" . $pubkey . "&ddns=" . $ddns . "&publicIp=" . $publicIp . "&user=" . $apiUser . "&pass=" . $apiPass . "&host=" . $internalIp . "&name=" . $routerName)`,
+                `$safeFetch ($logBase . "station-save-request-sent")`,
             ].join("\n");
 
             res.setHeader("Content-Type", "text/plain");

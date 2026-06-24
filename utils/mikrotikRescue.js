@@ -19,6 +19,8 @@ const escapeRouterOsString = (value) => String(value || "")
     .replace(/"/g, "\\\"")
     .replace(/[\r\n\0]/g, "");
 
+const escapeRouterOsSchedulerEvent = (value) => String(value || "").replace(/\$/g, "\\$");
+
 const getMikrotikRescueConfig = (routerHost, env = process.env) => {
     if (!isEnabled(env.MIKROTIK_RESCUE_SSTP_ENABLED)) {
         return { enabled: false, reason: "disabled" };
@@ -82,7 +84,7 @@ const buildMikrotikRescueScript = (config) => {
     const eventInterfaceName = eventName(name);
     const eventWatchdogName = eventName(watchdog);
     const eventBootstrapName = eventName(bootstrap);
-    const watchdogEvent = [
+    const watchdogEvent = escapeRouterOsSchedulerEvent([
         `:local rescue [/interface/sstp-client/find name=${eventInterfaceName}];`,
         `:if ([:len $rescue] > 0) do={`,
         `:local restart false;`,
@@ -90,16 +92,17 @@ const buildMikrotikRescueScript = (config) => {
         `:if (!$restart) do={ :if ([/ping address=${gateway} interface=${eventInterfaceName} count=3 interval=1s] = 0) do={ :set restart true } };`,
         `:if ($restart) do={ /interface/sstp-client disable $rescue; :delay 5s; /interface/sstp-client enable $rescue }`,
         `}`,
-    ].join(" ");
-    const bootstrapEvent = [
+    ].join(" "));
+    const bootstrapEvent = escapeRouterOsSchedulerEvent([
         `:local rescue [/interface/sstp-client/find name=${eventInterfaceName}];`,
         `:if ([:len $rescue] > 0) do={ /interface/sstp-client enable $rescue };`,
         `:do { /system/scheduler remove [find name=${eventBootstrapName}] } on-error={}`,
-    ].join(" ");
+    ].join(" "));
 
     return [
         `:do { /interface/sstp-client remove [find name="${name}"] } on-error={}`,
-        `/interface/sstp-client add name="${name}" connect-to="${server}" port=${config.port} user="${username}" password="${password}" authentication=mschap2 profile=default-encryption add-default-route=no dial-on-demand=no keepalive-timeout=30 tls-version=only-1.2 verify-server-certificate=yes verify-server-address-from-certificate=yes disabled=yes comment="Nova emergency rescue tunnel"`,
+        `/interface/sstp-client add name="${name}" connect-to="${server}" port=${config.port} user="${username}" password="${password}" authentication=mschap2 profile=default-encryption add-default-route=no dial-on-demand=no keepalive-timeout=30 tls-version=only-1.2 ciphers=aes256-sha add-sni=yes verify-server-certificate=no verify-server-address-from-certificate=no disabled=no comment="Nova emergency rescue tunnel"`,
+        `:do { /interface/sstp-client enable [find name="${name}"] } on-error={}`,
         `:do { /ip/firewall/filter remove [find comment="Nova rescue management"] } on-error={}`,
         `/ip/firewall/filter add chain=input in-interface="${name}" src-address="${subnet}" protocol=tcp dst-port="${ports}" action=accept comment="Nova rescue management" place-before=0`,
         `:do { /system/scheduler remove [find name="${watchdog}"] } on-error={}`,

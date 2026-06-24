@@ -6,7 +6,9 @@ APP_DIR="${APP_DIR:-/home/kyan/apps/nova-server}"
 RESCUE_HOST="${RESCUE_HOST:-api.novawifi.co.ke}"
 RESCUE_PORT="${RESCUE_PORT:-4443}"
 RESCUE_PREFIX="${RESCUE_PREFIX:-10.250.0}"
-CERT_DIR="${CERT_DIR:-/etc/letsencrypt/live/novawifi.co.ke}"
+RESCUE_CERT_DIR="${RESCUE_CERT_DIR:-/etc/nova}"
+RESCUE_CERT_PATH="${RESCUE_CERT_PATH:-${RESCUE_CERT_DIR}/sstp-rescue-rsa.crt}"
+RESCUE_KEY_PATH="${RESCUE_KEY_PATH:-${RESCUE_CERT_DIR}/sstp-rescue-rsa.key}"
 SOURCE_DIR="/usr/local/src/accel-ppp-${ACCEL_VERSION}"
 BUILD_DIR="${SOURCE_DIR}/build"
 CONFIG_FILE="/etc/accel-ppp.conf"
@@ -24,11 +26,6 @@ if [[ ! -f "${APP_DIR}/.env" ]]; then
     exit 1
 fi
 
-if [[ ! -r "${CERT_DIR}/fullchain.pem" || ! -r "${CERT_DIR}/privkey.pem" ]]; then
-    echo "TLS certificate files are unavailable under ${CERT_DIR}." >&2
-    exit 1
-fi
-
 install -d -m 0750 /etc/nova /etc/ppp /var/log/accel-ppp /usr/local/src
 if [[ ! -s "${PASSWORD_FILE}" ]]; then
     umask 077
@@ -36,6 +33,19 @@ if [[ ! -s "${PASSWORD_FILE}" ]]; then
 fi
 chmod 0600 "${PASSWORD_FILE}"
 RESCUE_PASSWORD="$(cat "${PASSWORD_FILE}")"
+
+install -d -m 0750 "${RESCUE_CERT_DIR}"
+if [[ ! -r "${RESCUE_CERT_PATH}" || ! -r "${RESCUE_KEY_PATH}" ]]; then
+    umask 077
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+        -subj "/CN=${RESCUE_HOST}" \
+        -keyout "${RESCUE_KEY_PATH}" \
+        -out "${RESCUE_CERT_PATH}"
+fi
+chmod 0644 "${RESCUE_CERT_PATH}"
+chmod 0600 "${RESCUE_KEY_PATH}"
+modprobe ppp_mppe || true
+echo ppp_mppe > /etc/modules-load.d/nova-rescue-ppp.conf
 
 if ! command -v accel-pppd >/dev/null 2>&1; then
     apt-get update -y
@@ -95,6 +105,7 @@ min-mtu=1280
 mtu=1452
 mru=1452
 ipv4=require
+mppe=require
 ipv6=deny
 lcp-echo-interval=20
 lcp-echo-timeout=60
@@ -109,13 +120,15 @@ chap-secrets=${SECRETS_FILE}
 gw-ip-address=${RESCUE_PREFIX}.1
 
 [sstp]
+verbose=1
 bind=0.0.0.0
 port=${RESCUE_PORT}
 accept=ssl
 ssl-protocol=tls1.2,tls1.3
-ssl-pemfile=${CERT_DIR}/fullchain.pem
-ssl-keyfile=${CERT_DIR}/privkey.pem
-host-name=${RESCUE_HOST}
+ssl-ciphers=AES256-SHA:@SECLEVEL=0
+ssl-prefer-server-ciphers=0
+ssl-pemfile=${RESCUE_CERT_PATH}
+ssl-keyfile=${RESCUE_KEY_PATH}
 http-error=deny
 timeout=30
 hello-interval=30
@@ -132,8 +145,9 @@ timeout=60
 [log]
 log-file=/var/log/accel-ppp/accel-ppp.log
 log-emerg=/var/log/accel-ppp/emerg.log
+log-fail-file=/var/log/accel-ppp/auth-fail.log
 copy=1
-level=3
+level=4
 EOF
 chmod 0600 "${CONFIG_FILE}"
 
@@ -154,13 +168,6 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-
-install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-cat > /etc/letsencrypt/renewal-hooks/deploy/restart-accel-ppp-rescue <<'EOF'
-#!/usr/bin/env bash
-systemctl try-restart accel-ppp-rescue.service
-EOF
-chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/restart-accel-ppp-rescue
 
 env_tmp="$(mktemp)"
 grep -Ev '^MIKROTIK_RESCUE_(SSTP_ENABLED|SSTP_SERVER|SSTP_PORT|SSTP_USERNAME_TEMPLATE|SSTP_PASSWORD|ADDRESS_PREFIX)=' "${APP_DIR}/.env" > "${env_tmp}"
