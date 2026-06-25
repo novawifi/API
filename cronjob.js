@@ -19,7 +19,7 @@ const { MpesaController } = require("./controllers/mpesaController");
 const { Mikrotikcontroller } = require("./controllers/mikrotikController");
 const { Utils } = require("./utils/Functions");
 const { socketManager } = require("./controllers/socketController");
-const { getRadiusClientIp, isWireGuardMikrotikIp, updateClientIp } = require("./utils/radiusConfig");
+const { ensureRadiusClient, getRadiusClientIp, isWireGuardMikrotikIp, updateClientIp } = require("./utils/radiusConfig");
 const { WebdockService } = require("./services/webdockService");
 
 class CronJob {
@@ -55,6 +55,21 @@ class CronJob {
                 }
             }
         }, 30 * 1000);
+    }
+
+    async findRadiusStationSharingClientIp(radiusClientIp, currentStationId = "") {
+        const ip = String(radiusClientIp || "").trim();
+        if (!ip || !this.db?.getAllStations) return null;
+        try {
+            const stations = await this.db.getAllStations();
+            return (stations || []).find((station) =>
+                String(station?.id || "") !== String(currentStationId || "") &&
+                String(station?.radiusClientIp || "").trim() === ip &&
+                String(station?.radiusClientSecret || "").trim()
+            ) || null;
+        } catch (_error) {
+            return null;
+        }
     }
 
     async pingWithRetry(pingFn, retries = 3, waitMs = 2000) {
@@ -2130,21 +2145,40 @@ Price: KSH ${service.price}</p>
                     }
                     continue;
                 }
-                if (!station.mikrotikDDNS) continue;
-                if (Utils.isValidIP && Utils.isValidIP(station.mikrotikDDNS)) continue;
+                const publicHost = station.mikrotikPublicHost || station.mikrotikDDNS || "";
+                if (!publicHost) continue;
+                if (Utils.isValidIP && Utils.isValidIP(publicHost)) continue;
                 if (!station.radiusClientName) continue;
 
-                const resolved = await dns.resolve4(station.mikrotikDDNS);
+                const resolved = await dns.resolve4(publicHost);
                 const publicIp = Array.isArray(resolved) && resolved.length > 0 ? resolved[0] : null;
                 if (!publicIp) continue;
 
-                const updateResult = await updateClientIp({
-                    name: station.radiusClientName,
-                    ip: publicIp,
-                });
+                const sharedRadiusStation = await this.findRadiusStationSharingClientIp(publicIp, station.id);
+                const radiusSecret = sharedRadiusStation?.radiusClientSecret || station.radiusClientSecret;
+                let updateResult;
+                if (sharedRadiusStation?.radiusClientSecret && sharedRadiusStation.radiusClientSecret !== station.radiusClientSecret) {
+                    updateResult = await ensureRadiusClient({
+                        name: station.radiusClientName,
+                        ip: publicIp,
+                        secret: sharedRadiusStation.radiusClientSecret,
+                        shortname: station.name || station.mikrotikHost,
+                        server: station.radiusServerIp || "",
+                        description: `Nova RADIUS client for ${station.name || station.mikrotikHost}`,
+                    });
+                    updateResult.updated = Boolean(updateResult?.success);
+                } else {
+                    updateResult = await updateClientIp({
+                        name: station.radiusClientName,
+                        ip: publicIp,
+                    });
+                }
 
                 if (updateResult?.updated) {
-                    await this.db.updateStation(station.id, { radiusClientIp: publicIp });
+                    await this.db.updateStation(station.id, {
+                        radiusClientIp: publicIp,
+                        ...(radiusSecret ? { radiusClientSecret: radiusSecret } : {}),
+                    });
                     socketManager.log(platformID, `RADIUS client IP updated for ${station.name}`, {
                         context: "cron",
                         level: "info",

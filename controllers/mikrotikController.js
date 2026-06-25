@@ -43,6 +43,72 @@ class Mikrotikcontroller {
         });
     }
 
+    async findRadiusStationSharingClientIp(radiusClientIp, currentStationId = "") {
+        const ip = String(radiusClientIp || "").trim();
+        if (!ip || !this.db?.getAllStations) return null;
+        try {
+            const stations = await this.db.getAllStations();
+            return (stations || []).find((station) =>
+                String(station?.id || "") !== String(currentStationId || "") &&
+                String(station?.radiusClientIp || "").trim() === ip &&
+                String(station?.radiusClientSecret || "").trim()
+            ) || null;
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    async normalizeRouterRadiusClient(platformID, host, radiusServerIp, radiusSecret) {
+        if (!platformID || !host || !radiusServerIp || !radiusSecret) {
+            return { success: false, message: "Missing RADIUS router normalization data" };
+        }
+        let connection;
+        try {
+            connection = await this.config.createSingleMikrotikClient(platformID, host);
+            if (!connection?.channel) {
+                return { success: false, message: "No valid MikroTik connection" };
+            }
+            const { channel } = connection;
+            const entries = await channel.write("/radius/print", []);
+            const matches = (Array.isArray(entries) ? entries : [])
+                .filter((entry) => String(entry.address || "") === String(radiusServerIp));
+            const keep = matches[0];
+            for (const extra of matches.slice(1)) {
+                if (extra?.[".id"]) {
+                    await channel.write("/radius/remove", [`=.id=${extra[".id"]}`]).catch(() => null);
+                }
+            }
+            const args = [
+                `=secret=${radiusSecret}`,
+                "=service=ppp,hotspot",
+                "=timeout=3s",
+                "=require-message-auth=no",
+            ];
+            if (keep?.[".id"]) {
+                await channel.write("/radius/set", [
+                    `=.id=${keep[".id"]}`,
+                    ...args,
+                ]);
+            } else {
+                await channel.write("/radius/add", [
+                    `=address=${radiusServerIp}`,
+                    ...args,
+                ]);
+            }
+            await channel.write("/radius/incoming/set", ["=accept=yes"]).catch(() => null);
+            await channel.write("/ppp/aaa/set", [
+                "=use-radius=yes",
+                "=accounting=yes",
+                "=interim-update=1m",
+            ]).catch(() => null);
+            return { success: true };
+        } catch (error) {
+            return { success: false, message: error?.message || "Router RADIUS normalization failed" };
+        } finally {
+            await this.safeCloseChannel(connection?.channel);
+        }
+    }
+
     async pushDashboardStats(platformID) {
         if (!platformID) return;
         try {
@@ -4287,19 +4353,28 @@ function autoLogin() {
                                 String(r.service || "").toLowerCase().includes("ppp")
                             )
                             : null;
-                        if (matchingRadius) {
-                            if (String(matchingRadius.secret || "") !== radiusSecret && matchingRadius[".id"]) {
-                                await channel.write("/radius/set", [
-                                    `=.id=${matchingRadius[".id"]}`,
-                                    `=secret=${radiusSecret}`,
-                                ]);
+                        const duplicateRadius = (Array.isArray(radiusEntries) ? radiusEntries : [])
+                            .filter((r) => String(r.address || "") === radiusServerIp && r[".id"] !== matchingRadius?.[".id"]);
+                        for (const duplicate of duplicateRadius) {
+                            if (duplicate?.[".id"]) {
+                                await channel.write("/radius/remove", [`=.id=${duplicate[".id"]}`]).catch(() => null);
                             }
+                        }
+                        if (matchingRadius?.[".id"]) {
+                            await channel.write("/radius/set", [
+                                `=.id=${matchingRadius[".id"]}`,
+                                `=secret=${radiusSecret}`,
+                                `=service=ppp`,
+                                `=timeout=3s`,
+                                `=require-message-auth=no`,
+                            ]);
                         } else {
                         await channel.write("/radius/add", [
                                 `=address=${radiusServerIp}`,
                                 `=secret=${radiusSecret}`,
                                 `=service=ppp`,
-                                `=timeout=300ms`,
+                                `=timeout=3s`,
+                                `=require-message-auth=no`,
                             ]);
                         }
                         await channel.write("/radius/incoming/set", ["=accept=yes"]);
@@ -4703,16 +4778,31 @@ function autoLogin() {
                         const hasRadius = Array.isArray(radiusEntries)
                             ? radiusEntries.find((r) =>
                                 String(r.address || "") === radiusServerIp &&
-                                String(r.secret || "") === stationRecord.radiusClientSecret &&
                                 String(r.service || "").toLowerCase().includes("hotspot")
                             )
                             : null;
-                        if (!hasRadius) {
+                        const duplicateRadius = (Array.isArray(radiusEntries) ? radiusEntries : [])
+                            .filter((r) => String(r.address || "") === radiusServerIp && r[".id"] !== hasRadius?.[".id"]);
+                        for (const duplicate of duplicateRadius) {
+                            if (duplicate?.[".id"]) {
+                                await channel.write("/radius/remove", [`=.id=${duplicate[".id"]}`]).catch(() => null);
+                            }
+                        }
+                        if (hasRadius?.[".id"]) {
+                            await channel.write("/radius/set", [
+                                `=.id=${hasRadius[".id"]}`,
+                                `=secret=${stationRecord.radiusClientSecret}`,
+                                `=service=hotspot`,
+                                `=timeout=3s`,
+                                `=require-message-auth=no`,
+                            ]);
+                        } else {
                             await channel.write("/radius/add", [
                                 `=address=${radiusServerIp}`,
                                 `=secret=${stationRecord.radiusClientSecret}`,
                                 `=service=hotspot`,
-                                `=timeout=300ms`,
+                                `=timeout=3s`,
+                                `=require-message-auth=no`,
                             ]);
                         }
                         await channel.write("/radius/incoming/set", ["=accept=yes"]);
@@ -5096,7 +5186,8 @@ function autoLogin() {
                 session.systemBasis === "RADIUS" && session.radiusClientSecret && radiusServerIp
                     ? [
                         `$safeFetch ($logBase . "radius-config-start")`,
-                        `/radius add address=${radiusServerIp} secret=${session.radiusClientSecret} service=ppp,hotspot timeout=300ms`,
+                        `:do { /radius remove [find address=${radiusServerIp}] } on-error={}`,
+                        `/radius add address=${radiusServerIp} secret=${session.radiusClientSecret} service=ppp,hotspot timeout=3s require-message-auth=no`,
                         `/radius incoming set accept=yes`,
                         `/ppp aaa set use-radius=yes accounting=yes interim-update=1m`,
                         `$safeFetch ($logBase . "radius-config-done")`,
@@ -5796,6 +5887,16 @@ function autoLogin() {
             let stationResult;
             const warnings = [];
             const systemBasis = session.systemBasis || "RADIUS";
+            const radiusClientIp = systemBasis === "RADIUS"
+                ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || existing?.radiusClientIp || "")
+                : null;
+            const sharedRadiusStation = systemBasis === "RADIUS"
+                ? await this.findRadiusStationSharingClientIp(radiusClientIp, existing?.id || "")
+                : null;
+            const radiusClientSecret = sharedRadiusStation?.radiusClientSecret || session.radiusClientSecret || existing?.radiusClientSecret || null;
+            if (systemBasis === "RADIUS" && radiusClientSecret) {
+                session.radiusClientSecret = radiusClientSecret;
+            }
             if (!existing) {
                 const sanitizeSubdomain = (value) => {
                     const lettersOnly = String(value || "")
@@ -5821,8 +5922,8 @@ function autoLogin() {
                     adminID,
                     systemBasis,
                     radiusClientName: session.radiusClientName || null,
-                    radiusClientSecret: session.radiusClientSecret || null,
-                    radiusClientIp: systemBasis === "RADIUS" ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || "") : null,
+                    radiusClientSecret,
+                    radiusClientIp,
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || "") : null,
                     hotspotTemplateMode: "offline",
                     hotspotTemplateName: null,
@@ -5844,14 +5945,13 @@ function autoLogin() {
                     mikrotikPublicHost: endpointHost,
                     systemBasis,
                     radiusClientName: session.radiusClientName || existing.radiusClientName || null,
-                    radiusClientSecret: session.radiusClientSecret || existing.radiusClientSecret || null,
-                    radiusClientIp: systemBasis === "RADIUS" ? getRadiusClientIp(payload.mikrotikHost, payload.publicIp || existing.radiusClientIp || "") : existing.radiusClientIp || null,
+                    radiusClientSecret,
+                    radiusClientIp: systemBasis === "RADIUS" ? radiusClientIp : existing.radiusClientIp || null,
                     radiusServerIp: systemBasis === "RADIUS" ? (session.radiusServerIp || existing.radiusServerIp || "") : existing.radiusServerIp || null,
                 });
             }
 
             if (systemBasis === "RADIUS" && session.radiusClientName && session.radiusClientSecret) {
-                const radiusClientIp = getRadiusClientIp(payload.mikrotikHost, payload.publicIp || "");
                 if (!radiusClientIp) {
                     warnings.push("RADIUS client not added: missing router client IP");
                 } else {
@@ -5867,6 +5967,15 @@ function autoLogin() {
                         warnings.push(`RADIUS client add failed: ${addResult?.message || "unknown error"}`);
                         console.warn("[RADIUS] ensureRadiusClient failed", addResult?.message || addResult);
                     }
+                }
+                const routerRadiusResult = await this.normalizeRouterRadiusClient(
+                    platformID,
+                    payload.mikrotikHost,
+                    session.radiusServerIp || getRadiusServerIp(),
+                    session.radiusClientSecret
+                );
+                if (!routerRadiusResult.success) {
+                    warnings.push(`Router RADIUS normalization failed: ${routerRadiusResult.message}`);
                 }
             }
 

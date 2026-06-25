@@ -312,7 +312,46 @@ test("autoConfigurePPPoE configures RADIUS and reuses existing PPPoE server", as
 
     const radiusSet = channelCalls.find((c) => c.path === "/radius/set");
     assert.ok(radiusSet, "Expected /radius/set to update secret");
+    assert.ok(radiusSet.args.includes("=secret=newsecret"));
+    assert.ok(radiusSet.args.includes("=timeout=3s"));
+    assert.ok(radiusSet.args.includes("=require-message-auth=no"));
 
     const radiusAdd = channelCalls.find((c) => c.path === "/radius/add");
     assert.equal(radiusAdd, undefined);
+});
+
+test("normalizeRouterRadiusClient removes duplicates and applies stable settings", async () => {
+    const ctrl = new Mikrotikcontroller();
+    const calls = [];
+    const channel = {
+        write: async (path, args) => {
+            calls.push({ path, args });
+            if (path === "/radius/print") {
+                return [
+                    { ".id": "*1", address: "77.37.97.244", secret: "old", service: "ppp", timeout: "300ms" },
+                    { ".id": "*2", address: "77.37.97.244", secret: "older", service: "hotspot", timeout: "300ms" },
+                    { ".id": "*3", address: "192.0.2.1", secret: "other", service: "ppp" },
+                ];
+            }
+            return [];
+        },
+        close: async () => calls.push({ path: "close", args: [] }),
+    };
+    ctrl.config = {
+        createSingleMikrotikClient: async () => ({ channel }),
+    };
+
+    const result = await ctrl.normalizeRouterRadiusClient("plat1", "10.10.10.34", "77.37.97.244", "sharedsecret");
+
+    assert.equal(result.success, true);
+    const remove = calls.find((call) => call.path === "/radius/remove");
+    assert.deepEqual(remove.args, ["=.id=*2"]);
+    const set = calls.find((call) => call.path === "/radius/set");
+    assert.ok(set.args.includes("=.id=*1"));
+    assert.ok(set.args.includes("=secret=sharedsecret"));
+    assert.ok(set.args.includes("=service=ppp,hotspot"));
+    assert.ok(set.args.includes("=timeout=3s"));
+    assert.ok(set.args.includes("=require-message-auth=no"));
+    assert.ok(calls.some((call) => call.path === "/radius/incoming/set"));
+    assert.ok(calls.some((call) => call.path === "/ppp/aaa/set"));
 });

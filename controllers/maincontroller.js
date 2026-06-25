@@ -60,6 +60,21 @@ class Controller {
     });
   }
 
+  async findRadiusStationSharingClientIp(radiusClientIp, currentStationId = "") {
+    const ip = String(radiusClientIp || "").trim();
+    if (!ip || !this.db?.getAllStations) return null;
+    try {
+      const stations = await this.db.getAllStations();
+      return (stations || []).find((station) =>
+        String(station?.id || "") !== String(currentStationId || "") &&
+        String(station?.radiusClientIp || "").trim() === ip &&
+        String(station?.radiusClientSecret || "").trim()
+      ) || null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   buildDashboardResponse(payload, role = "admin") {
     if (!payload) return null;
     const IsB2B = role === "superuser" ? payload.IsB2B : false;
@@ -4656,6 +4671,12 @@ class Controller {
         const radiusHost = getRadiusClientIp(stationResult, Utils.isValidIP(normalizedPublicHost)
           ? normalizedPublicHost
           : resolvedIp);
+        const sharedRadiusStation = await this.findRadiusStationSharingClientIp(radiusHost, stationResult.id);
+        if (sharedRadiusStation?.radiusClientSecret && sharedRadiusStation.radiusClientSecret !== stationResult.radiusClientSecret) {
+          stationResult = await this.db.updateStation(stationResult.id, {
+            radiusClientSecret: sharedRadiusStation.radiusClientSecret,
+          });
+        }
         await this.db.updateStation(stationResult.id, {
           radiusClientIp: radiusHost || "",
         });
@@ -11579,22 +11600,29 @@ class Controller {
       const { channel } = connection;
       try {
         const entries = await channel.write("/radius/print", []);
-        const existing = Array.isArray(entries)
-          ? entries.find((r) => String(r.address || "") === radiusServerIp)
-          : null;
+        const matches = (Array.isArray(entries) ? entries : [])
+          .filter((r) => String(r.address || "") === radiusServerIp);
+        const existing = matches[0] || null;
+        for (const extra of matches.slice(1)) {
+          if (extra?.[".id"]) {
+            await channel.write("/radius/remove", [`=.id=${extra[".id"]}`]).catch(() => null);
+          }
+        }
         if (existing && existing[".id"]) {
           await channel.write("/radius/set", [
             `=.id=${existing[".id"]}`,
             `=secret=${secret}`,
             "=service=ppp,hotspot",
-            "=timeout=300ms",
+            "=timeout=3s",
+            "=require-message-auth=no",
           ]);
         } else {
           await channel.write("/radius/add", [
             `=address=${radiusServerIp}`,
             `=secret=${secret}`,
             "=service=ppp,hotspot",
-            "=timeout=300ms",
+            "=timeout=3s",
+            "=require-message-auth=no",
           ]);
         }
         await channel.write("/radius/incoming/set", ["=accept=yes"]);
@@ -11753,9 +11781,14 @@ class Controller {
           clientName = generateName();
         }
         existingNames.add(clientName);
-        const clientSecret = getRadiusClientSecret(station.radiusClientSecret || crypto.randomBytes(12).toString("hex"));
         const publicIp = await this.resolveStationPublicIp(station);
         const radiusClientIp = getRadiusClientIp(station, publicIp || station.radiusClientIp || "");
+        const sharedRadiusStation = await this.findRadiusStationSharingClientIp(radiusClientIp, station.id);
+        const clientSecret = getRadiusClientSecret(
+          sharedRadiusStation?.radiusClientSecret ||
+          station.radiusClientSecret ||
+          crypto.randomBytes(12).toString("hex")
+        );
         if (!radiusClientIp) {
           summary.warnings.push(`Station ${station.name || station.mikrotikHost}: missing Radius client IP`);
         }

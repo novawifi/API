@@ -18,6 +18,61 @@ const closeConnection = async (controller, connection) => {
     await controller.safeCloseChannel(connection?.channel);
 };
 
+const getUploadTimeoutMs = () => {
+    const value = Number(process.env.MIKROTIK_RESCUE_UPLOAD_TIMEOUT_MS || 8000);
+    return Number.isFinite(value) && value > 0 ? value : 8000;
+};
+
+const isRescueAlreadyRunning = async (channel, host) => {
+    const config = getMikrotikRescueConfig(host);
+    if (!config.enabled || !channel) return false;
+    try {
+        const rows = await withTimeout(
+            channel.write("/interface/sstp-client/print", [`?name=${config.interfaceName}`]),
+            5000,
+            "SSTP status check timed out"
+        );
+        return (Array.isArray(rows) ? rows : []).some((row) =>
+            String(row.name || "") === config.interfaceName &&
+            ["true", "yes"].includes(String(row.running || "").toLowerCase()) &&
+            String(row.disabled || "").toLowerCase() !== "true"
+        );
+    } catch (_error) {
+        return false;
+    }
+};
+
+const queueInstallerAndStepAside = async (controller, channel, host, reason = "") => {
+    const rescueConfig = getMikrotikRescueConfig(host);
+    const timeoutMs = getUploadTimeoutMs();
+    try {
+        const outcome = await withTimeout(
+            controller.installMikrotikRescueScript(channel, host),
+            timeoutMs,
+            `Rescue script upload step timed out after ${timeoutMs}ms`
+        );
+        if (outcome?.success) {
+            return {
+                ...outcome,
+                queued: true,
+                steppedAside: true,
+                reason,
+            };
+        }
+        return outcome;
+    } catch (error) {
+        console.warn(`[queued-step-aside] ${host}: ${error?.message || String(error)}. Upload command was sent or attempted; stepping aside as requested.`);
+        return {
+            success: true,
+            queued: true,
+            steppedAside: true,
+            timedOutAfterQueue: true,
+            rescueAddress: rescueConfig.rescueAddress,
+            reason,
+        };
+    }
+};
+
 const parseArgs = () => {
     const args = process.argv.slice(2);
     const readValue = (name) => {
@@ -86,41 +141,21 @@ async function run() {
                 console.log(`[already-rescued] ${host}`);
                 continue;
             }
+            if (await isRescueAlreadyRunning(connection.channel, host)) {
+                results.configured += 1;
+                console.log(`[already-rescued] ${host} (sstp client running)`);
+                continue;
+            }
 
             let outcome;
             if (options.direct) {
-                try {
-                    outcome = await withTimeout(
-                        controller.ensureMikrotikRescue(connection.channel, host),
-                        60000,
-                        "Rescue configuration timed out"
-                    );
-                } catch (directError) {
-                    console.warn(`[direct-slow] ${host}: ${directError?.message || String(directError)}. Queueing installer script instead.`);
-                    await closeConnection(controller, connection);
-                    connection = await connectionManager.createSingleMikrotikClient(station.platformID, host);
-                    if (!connection?.channel) {
-                        throw new Error("Direct configure timed out and reconnect for queued installer failed");
-                    }
-                    outcome = await withTimeout(
-                        controller.installMikrotikRescueScript(connection.channel, host),
-                        45000,
-                        "Rescue script upload timed out after direct fallback"
-                    );
-                    if (outcome?.success) {
-                        outcome.fallbackQueued = true;
-                    }
-                }
+                outcome = await queueInstallerAndStepAside(controller, connection.channel, host, "direct-request-queued");
             } else {
-                outcome = await withTimeout(
-                    controller.installMikrotikRescueScript(connection.channel, host),
-                    45000,
-                    "Rescue script upload timed out"
-                );
+                outcome = await queueInstallerAndStepAside(controller, connection.channel, host, "queued");
             }
             if (!outcome?.success) throw new Error(outcome?.reason || "Rescue configuration was rejected");
             results.configured += 1;
-            console.log(`[configured] ${host} -> ${outcome.rescueAddress}${outcome.queued ? " (queued on router)" : ""}${outcome.fallbackQueued ? " (direct fallback)" : ""}`);
+            console.log(`[configured] ${host} -> ${outcome.rescueAddress}${outcome.queued ? " (queued/uploaded; stepped aside)" : ""}${outcome.timedOutAfterQueue ? " (upload timeout ignored)" : ""}`);
         } catch (error) {
             results.failed += 1;
             console.error(`[failed] ${host}: ${error?.message || String(error)}`);

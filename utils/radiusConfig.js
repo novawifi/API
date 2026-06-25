@@ -42,6 +42,9 @@ const getRadiusClientIp = (stationOrHost, fallbackIp = "") => {
   return String(fallbackIp || "").trim();
 };
 
+const isWireGuardMikrotikIp = (value) =>
+  /^10\.10\.10\.(?:[1-9]|[1-9]\d|1\d\d|2[0-4]\d|25[0-4])$/.test(String(value || "").trim());
+
 const sanitizeToken = (value) =>
   String(value || "")
     .trim()
@@ -248,6 +251,7 @@ module.exports = {
   getRadiusClientIp,
   getRadiusClientSecret,
   getRadiusServerIp,
+  isWireGuardMikrotikIp,
   updateClientIp,
   removeRadiusClient,
 };

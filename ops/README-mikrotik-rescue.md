@@ -10,14 +10,14 @@ cd /home/kyan/apps/nova-server
 node ops/provision-mikrotik-rescue.js --apply --station 10.10.10.13
 ```
 
-Configure directly instead of queueing the one-shot router script:
+Queue the one-shot installer through an existing Nova API connection and step aside:
 
 ```bash
 cd /home/kyan/apps/nova-server
 node ops/provision-mikrotik-rescue.js --apply --direct --station 10.10.10.13
 ```
 
-If direct configuration is slow or times out after the router is reachable, the provisioner falls back to uploading the one-shot installer script and marks that router configured once the installer is queued.
+The provisioner does not wait for every RouterOS command to finish. If the SSTP client is already running, it marks the router configured. Otherwise it sends/queues the installer script and marks the router configured even if the API upload step times out after the command was attempted.
 
 Preview eligible routers without changing anything:
 

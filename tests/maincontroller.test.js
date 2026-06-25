@@ -291,6 +291,22 @@ test("buildNginxConfig supports a WebFig rescue backup upstream", async () => {
     assert.ok(config.includes("proxy_next_upstream error timeout http_502 http_503 http_504;"));
 });
 
+test("findRadiusStationSharingClientIp returns another station using the same RADIUS source IP", async () => {
+    const controller = new Controller();
+    controller.db = {
+        getAllStations: async () => [
+            { id: "current", radiusClientIp: "197.248.139.39", radiusClientSecret: "current-secret" },
+            { id: "shared", radiusClientIp: "197.248.139.39", radiusClientSecret: "shared-secret" },
+            { id: "empty", radiusClientIp: "197.248.139.39", radiusClientSecret: "" },
+        ],
+    };
+
+    const station = await controller.findRadiusStationSharingClientIp("197.248.139.39", "current");
+
+    assert.equal(station.id, "shared");
+    assert.equal(station.radiusClientSecret, "shared-secret");
+});
+
 test("getStationTemplateSelection keeps station template modes independent", () => {
     const controller = new Controller();
     const config = { template: "Default" };
