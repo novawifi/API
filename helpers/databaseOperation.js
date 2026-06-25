@@ -2412,10 +2412,24 @@ class DataBase {
 
     async getAllPlatforms() {
         try {
-            const platforms = await prisma.platform.findMany();
+            const platforms = await prisma.platform.findMany({
+                orderBy: {
+                    createdAt: "desc",
+                },
+            });
             return platforms;
         } catch (error) {
             console.error("Error getting platform:", error);
+            throw error;
+        }
+    }
+
+    async getAllFunds() {
+        try {
+            const funds = await prisma.funds.findMany();
+            return funds;
+        } catch (error) {
+            console.error("Error getting funds:", error);
             throw error;
         }
     }
@@ -3362,6 +3376,32 @@ class DataBase {
                 },
             })
             return addfunds;
+        } catch (error) {
+            console.error("An error occured:", error);
+            return null;
+        }
+    }
+
+    async upsertFunds(platformID, data) {
+        if (!platformID || !data) return null;
+        try {
+            const funds = await prisma.funds.upsert({
+                where: {
+                    platformID
+                },
+                update: {
+                    ...data,
+                },
+                create: {
+                    platformID,
+                    balance: data.balance || "0.00",
+                    withdrawals: data.withdrawals || "0.00",
+                    deposits: data.deposits || "0.00",
+                    shortCodeBalance: data.shortCodeBalance || "0.00",
+                    shortIdentifier: data.shortIdentifier || "null",
+                },
+            })
+            return funds;
         } catch (error) {
             console.error("An error occured:", error);
             return null;

@@ -23,6 +23,8 @@ router.post("/code", use("getCode"));
 router.post("/addPlatform", use("addPlatform"));
 router.post("/updatePlatform", use("updatePlatform"));
 router.post("/deletePlatform", use("deletePlatformID"));
+router.post("/manager/platform-funds/update", use("managerUpsertPlatformFunds"));
+router.post("/manager/platform-funds/delete", use("managerDeletePlatformFunds"));
 router.post("/loginAdmin", use("LoginAdmin"));
 router.post("/loginManager", use("LoginManager"));
 router.post("/fetchPayments", use("fetchPayments"));
@@ -174,6 +176,7 @@ router.post("/managerAuthHealth", use("managerAuthHealth"));
 router.post("/managerOps/list", use("managerOpsList"));
 router.post("/managerOps/run", use("managerOpsRun"));
 router.post("/managerOps/repair-site", use("managerRepairSite"));
+router.post("/managerOps/create-subdomain-site", use("managerCreateSubdomainSite"));
 router.post("/stations/link", use("linkStations"));
 router.post("/stations/unlink", use("unlinkStation"));
 

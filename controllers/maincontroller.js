@@ -176,6 +176,59 @@ class Controller {
     return next;
   }
 
+  parseFlexibleTrial({ plan, baseDate = new Date(), trialMode, trialDays, trialEndsAt, currentTrialEndsAt }) {
+    const mode = String(trialMode || "").trim().toLowerCase();
+    if (mode === "disabled" || mode === "none") {
+      return { hasValue: true, value: null };
+    }
+
+    if (mode === "date" || trialEndsAt !== undefined) {
+      const text = String(trialEndsAt || "").trim();
+      if (!text) return { hasValue: mode === "date", value: null };
+      const date = new Date(text);
+      if (Number.isNaN(date.getTime())) {
+        return { hasValue: true, error: "Invalid trial end date." };
+      }
+      return { hasValue: true, value: date };
+    }
+
+    if (mode === "days" || trialDays !== undefined) {
+      const days = Number(trialDays);
+      if (!Number.isFinite(days) || days < 0 || days > 365) {
+        return { hasValue: true, error: "Trial days must be between 0 and 365." };
+      }
+      return { hasValue: true, value: this.addDays(baseDate, Math.floor(days)) };
+    }
+
+    if (currentTrialEndsAt !== undefined) {
+      return { hasValue: false, value: currentTrialEndsAt || null };
+    }
+
+    const defaultDays = this.getAccountPlan(plan).trialDays;
+    if (defaultDays > 0) {
+      return { hasValue: true, value: this.addDays(baseDate, defaultDays) };
+    }
+    return { hasValue: true, value: null };
+  }
+
+  normalizeFundsPayload(payload = {}) {
+    const moneyFields = ["balance", "withdrawals", "deposits", "shortCodeBalance"];
+    const data = {};
+    for (const field of moneyFields) {
+      if (payload[field] === undefined) continue;
+      const amount = Number(String(payload[field] || "0").replace(/,/g, ""));
+      if (!Number.isFinite(amount) || amount < 0) {
+        return { error: `${field} must be a valid non-negative amount.` };
+      }
+      data[field] = amount.toFixed(2);
+    }
+    if (payload.shortIdentifier !== undefined) {
+      const shortIdentifier = String(payload.shortIdentifier || "").trim();
+      data.shortIdentifier = shortIdentifier || "null";
+    }
+    return { data };
+  }
+
   parseDataLimitBytes(value) {
     if (!value) return null;
     const text = String(value).trim();
@@ -1853,10 +1906,15 @@ class Controller {
         return res.json(cached);
       }
       const platforms = await this.db.getAllPlatforms();
+      const allFunds = typeof this.db.getAllFunds === "function" ? await this.db.getAllFunds() : [];
+      const fundsByPlatform = new Map((allFunds || []).map((funds) => [funds.platformID, funds]));
       const response = {
         success: true,
         message: "Platforms fetched!",
-        platforms: platforms,
+        platforms: (platforms || []).map((platform) => ({
+          ...platform,
+          funds: fundsByPlatform.get(platform.platformID) || null,
+        })),
       };
       this.cache.set(cacheKey, response, 30000);
       return res.json(response);
@@ -7835,6 +7893,48 @@ class Controller {
     });
   }
 
+  async resolveManagerOpsStation(station) {
+    const value = String(station || "").trim();
+    if (!value) return null;
+    const stations = (await this.db.getAdminStations().catch(() => [])) || [];
+    return stations.find((item) =>
+      String(item?.id || "") === value ||
+      String(item?.mikrotikHost || "") === value ||
+      String(item?.name || "") === value
+    ) || null;
+  }
+
+  buildManagerOpsScriptArgs(scriptName, station = null) {
+    const script = String(scriptName || "").trim();
+    const platformID = String(station?.platformID || "").trim();
+    const stationId = String(station?.id || "").trim();
+    const host = String(station?.mikrotikHost || "").trim();
+
+    if (script === "seed:cleanup-expired-hotspot" || script === "seed:auto-backup-script") {
+      if (!station) return ["--all-platforms"];
+      const args = [];
+      if (platformID) args.push(`--platformID=${platformID}`);
+      if (stationId) args.push(`--stationId=${stationId}`);
+      if (host) args.push(`--host=${host}`);
+      return args;
+    }
+
+    const platformScopedScripts = new Set([
+      "seed:dashboard",
+      "seed:webfig-nginx-sites",
+      "seed:provision-nginx-sites",
+      "seed:redirect-online-to-co-ke",
+      "seed:router-walled-garden",
+      "seed:notify-upgrade-complete",
+    ]);
+
+    if (station && platformScopedScripts.has(script) && platformID) {
+      return [`--platforms=${platformID}`];
+    }
+
+    return [];
+  }
+
   async managerOpsList(req, res) {
     const { token } = req.body || {};
     const session = await this.authManagerSession(token);
@@ -7847,7 +7947,7 @@ class Controller {
         label: root.label,
         scripts: this.readPackageScripts(root),
       }));
-    const stations = (await this.db.getAllStations().catch(() => [])) || [];
+    const stations = (await this.db.getAdminStations().catch(() => [])) || [];
 
     return res.json({
       success: true,
@@ -7870,6 +7970,11 @@ class Controller {
     if (!session.success) return res.status(401).json(session);
 
     try {
+      const selectedStation = await this.resolveManagerOpsStation(station);
+      if (station && !selectedStation) {
+        return res.status(400).json({ success: false, message: "Selected station was not found." });
+      }
+
       if (type === "package") {
         const selectedRoot = this.getManagerOpsRoot(root);
         if (!selectedRoot) return res.status(400).json({ success: false, message: "Unknown package root." });
@@ -7877,7 +7982,10 @@ class Controller {
         if (!scripts.some((item) => item.name === script)) {
           return res.status(400).json({ success: false, message: "Unknown package script." });
         }
-        const result = await this.runManagedCommand("npm", ["run", script], {
+        const scriptArgs = selectedRoot.id === "server" ? this.buildManagerOpsScriptArgs(script, selectedStation) : [];
+        const npmArgs = ["run", script];
+        if (scriptArgs.length) npmArgs.push("--", ...scriptArgs);
+        const result = await this.runManagedCommand("npm", npmArgs, {
           cwd: selectedRoot.cwd,
           timeout: 10 * 60 * 1000,
         });
@@ -7890,8 +7998,8 @@ class Controller {
         let result;
         if (op === "provision-mikrotik-rescue") {
           const args = ["ops/provision-mikrotik-rescue.js", "--apply", "--direct"];
-          const stationHost = String(station || "").trim();
-          if (stationHost) args.push("--station", stationHost);
+          if (selectedStation?.mikrotikHost) args.push("--station", selectedStation.mikrotikHost);
+          if (selectedStation?.id) args.push("--stationId", selectedStation.id);
           result = await this.runManagedCommand("node", args, {
             cwd: this.getManagerOpsRoot("server")?.cwd || appRoot,
             timeout: 10 * 60 * 1000,
@@ -7904,7 +8012,11 @@ class Controller {
             "seed-router-walled-garden": "seed:router-walled-garden",
             "seed-auto-backup-script": "seed:auto-backup-script",
           };
-          result = await this.runManagedCommand("npm", ["run", scriptMap[op]], {
+          const mappedScript = scriptMap[op];
+          const scriptArgs = this.buildManagerOpsScriptArgs(mappedScript, selectedStation);
+          const npmArgs = ["run", mappedScript];
+          if (scriptArgs.length) npmArgs.push("--", ...scriptArgs);
+          result = await this.runManagedCommand("npm", npmArgs, {
             cwd: this.getManagerOpsRoot("server")?.cwd || appRoot,
             timeout: 10 * 60 * 1000,
           });
@@ -7961,6 +8073,116 @@ class Controller {
       });
     } catch (error) {
       return res.status(500).json({ success: false, message: error?.message || "Site repair failed." });
+    }
+  }
+
+  buildManagedSubdomain(value) {
+    const baseDomain = process.env.DOMAIN || "novawifi.co.ke";
+    const raw = String(value || "").trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0];
+    if (!raw) return null;
+    const domain = raw.endsWith(`.${baseDomain}`) ? raw : `${raw}.${baseDomain}`;
+    const safeDomain = this.sanitizeDomain(domain);
+    if (!safeDomain || safeDomain === baseDomain || !safeDomain.endsWith(`.${baseDomain}`)) return null;
+    const prefix = safeDomain.slice(0, -(`.${baseDomain}`).length);
+    const labels = prefix.split(".");
+    const validLabels = labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label));
+    return validLabels ? safeDomain : null;
+  }
+
+  normalizeManagedProxyTarget({ targetHost, targetPort, targetProtocol }) {
+    const protocol = String(targetProtocol || "http").trim().toLowerCase() === "https" ? "https" : "http";
+    const port = Number(targetPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+
+    let host = String(targetHost || "").trim();
+    if (!host) return null;
+    try {
+      if (/^https?:\/\//i.test(host)) {
+        const parsed = new URL(host);
+        host = parsed.hostname;
+      } else {
+        host = host.split("/")[0].split(":")[0];
+      }
+    } catch (_error) {
+      return null;
+    }
+
+    const safeHost = this.sanitizeDomain(host);
+    const isIp = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
+    if (!safeHost && !isIp) return null;
+    if (isIp && !host.split(".").every((part) => Number(part) >= 0 && Number(part) <= 255)) return null;
+    return `${protocol}://${host}:${port}`;
+  }
+
+  async nginxSiteExists(domain) {
+    const safeDomain = this.sanitizeDomain(domain);
+    if (!safeDomain) return true;
+    const paths = [
+      `/etc/nginx/sites-available/${safeDomain}`,
+      `/etc/nginx/sites-enabled/${safeDomain}`,
+    ];
+    for (const sitePath of paths) {
+      try {
+        await fsp.lstat(sitePath);
+        return true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") return true;
+      }
+    }
+    return false;
+  }
+
+  async managerCreateSubdomainSite(req, res) {
+    const { token, subdomain, targetHost, targetPort, targetProtocol } = req.body || {};
+    const session = await this.authManagerSession(token);
+    if (!session.success) return res.status(401).json(session);
+
+    const domain = this.buildManagedSubdomain(subdomain);
+    if (!domain) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid novawifi.co.ke subdomain.",
+      });
+    }
+
+    const target = this.normalizeManagedProxyTarget({ targetHost, targetPort, targetProtocol });
+    if (!target) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid target domain/IP and port.",
+      });
+    }
+
+    try {
+      const taken = await this.nginxSiteExists(domain);
+      if (taken) {
+        return res.status(409).json({
+          success: false,
+          message: `${domain} already has an nginx site configured.`,
+          domain,
+        });
+      }
+
+      const wildcard = this.getWildcardCertificatePaths(domain);
+      const provision = await this.addReverseProxySite(domain, target);
+      return res.json({
+        ...provision,
+        title: `Create ${domain}`,
+        domain,
+        target,
+        ssl: provision.ssl || {
+          success: Boolean(wildcard.hasWildcardCert),
+          message: "Using wildcard SSL certificate.",
+        },
+        message: provision.success
+          ? `Subdomain ${domain} now proxies to ${target}.`
+          : provision.message,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message || "Subdomain site creation failed.",
+      });
     }
   }
 
@@ -8496,7 +8718,7 @@ class Controller {
   }
 
   async addPlatform(req, res) {
-    const { token, name, url, platformID, adminID, email, password, role, phone, adminName, subscriptionPlan } = req.body;
+    const { token, name, url, platformID, adminID, email, password, role, phone, adminName, subscriptionPlan, trialDays, trialEndsAt, trialMode } = req.body;
     if (!token || !name || !url || !platformID || !adminID || !email || !password || !role) {
       return res.json({
         success: false,
@@ -8505,14 +8727,21 @@ class Controller {
     }
     const plan = this.normalizePlatformPlan(subscriptionPlan);
     const createdAt = new Date();
-    const trialEndsAt = this.isTrialLimitedPlan(plan) ? this.addDays(createdAt, 3) : null;
+    const trial = this.parseFlexibleTrial({ plan, baseDate: createdAt, trialDays, trialEndsAt, trialMode });
+    if (trial.error) {
+      return res.status(400).json({
+        success: false,
+        message: trial.error,
+      });
+    }
+    const resolvedTrialEndsAt = trial.value;
     const data = {
       name: name,
       url: url,
       platformID: platformID,
       adminID: adminID,
       subscriptionPlan: plan,
-      trialEndsAt,
+      trialEndsAt: resolvedTrialEndsAt,
     };
     try {
       const session = await this.authManagerSession(token);
@@ -8617,7 +8846,7 @@ class Controller {
         }
       }
       if (this.isTrialLimitedPlan(plan)) {
-        dueDate = trialEndsAt;
+        dueDate = resolvedTrialEndsAt;
         totalAmount = planPrice;
       }
 
@@ -8638,7 +8867,7 @@ class Controller {
       data.url = sanitizedUrl;
       const add = await this.db.createPlatform(data);
       await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
-        message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
+        message: `Your ${plan} plan includes trial access. Pay KES ${totalAmount} before ${resolvedTrialEndsAt ? resolvedTrialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
         status: "info",
         actionLabel: "Pay Bill",
         actionUrl: "/admin/bills",
@@ -8657,6 +8886,7 @@ class Controller {
         name: adminName || name,
         token: adminToken,
       });
+      this.cache.del("main:platforms:all");
 
       return res.status(201).json({
         success: true,
@@ -8669,7 +8899,7 @@ class Controller {
   };
 
   async updatePlatform(req, res) {
-    const { token, platformID, name, status } = req.body;
+    const { token, platformID, name, status, subscriptionPlan, trialMode, trialDays, trialEndsAt } = req.body;
     if (!token || !platformID || !name) {
       return res.json({
         success: false,
@@ -8708,7 +8938,29 @@ class Controller {
         name,
         status: normalizedStatus,
       };
+      if (subscriptionPlan !== undefined) {
+        data.subscriptionPlan = this.normalizePlatformPlan(subscriptionPlan);
+      }
+      const plan = data.subscriptionPlan || this.normalizePlatformPlan(existing.subscriptionPlan);
+      const trial = this.parseFlexibleTrial({
+        plan,
+        baseDate: new Date(),
+        trialMode,
+        trialDays,
+        trialEndsAt,
+        currentTrialEndsAt: existing.trialEndsAt,
+      });
+      if (trial.error) {
+        return res.status(400).json({
+          success: false,
+          message: trial.error,
+        });
+      }
+      if (trial.hasValue) {
+        data.trialEndsAt = trial.value;
+      }
       const upd = await this.db.updatePlatform(platformID, data);
+      await this.ensurePlatformBillingService(platformID);
       this.cache.del("main:platforms:all");
 
       return res.status(200).json({
@@ -10377,6 +10629,108 @@ class Controller {
       });
     }
   };
+
+  async managerUpsertPlatformFunds(req, res) {
+    const { token, platformID, funds } = req.body || {};
+    if (!token || !platformID) {
+      return res.json({
+        success: false,
+        message: "Missing credentials required!",
+      });
+    }
+
+    try {
+      const session = await this.authManagerSession(token);
+      if (!session.success) {
+        return res.json({
+          success: false,
+          message: session.message,
+        });
+      }
+
+      const platform = await this.db.getPlatform(platformID);
+      if (!platform) {
+        return res.status(404).json({
+          success: false,
+          message: "Platform not found!",
+        });
+      }
+
+      const normalized = this.normalizeFundsPayload(funds || req.body);
+      if (normalized.error) {
+        return res.status(400).json({
+          success: false,
+          message: normalized.error,
+        });
+      }
+
+      const update = await this.db.upsertFunds(platformID, normalized.data);
+      if (!update) {
+        return res.status(500).json({
+          success: false,
+          message: "Unable to update funds.",
+        });
+      }
+
+      this.cache.del(`main:funds:${platformID}`);
+      this.cache.del("main:platforms:all");
+
+      return res.json({
+        success: true,
+        message: "Platform funds updated successfully.",
+        funds: update,
+      });
+    } catch (err) {
+      console.error("An error occured", err);
+      return res.json({
+        success: false,
+        message: "An internal error occured, try again.",
+      });
+    }
+  }
+
+  async managerDeletePlatformFunds(req, res) {
+    const { token, platformID } = req.body || {};
+    if (!token || !platformID) {
+      return res.json({
+        success: false,
+        message: "Missing credentials required!",
+      });
+    }
+
+    try {
+      const session = await this.authManagerSession(token);
+      if (!session.success) {
+        return res.json({
+          success: false,
+          message: session.message,
+        });
+      }
+
+      const platform = await this.db.getPlatform(platformID);
+      if (!platform) {
+        return res.status(404).json({
+          success: false,
+          message: "Platform not found!",
+        });
+      }
+
+      await this.db.deleteFunds(platformID);
+      this.cache.del(`main:funds:${platformID}`);
+      this.cache.del("main:platforms:all");
+
+      return res.json({
+        success: true,
+        message: "Platform funds deleted successfully.",
+      });
+    } catch (err) {
+      console.error("An error occured", err);
+      return res.json({
+        success: false,
+        message: "An internal error occured, try again.",
+      });
+    }
+  }
 
   async fetchSessions(req, res) {
     const { token, adminID } = req.body;
