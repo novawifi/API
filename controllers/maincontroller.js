@@ -7731,6 +7731,239 @@ class Controller {
     }
   };
 
+  getManagerOpsPackageRoots() {
+    const serverRoot = fs.existsSync(path.join(appRoot, "package.json")) &&
+      fs.existsSync(path.join(appRoot, "controllers"))
+      ? appRoot
+      : path.resolve(appRoot, "server");
+    const workspaceRoot = path.dirname(serverRoot);
+    return [
+      { id: "server", label: "Server", cwd: serverRoot },
+      { id: "client", label: "Client", cwd: path.resolve(workspaceRoot, "client") },
+      { id: "landing", label: "Landing", cwd: path.resolve(workspaceRoot, "landing") },
+      { id: "dedicated-client", label: "Dedicated Client", cwd: path.resolve(workspaceRoot, "dedicated-client") },
+    ];
+  }
+
+  getManagerOpsRoot(rootId) {
+    return this.getManagerOpsPackageRoots().find((root) => root.id === rootId && fs.existsSync(root.cwd));
+  }
+
+  readPackageScripts(root) {
+    try {
+      const packagePath = path.join(root.cwd, "package.json");
+      const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+      return Object.keys(pkg.scripts || {}).map((name) => ({
+        id: `${root.id}:${name}`,
+        root: root.id,
+        rootLabel: root.label,
+        name,
+        command: `npm run ${name}`,
+        script: pkg.scripts[name],
+      }));
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  getManagerOpsDefinitions() {
+    return [
+      {
+        id: "provision-mikrotik-rescue",
+        label: "Provision MikroTik SSTP Rescue",
+        description: "Queue/upload the SSTP rescue installer to all routers or one station, then step aside.",
+        command: "node ops/provision-mikrotik-rescue.js --apply --direct",
+        fields: [
+          { name: "station", label: "Station", type: "station", placeholder: "All routers" },
+        ],
+      },
+      {
+        id: "seed-webfig-nginx-sites",
+        label: "Seed WebFig Nginx Sites",
+        description: "Regenerate WebFig nginx mappings for stations that have or need WebFig hosts.",
+        command: "npm run seed:webfig-nginx-sites",
+      },
+      {
+        id: "seed-update-station-ddns",
+        label: "Update Station DDNS",
+        description: "Refresh stored station DDNS/WebFig data from known station records.",
+        command: "npm run seed:update-station-ddns",
+      },
+      {
+        id: "seed-provision-nginx-sites",
+        label: "Provision Platform Nginx Sites",
+        description: "Repair/provision platform portal nginx sites from stored platform URLs.",
+        command: "npm run seed:provision-nginx-sites",
+      },
+      {
+        id: "seed-router-walled-garden",
+        label: "Seed Router Walled Garden",
+        description: "Push portal/walled-garden allow rules to routers.",
+        command: "npm run seed:router-walled-garden",
+      },
+      {
+        id: "seed-auto-backup-script",
+        label: "Seed Auto Backup Script",
+        description: "Install or refresh MikroTik auto-backup scheduler scripts.",
+        command: "npm run seed:auto-backup-script",
+      },
+    ];
+  }
+
+  runManagedCommand(command, args = [], options = {}) {
+    const cwd = options.cwd || path.resolve(appRoot, "server");
+    const timeout = Number(options.timeout || 5 * 60 * 1000);
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      execFile(command, args, {
+        cwd,
+        timeout,
+        maxBuffer: 1024 * 1024 * 4,
+        windowsHide: true,
+      }, (error, stdout, stderr) => {
+        resolve({
+          success: !error,
+          exitCode: typeof error?.code === "number" ? error.code : 0,
+          signal: error?.signal || null,
+          command: [command, ...args].join(" "),
+          cwd,
+          durationMs: Date.now() - startedAt,
+          stdout: String(stdout || "").slice(-12000),
+          stderr: String(stderr || error?.message || "").slice(-12000),
+        });
+      });
+    });
+  }
+
+  async managerOpsList(req, res) {
+    const { token } = req.body || {};
+    const session = await this.authManagerSession(token);
+    if (!session.success) return res.status(401).json(session);
+
+    const packageRoots = this.getManagerOpsPackageRoots()
+      .filter((root) => fs.existsSync(path.join(root.cwd, "package.json")))
+      .map((root) => ({
+        id: root.id,
+        label: root.label,
+        scripts: this.readPackageScripts(root),
+      }));
+    const stations = (await this.db.getAllStations().catch(() => [])) || [];
+
+    return res.json({
+      success: true,
+      packageRoots,
+      ops: this.getManagerOpsDefinitions(),
+      stations: stations.map((station) => ({
+        id: station.id,
+        name: station.name,
+        platformID: station.platformID,
+        mikrotikHost: station.mikrotikHost,
+        mikrotikWebfigHost: station.mikrotikWebfigHost,
+        systemBasis: station.systemBasis,
+      })),
+    });
+  }
+
+  async managerOpsRun(req, res) {
+    const { token, type, root, script, op, station } = req.body || {};
+    const session = await this.authManagerSession(token);
+    if (!session.success) return res.status(401).json(session);
+
+    try {
+      if (type === "package") {
+        const selectedRoot = this.getManagerOpsRoot(root);
+        if (!selectedRoot) return res.status(400).json({ success: false, message: "Unknown package root." });
+        const scripts = this.readPackageScripts(selectedRoot);
+        if (!scripts.some((item) => item.name === script)) {
+          return res.status(400).json({ success: false, message: "Unknown package script." });
+        }
+        const result = await this.runManagedCommand("npm", ["run", script], {
+          cwd: selectedRoot.cwd,
+          timeout: 10 * 60 * 1000,
+        });
+        return res.json({ ...result, title: `${selectedRoot.label}: npm run ${script}` });
+      }
+
+      if (type === "op") {
+        const opDef = this.getManagerOpsDefinitions().find((item) => item.id === op);
+        if (!opDef) return res.status(400).json({ success: false, message: "Unknown operation." });
+        let result;
+        if (op === "provision-mikrotik-rescue") {
+          const args = ["ops/provision-mikrotik-rescue.js", "--apply", "--direct"];
+          const stationHost = String(station || "").trim();
+          if (stationHost) args.push("--station", stationHost);
+          result = await this.runManagedCommand("node", args, {
+            cwd: this.getManagerOpsRoot("server")?.cwd || appRoot,
+            timeout: 10 * 60 * 1000,
+          });
+        } else {
+          const scriptMap = {
+            "seed-webfig-nginx-sites": "seed:webfig-nginx-sites",
+            "seed-update-station-ddns": "seed:update-station-ddns",
+            "seed-provision-nginx-sites": "seed:provision-nginx-sites",
+            "seed-router-walled-garden": "seed:router-walled-garden",
+            "seed-auto-backup-script": "seed:auto-backup-script",
+          };
+          result = await this.runManagedCommand("npm", ["run", scriptMap[op]], {
+            cwd: this.getManagerOpsRoot("server")?.cwd || appRoot,
+            timeout: 10 * 60 * 1000,
+          });
+        }
+        return res.json({ ...result, title: opDef.label });
+      }
+
+      return res.status(400).json({ success: false, message: "Unknown operation type." });
+    } catch (error) {
+      return res.status(500).json({ success: false, message: error?.message || "Operation failed." });
+    }
+  }
+
+  async managerRepairSite(req, res) {
+    const { token, url, targetUrl } = req.body || {};
+    const session = await this.authManagerSession(token);
+    if (!session.success) return res.status(401).json(session);
+
+    const domain = this.sanitizeDomain(url);
+    if (!domain) return res.status(400).json({ success: false, message: "Invalid URL/domain." });
+
+    try {
+      const station = await this.db.getStationByWebfigHost(domain);
+      if (station) {
+        const repair = await this.ensureStationWebfigSite(station);
+        return res.json({ ...repair, kind: "webfig", station });
+      }
+
+      const platform = await this.db.getPlatformByURLData(domain).catch(() => null);
+      let target = this.normalizeProxyTargetUrl(targetUrl);
+      let verifyOptions = {};
+      if (platform) {
+        target = this.getSharedPortalTarget();
+        verifyOptions = { path: "/admin/login", rejectStatusCodes: ["404"] };
+      }
+      if (!target) {
+        return res.status(400).json({
+          success: false,
+          message: "Target URL is required when the domain is not a known platform or WebFig host.",
+        });
+      }
+
+      const provision = await this.addReverseProxySite(domain, target);
+      if (!provision.success) return res.json(provision);
+      const verification = await this.verifyNginxSite(domain, target, verifyOptions);
+      return res.json({
+        success: verification.success,
+        kind: platform ? "platform" : "custom",
+        domain,
+        target,
+        provision,
+        verification,
+        message: verification.success ? `Nginx site repaired for ${domain}` : verification.message,
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, message: error?.message || "Site repair failed." });
+    }
+  }
+
   resolveHotspotTemplateHost({ hash, station, config } = {}) {
     const stationHost = String(station || "").trim();
     if (Utils.isValidIP(stationHost) && stationHost.startsWith("10.10.10.")) {

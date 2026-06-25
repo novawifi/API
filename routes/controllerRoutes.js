@@ -171,6 +171,9 @@ router.post("/saveMikrotikInfo", use("saveMikrotikInfo"));
 router.post("/migrateSystemBasis", use("migrateSystemBasis"));
 router.post("/systemBasisMigrations", use("fetchSystemBasisMigrations"));
 router.post("/managerAuthHealth", use("managerAuthHealth"));
+router.post("/managerOps/list", use("managerOpsList"));
+router.post("/managerOps/run", use("managerOpsRun"));
+router.post("/managerOps/repair-site", use("managerRepairSite"));
 router.post("/stations/link", use("linkStations"));
 router.post("/stations/unlink", use("unlinkStation"));
 
