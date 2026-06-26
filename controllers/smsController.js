@@ -69,7 +69,8 @@ class SMS {
         }
     };
 
-    async sendInternalSMS(phone, message) {
+    async sendInternalSMS(phone, message, options = {}) {
+        const silent = options?.silent === true;
         const API_URL = process.env.UMS_SMS_API_URL || "https://comms.umeskiasoftwares.com/api/v1/sms/send";
         if (!phone || !message) {
             return { success: false, message: "Missing credentials required" };
@@ -97,12 +98,18 @@ class SMS {
             const result = await response.json();
 
             if (result.status !== "complete") {
+                if (silent) {
+                    return { success: false, message: "SMS failed to send", result };
+                }
                 console.error("SMS FAILED:", result);
                 return { success: false, message: "SMS failed to send", result };
             }
 
             return { success: true, message: "SMS sent successfully", result };
         } catch (error) {
+            if (silent) {
+                return { success: false, message: "SMS API error", error: error?.message || error };
+            }
             console.error("SMS API ERROR:", error);
             return { success: false, message: "SMS API error", error: error?.message || error };
         }

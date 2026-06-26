@@ -70,7 +70,11 @@ class Socket {
         const station = await this.db.getStationByHost(platformData.platformID, host);
         if (!station) return platformData;
         const mode = String(station.hotspotTemplateMode || "").toLowerCase();
-        const stationSupportPhone = station.supportPhone || platformData.supportPhone || platformData.phone || "";
+        const stationSupportPhone =
+            String(station.supportPhone || "").trim() ||
+            String(platformData.supportPhone || "").trim() ||
+            String(platformData.phone || "").trim() ||
+            "0712345678";
         return {
             ...platformData,
             ...(mode ? {

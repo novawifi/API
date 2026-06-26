@@ -849,21 +849,21 @@ Price: KSH ${service.price}</p>
 
         const users = await this.db.getActivePlatformUsers(platformID);
         const limitedUsers = users.filter(
-            user => user.package?.category === "Data" && user.username
+            user => String(user.package?.category || "").toLowerCase() === "data" && user.username
         );
         if (limitedUsers.length === 0) return;
 
         const stationByHost = new Map(routers.map((r) => [r.mikrotikHost, r]));
-        const parseUsageToKilobytes = (usage) => {
-            if (!usage) return 0;
-            if (String(usage).toLowerCase() === "unlimited") return 0;
-            const [value, unit] = String(usage).split(" ");
-            if (!value || !unit) return 0;
-            const unitMap = { B: 1 / 1024, KB: 1, MB: 1024, GB: 1024 ** 2, TB: 1024 ** 3 };
-            const factor = unitMap[unit.toUpperCase()];
+        const parseUsageToBytes = (usage) => {
+            const text = String(usage || "").trim();
+            if (!text || /^unlimited$/i.test(text)) return 0;
+            const match = text.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i);
+            if (!match) return 0;
+            const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+            const factor = unitMap[match[2].toUpperCase()];
             if (!factor) return 0;
-            const num = parseFloat(value);
-            if (Number.isNaN(num)) return 0;
+            const num = Number(match[1]);
+            if (!Number.isFinite(num) || num <= 0) return 0;
             return Math.round(num * factor);
         };
 
@@ -883,15 +883,40 @@ Price: KSH ${service.price}</p>
         if (radiusUsers.length > 0) {
             const usernames = Array.from(new Set(radiusUsers.map((u) => u.username).filter(Boolean)));
             const usageMap = await this.db.getRadiusUsageByUsernames(usernames);
+            const depletedByHost = new Map();
             for (const user of radiusUsers) {
                 const username = user.username;
-                const limitKb = parseUsageToKilobytes(user.package?.usage);
-                if (!username || limitKb <= 0) continue;
+                const limitBytes = parseUsageToBytes(user.package?.fupLimit) || parseUsageToBytes(user.package?.usage);
+                if (!username || limitBytes <= 0) continue;
                 const usedBytes = usageMap[username] || 0;
-                const usedKb = Math.floor(Number(usedBytes) / 1024);
-                if (usedKb < limitKb) continue;
+                if (Number(usedBytes) < limitBytes) continue;
                 await this.db.updateUser(user.id, { status: "expired" });
                 await this.db.deleteRadiusUser(username);
+                const host = user.package?.routerHost;
+                if (host) {
+                    const depleted = depletedByHost.get(host) || [];
+                    depleted.push(username);
+                    depletedByHost.set(host, depleted);
+                }
+            }
+
+            for (const [host, depletedUsernames] of depletedByHost.entries()) {
+                await this.withRouterLock(`${platformID}:${host}`, async () => {
+                    const channel = await this.getMikrotikChannel(platformID, host);
+                    if (!channel) return;
+
+                    try {
+                        const activeUsers = await this.mikrotik.listHotspotActiveUsers(channel);
+                        const depletedSet = new Set(depletedUsernames);
+                        for (const active of activeUsers || []) {
+                            const activeName = active?.user || active?.name;
+                            if (!active?.[".id"] || !depletedSet.has(activeName)) continue;
+                            await this.mikrotik.deleteHotspotActiveUser(channel, active[".id"]);
+                        }
+                    } catch {
+                        // RADIUS credentials were already removed; router session cleanup is best-effort.
+                    }
+                });
             }
         }
 
@@ -956,6 +981,60 @@ Price: KSH ${service.price}</p>
                         // Per-user router errors ignored
                     }
                 }
+            });
+        }
+    }
+
+    parseDataLimitBytes(value) {
+        const text = String(value || "").trim();
+        if (!text || /^unlimited$/i.test(text)) return 0;
+        const match = text.match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i);
+        if (!match) return 0;
+        const unitMap = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+        const factor = unitMap[match[2].toUpperCase()];
+        const amount = Number(match[1]);
+        if (!factor || !Number.isFinite(amount) || amount <= 0) return 0;
+        return Math.round(amount * factor);
+    }
+
+    async expireRadiusPPPoEFupForPlatform(platform) {
+        const platformID = platform.platformID;
+        const [stations, pppoeAccounts, plans] = await Promise.all([
+            this.db.getStations(platformID),
+            this.db.getPPPoE(platformID),
+            this.db.getPPPoEPlans(platformID),
+        ]);
+        if (!Array.isArray(stations) || !Array.isArray(pppoeAccounts) || pppoeAccounts.length === 0) return;
+
+        const radiusHosts = new Set(
+            stations
+                .filter((station) => String(station?.systemBasis || "API").toUpperCase() === "RADIUS")
+                .map((station) => station.mikrotikHost)
+                .filter(Boolean)
+        );
+        if (radiusHosts.size === 0) return;
+
+        const planMap = new Map((Array.isArray(plans) ? plans : []).map((plan) => [plan.id, plan]));
+        const activeRadiusAccounts = pppoeAccounts.filter((account) =>
+            String(account?.status || "").toLowerCase() === "active" &&
+            account?.clientname &&
+            radiusHosts.has(account?.station)
+        );
+
+        for (const account of activeRadiusAccounts) {
+            const plan = account.planId ? planMap.get(account.planId) : null;
+            const limitBytes = this.parseDataLimitBytes(account.fupLimit) || this.parseDataLimitBytes(plan?.fupLimit);
+            if (limitBytes <= 0) continue;
+
+            const cycleStartedAt = account.updatedAt || account.createdAt || null;
+            const usedBytes = await this.db.getRadiusUsageByUsernameSince(account.clientname, cycleStartedAt);
+            if (Number(usedBytes) < limitBytes) continue;
+
+            await this.db.updatePPPoE(account.id, { status: "expired" });
+            await this.disablePPPSecret(platformID, account.clientname, account.station);
+            socketManager.log(platformID, `Cron: PPPoE FUP depleted for ${account.clientname}`, {
+                context: "cron",
+                level: "warn",
             });
         }
     }
@@ -2003,14 +2082,14 @@ Price: KSH ${service.price}</p>
         const pending = await this.db.getMpesaByStatuses(platformID, ["PENDING", "PROCESSING"], cutoff);
         if (!pending || pending.length === 0) return;
 
-	        for (const payment of pending) {
-	            try {
-	                const invoiceId = payment.reqcode || payment.code;
-	                const statusInfo = await this.mpesa.fetchIntaSendStatus(invoiceId);
-	                if (!statusInfo?.state) continue;
+        for (const payment of pending) {
+            try {
+                const invoiceId = payment.reqcode || payment.code;
+                const statusInfo = await this.mpesa.fetchIntaSendStatus(invoiceId);
+                if (!statusInfo?.state) continue;
 
-	                const nextStatus = this.mpesa.normalizeIntaSendStatus(statusInfo.state);
-	                if (nextStatus !== payment.status) {
+                const nextStatus = this.mpesa.normalizeIntaSendStatus(statusInfo.state);
+                if (nextStatus !== payment.status) {
                     await this.db.updateMpesaCode(payment.code, {
                         status: nextStatus,
                         failed_reason: statusInfo.failed_reason || payment.failed_reason,
@@ -2244,6 +2323,19 @@ Price: KSH ${service.price}</p>
         }
     }
 
+    async markAllExpiredUserCodesInDB() {
+        const now = new Date();
+        const result = await this.db?.updateActiveDBUsersByTime(now);
+
+        if (result?.count > 0) {
+            console.log(`Cron: marked ${result.count} expired active users in database`);
+            socketManager.log("system", `Cron: marked ${result.count} expired active users in database`, {
+                context: "cron",
+                level: "info",
+            });
+        }
+    }
+
     async purgeDuplicateUserCodes(platform) {
         try {
             const platformID = platform.platformID;
@@ -2324,6 +2416,7 @@ Price: KSH ${service.price}</p>
             () => this.saveBandwidthUsageForPlatform(platform),
             () => this.checkAndExpireUsersForPlatform(platform),
             () => this.expireDataPlansForPlatform(platform),
+            () => this.expireRadiusPPPoEFupForPlatform(platform),
             () => this.updateOnlineCountsForPlatform(platform),
             () => this.makeSureUsersInMikrotikAreActiveInDatabaseForPlatform(platform),
             () => this.reconcileDashboardStatsForPlatform(platform),
@@ -2361,6 +2454,7 @@ Price: KSH ${service.price}</p>
         this.pullTxnRunning = false;
         this.rebootRunning = false;
         this.mikrotikBackupRunning = false;
+        this.minuteDbExpiryRunning = false;
 
         const withTimeout = (promise, ms, label = "task") =>
             Promise.race([
@@ -2427,6 +2521,30 @@ Price: KSH ${service.price}</p>
                 this.fiveMinuteRunning = false;
             }
         };
+
+        const runDbExpiryEveryMinute = async () => {
+            if (this.minuteDbExpiryRunning) {
+                console.warn("[cron] DB expiry job still running, skipping");
+                return;
+            }
+
+            this.minuteDbExpiryRunning = true;
+            try {
+                await withTimeout(
+                    this.markAllExpiredUserCodesInDB(),
+                    60_000,
+                    "db user expiry"
+                );
+            } catch (err) {
+                console.error("[cron] DB expiry job failed", err);
+            } finally {
+                this.minuteDbExpiryRunning = false;
+            }
+        };
+
+        setTimeout(runDbExpiryEveryMinute, 5_000);
+        this.minuteDbExpiryInterval = setInterval(runDbExpiryEveryMinute, 60_000);
+        console.log("[cron] DB expiry interval registered at 60 seconds");
 
         setTimeout(() => {
             this.fiveMinuteTask = cron.schedule(

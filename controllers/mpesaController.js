@@ -4424,6 +4424,7 @@ class MpesaController {
                     expireAt,
                     period: pkg.period,
                     sessionTimeoutSeconds: null,
+                    devices: pkg.devices,
                 });
             }
         } catch (err) {

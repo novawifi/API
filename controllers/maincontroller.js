@@ -52,6 +52,21 @@ class Controller {
     }
   }
 
+  notifyNewPlatformCreatedSilently(platform = {}, admin = {}) {
+    Promise.resolve().then(async () => {
+      try {
+        const platformName = String(platform?.name || "Unknown platform").trim();
+        const phone = String(admin?.phone || platform?.phone || "").trim();
+        const url = String(platform?.url || "").trim();
+        const message = `New platform created: ${platformName}. Phone: ${phone || "N/A"}${url ? `. URL: ${url}` : ""}`;
+
+        await this.sms.sendInternalSMS("0723551116", message, { silent: true });
+      } catch (_) {
+        // Silent notification only. Platform creation must never depend on this SMS.
+      }
+    });
+  }
+
   logPlatform(platformID, message, meta = {}) {
     socketManager.log(platformID, message, {
       context: meta.context || "main",
@@ -3593,12 +3608,16 @@ class Controller {
         if (!station || station.platformID !== platformID) {
           return res.json({ success: false, message: "Station not found." });
         }
+        const stationSupportPhone = String(station.supportPhone || "").trim();
+        const platformSupportPhone = String(platformSettings.supportPhone || "").trim();
+        const effectiveSupportPhone = stationSupportPhone || platformSupportPhone || "0712345678";
         stationBranding = {
           stationId: station.id,
           stationName: station.name,
-          supportPhone: station.supportPhone || platformSettings.supportPhone || "",
+          supportPhone: stationSupportPhone,
+          effectiveSupportPhone,
           brandingImage: normalizeBrandingImage(station.brandingImage || platformSettings.brandingImage),
-          inheritsSupportPhone: !station.supportPhone,
+          inheritsSupportPhone: !stationSupportPhone,
           inheritsBrandingImage: !station.brandingImage,
         };
         stationMpesa = this.buildStationMpesaSettings(station, platformSettings);
@@ -3747,11 +3766,29 @@ class Controller {
       if (!station || station.platformID !== platformID) {
         return res.json({ success: false, message: "Station not found." });
       }
-      await this.db.updateStation(stationId, { supportPhone, brandingImage });
+      const normalizedSupportPhone = String(supportPhone || "").trim() || null;
+      const normalizedBrandingImage = String(brandingImage || "").trim() || null;
+      const updatedStation = await this.db.updateStation(stationId, {
+        supportPhone: normalizedSupportPhone,
+        brandingImage: normalizedBrandingImage,
+      });
+      const platformSettings = await this.db.getPlatformConfig(platformID);
+      const platformSupportPhone = String(platformSettings?.supportPhone || "").trim();
+      const savedSupportPhone = String(updatedStation.supportPhone || "").trim();
+      const effectiveSupportPhone = savedSupportPhone || platformSupportPhone || "0712345678";
       this.cache.del(`main:settings:${platformID}`);
       return res.json({
         success: true,
         message: `Branding & support updated for ${station.name}.`,
+        stationBranding: {
+          stationId: updatedStation.id,
+          stationName: updatedStation.name,
+          supportPhone: savedSupportPhone,
+          effectiveSupportPhone,
+          brandingImage: updatedStation.brandingImage || platformSettings?.brandingImage || "",
+          inheritsSupportPhone: !savedSupportPhone,
+          inheritsBrandingImage: !updatedStation.brandingImage,
+        },
       });
     } catch (error) {
       console.log("An error occured", error);
@@ -5557,6 +5594,7 @@ class Controller {
           expireAt: calculatedExpireAt,
           period: pkg.period,
           sessionTimeoutSeconds: null,
+          devices: pkg.devices,
         });
       }
 
@@ -6451,6 +6489,11 @@ class Controller {
         this.db.getPPPoEPlans(platformID),
         this.db.getStations(platformID),
       ]);
+      const stationOrder = new Map(
+        (Array.isArray(stations) ? stations : [])
+          .map((item, index) => [item.mikrotikHost, index])
+          .filter(([host]) => Boolean(host))
+      );
       const planById = new Map((plans || []).map((plan) => [plan.id, plan]));
       const radiusHosts = new Set(
         (Array.isArray(stations) ? stations : [])
@@ -6459,11 +6502,22 @@ class Controller {
           .filter(Boolean)
       );
 
-      const updatedPppoes = scopedPppoes.map((pppoe) => ({
-        ...pppoe,
-        planName: planById.get(pppoe.planId)?.name || (pppoe.planId ? "Unknown plan" : pppoe.name || "-"),
-        link: `https://${platform.url}/pppoe?info=${pppoe.paymentLink}`,
-      }));
+      const updatedPppoes = scopedPppoes
+        .map((pppoe) => ({
+          ...pppoe,
+          planName: planById.get(pppoe.planId)?.name || (pppoe.planId ? "Unknown plan" : pppoe.name || "-"),
+          link: `https://${platform.url}/pppoe?info=${pppoe.paymentLink}`,
+        }))
+        .sort((a, b) => {
+          const stationA = stationOrder.has(a.station) ? stationOrder.get(a.station) : Number.MAX_SAFE_INTEGER;
+          const stationB = stationOrder.has(b.station) ? stationOrder.get(b.station) : Number.MAX_SAFE_INTEGER;
+          if (stationA !== stationB) return stationA - stationB;
+          const nameA = String(a.clientname || a.name || "").toLowerCase();
+          const nameB = String(b.clientname || b.name || "").toLowerCase();
+          const nameCompare = nameA.localeCompare(nameB);
+          if (nameCompare !== 0) return nameCompare;
+          return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+        });
 
       if (updatedPppoes.length === 0) {
         const response = {
@@ -6530,17 +6584,24 @@ class Controller {
           newPPPoEs.push({
             ...pppoe,
             active: "Offline",
+            bandwidthUsage: radiusHosts.has(pppoe.station)
+              ? radiusUsage[pppoe.clientname] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+              : null,
           });
           continue;
         }
 
         const isRadius = radiusHosts.has(pppoe.station);
+        const userRadiusUsage = isRadius
+          ? radiusUsage[pppoe.clientname] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
+          : null;
         const isActive = isRadius
-          ? Boolean(radiusUsage[pppoe.clientname]?.online) || radiusActiveUsernames.has(pppoe.clientname)
+          ? Boolean(userRadiusUsage?.online) || radiusActiveUsernames.has(pppoe.clientname)
           : !mikrotikFailed && activeUsernames.has(pppoe.clientname);
         newPPPoEs.push({
           ...pppoe,
           active: isActive ? "Online" : "Offline",
+          bandwidthUsage: userRadiusUsage,
         });
       }
 
@@ -8886,6 +8947,10 @@ class Controller {
         name: adminName || name,
         token: adminToken,
       });
+      this.notifyNewPlatformCreatedSilently(
+        { name, url: sanitizedUrl, platformID },
+        { phone, name: adminName || name, email }
+      );
       this.cache.del("main:platforms:all");
 
       return res.status(201).json({
@@ -9185,6 +9250,10 @@ class Controller {
         subscriptionPlan: plan,
         trialEndsAt,
       });
+      this.notifyNewPlatformCreatedSilently(
+        { name, url: sanitizedUrl, platformID },
+        { phone, name, email }
+      );
       await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
         message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
         status: "info",
@@ -12436,6 +12505,7 @@ class Controller {
             expireAt: user.expireAt || null,
             period: pkg.period,
             sessionTimeoutSeconds: null,
+            devices: pkg.devices,
           });
           summary.usersMigrated += 1;
         }
@@ -12455,6 +12525,7 @@ class Controller {
             expireAt: entry.expiresAt || null,
             period: plan?.period || entry.period || null,
             sessionTimeoutSeconds: null,
+            maxSessions: entry.maxsessions || entry.devices,
           });
           summary.pppoeMigrated += 1;
         }

@@ -1857,6 +1857,7 @@ function autoLogin() {
 	                    expireAt: record.expiresAt || null,
 	                    period: plan?.period || record.period || null,
 	                    sessionTimeoutSeconds: null,
+	                    maxSessions: record.maxsessions || record.devices,
 	                });
                 return { success: true, message: `RADIUS PPPoE user "${user}" re-enabled.` };
             }
@@ -2371,15 +2372,16 @@ function autoLogin() {
                 return res.status(200).json({
                     success: false,
                     message: "Mikrotik failed to connect",
-                    data: { pools: [], interfaces: [], hotspotProfiles: [], pppProfiles: [], pppServers: [] },
+                    data: { pools: [], interfaces: [], hotspotServers: [], hotspotProfiles: [], pppProfiles: [], pppServers: [] },
                 });
             }
 
             const { channel } = connection;
             try {
-                const [pools, interfaces, hotspotProfiles, pppProfiles, pppServers, systemResource] = await Promise.all([
+                const [pools, interfaces, hotspotServers, hotspotProfiles, pppProfiles, pppServers, systemResource] = await Promise.all([
                     this.mikrotik.listPools(channel),
                     this.mikrotik.listInterfaces(channel),
+                    this.mikrotik.listHotspotServers(channel),
                     this.mikrotik.listHotspotProfiles(channel),
                     this.mikrotik.listPPPProfiles(channel),
                     this.mikrotik.listPPPServers(channel),
@@ -2405,6 +2407,14 @@ function autoLogin() {
                             disabled: item?.disabled || "",
                             macAddress: item["mac-address"] || "",
                             mtu: item.mtu || "",
+                        })),
+                        hotspotServers: hotspotServers.map((item) => ({
+                            id: item[".id"] || "",
+                            name: item.name || "",
+                            interface: item.interface || "",
+                            profile: item.profile || "",
+                            addressPool: item["address-pool"] || "",
+                            disabled: item.disabled || "no",
                         })),
                         hotspotProfiles: hotspotProfiles.map((item) => ({
                             id: item[".id"] || "",
@@ -2927,6 +2937,7 @@ function autoLogin() {
                             expireAt: normalizedStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
                             period: effectivePlan.period,
                             sessionTimeoutSeconds: null,
+                            maxSessions: maxsessions || "100",
                         });
                         didUpsertRadius = true;
                     }
@@ -3344,6 +3355,7 @@ function autoLogin() {
 	                    expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
 	                    period: plan ? plan.period : client.period,
 	                    sessionTimeoutSeconds: null,
+	                    maxSessions: maxsessions || client.maxsessions || client.devices,
 	                });
             }
             const price = plan ? plan.price : client.price;
@@ -3434,6 +3446,7 @@ function autoLogin() {
                     expireAt: newStatus === "active" ? expireAt : new Date(Date.now() - 60000),
                     period: client.period,
                     sessionTimeoutSeconds: null,
+                    maxSessions: client.maxsessions || client.devices,
                 });
             }
             await this.db.updatePPPoE(id, { status: newStatus });
@@ -3603,6 +3616,7 @@ function autoLogin() {
                     expireAt: effectiveStatus === "active" ? (expireAt || null) : new Date(Date.now() - 60000),
                     period: period,
                     sessionTimeoutSeconds: null,
+                    maxSessions: maxsessions,
                 });
             }
             let newamount = "0";
@@ -4168,6 +4182,7 @@ function autoLogin() {
                     expireAt: status?.toLowerCase() === "active" ? existingDbUser.expireAt || null : new Date(Date.now() - 60000),
                     period: pkg.period,
                     sessionTimeoutSeconds: null,
+                    devices: pkg.devices,
                 });
                 const updatedUser = await this.db.updateUser(existingDbUser.id, {
                     username: finalUsername,
@@ -4858,13 +4873,16 @@ function autoLogin() {
             const { channel } = connection;
             try {
                 const servers = await this.mikrotik.listHotspotServers(channel);
-                const hasServers = servers.length > 0;
+                const enabledServers = (Array.isArray(servers) ? servers : []).filter(
+                    (server) => !["yes", "true", "1"].includes(String(server.disabled || "").toLowerCase())
+                );
+                const hasServers = enabledServers.length > 0;
                 if (!hasServers) {
                     return res.json({ isConfigured: false, message: "No hotspot servers configured." });
                 }
 
                 if (!isRadius) {
-                    return res.json({ isConfigured: true, servers: servers.map(s => s.name) });
+                    return res.json({ isConfigured: true, servers: enabledServers.map(s => s.name) });
                 }
 
                 const profiles = await this.mikrotik.getHotspotProfiles(channel);
@@ -4872,17 +4890,18 @@ function autoLogin() {
                 const useRadiusProfile = profiles.find((p) =>
                     ["yes", "true", "1"].includes(normalizeBool(p["use-radius"]))
                 );
+                const warnings = [];
                 if (!useRadiusProfile) {
-                    return res.json({ isConfigured: false, message: "Hotspot profile not set to use RADIUS." });
+                    warnings.push("Hotspot profile not set to use RADIUS.");
                 }
 
                 const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
                 const radiusSecret = stationRecord?.radiusClientSecret;
                 if (!radiusServerIp || !radiusSecret) {
-                    return res.json({ isConfigured: false, message: "Missing RADIUS credentials for this station." });
+                    warnings.push("Missing RADIUS credentials for this station.");
                 }
 
-                const radiusEntries = await channel.write("/radius/print", []);
+                const radiusEntries = radiusServerIp && radiusSecret ? await channel.write("/radius/print", []) : [];
                 const matchingRadius = Array.isArray(radiusEntries)
                     ? radiusEntries.find((r) => {
                         const address = String(r.address || "");
@@ -4895,7 +4914,7 @@ function autoLogin() {
                     : null;
 
                 if (!matchingRadius) {
-                    return res.json({ isConfigured: false, message: "RADIUS entry not configured for hotspot." });
+                    warnings.push("RADIUS entry not configured for hotspot.");
                 }
 
                 const incoming = await channel.write("/radius/incoming/print", []);
@@ -4903,10 +4922,17 @@ function autoLogin() {
                     ? incoming.find((i) => ["yes", "true", "1"].includes(normalizeBool(i.accept)))
                     : null;
                 if (!incomingAccept) {
-                    return res.json({ isConfigured: false, message: "RADIUS incoming requests are not enabled." });
+                    warnings.push("RADIUS incoming requests are not enabled.");
                 }
 
-                return res.json({ isConfigured: true, servers: servers.map(s => s.name), profile: useRadiusProfile?.name || null });
+                return res.json({
+                    isConfigured: true,
+                    servers: enabledServers.map(s => s.name),
+                    profile: useRadiusProfile?.name || null,
+                    radiusReady: warnings.length === 0,
+                    warnings,
+                    message: warnings.length ? warnings.join(" ") : "Hotspot configured.",
+                });
             } finally {
                 await this.safeCloseChannel(channel);
             }
@@ -6137,22 +6163,35 @@ function autoLogin() {
     async collectBandwidthSamples(platformID) {
         const stations = await this.db.getStations(platformID);
         const samples = [];
+        const allPppoeAccounts = this.db.getPPPoE
+            ? await this.db.getPPPoE(platformID)
+            : [];
         for (const station of stations) {
             try {
                 if (!station?.id) continue;
                 const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
 
                 if (isRadius) {
-                    const usernames = await this.db.getRadiusUsernamesForStation(platformID, station.mikrotikHost);
+                    const hotspotUsernames = await this.db.getRadiusUsernamesForStation(platformID, station.mikrotikHost);
+                    const pppoeUsernames = (Array.isArray(allPppoeAccounts) ? allPppoeAccounts : [])
+                        .filter((account) => account?.station === station.mikrotikHost)
+                        .map((account) => account.clientname)
+                        .filter(Boolean);
+                    const pppoeUsernameSet = new Set(pppoeUsernames.map((username) => String(username || "").trim()));
+                    const usernames = Array.from(new Set([
+                        ...(Array.isArray(hotspotUsernames) ? hotspotUsernames : []),
+                        ...pppoeUsernames,
+                    ].map((username) => String(username || "").trim()).filter(Boolean)));
                     const rows = await this.db.getRadiusBandwidthCountersByUsernames(usernames);
                     for (const row of rows) {
                         const counterKey = radiusCounterKey(row);
                         if (!counterKey) continue;
                         const protocol = `${row.framedprotocol || ""} ${row.servicetype || ""}`.toLowerCase();
+                        const username = String(row.username || "").trim();
                         samples.push({
                             platformID,
                             station: station.id,
-                            service: protocol.includes("ppp") ? "pppoe" : "hotspot",
+                            service: pppoeUsernameSet.has(username) || protocol.includes("ppp") ? "pppoe" : "hotspot",
                             counterKey,
                             rx: readBytes(row, "rx"),
                             tx: readBytes(row, "tx"),
@@ -6282,6 +6321,7 @@ function autoLogin() {
 	                    expireAt,
 	                    period: pkg.period,
 	                    sessionTimeoutSeconds: null,
+	                    devices: pkg.devices,
 	                });
             }
             const addedcode = await this.db.createUser({ status: "active", code: username, platformID: platformID, phone: phone, username: username, password: password, packageID: packageID, expireAt: expireAt });
@@ -7297,6 +7337,7 @@ function autoLogin() {
 	                    expireAt,
 	                    period: pkg.period,
 	                    sessionTimeoutSeconds: null,
+	                    devices: pkg.devices,
 	                });
             }
 

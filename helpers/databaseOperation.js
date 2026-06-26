@@ -407,6 +407,25 @@ class DataBase {
         }
     }
 
+    async updateActiveDBUsersByTime(now = new Date()) {
+        try {
+            return await prisma.user.updateMany({
+                where: {
+                    status: { in: ["active", "Active", "ACTIVE"] },
+                    expireAt: {
+                        lte: now,
+                    },
+                },
+                data: {
+                    status: "expired",
+                },
+            });
+        } catch (error) {
+            console.error("Error expiring users:", error);
+            throw error;
+        }
+    }
+
     async deleteUser(id) {
         if (!id) return null;
         try {
@@ -421,9 +440,21 @@ class DataBase {
         }
     }
 
-    async upsertRadiusUser({ username, password, groupname, rateLimit, dataLimitBytes, expireAt, period, sessionTimeoutSeconds }) {
+    async upsertRadiusUser({ username, password, groupname, rateLimit, dataLimitBytes, expireAt, period, sessionTimeoutSeconds, devices, simultaneousUse, maxSessions }) {
         if (!username || !password) return null;
         try {
+            const normalizePositiveInteger = (...values) => {
+                for (const value of values) {
+                    if (value === undefined || value === null) continue;
+                    const text = String(value).trim();
+                    if (!text || /^(unlimited|no\s*limit|none|null)$/i.test(text)) continue;
+                    const match = text.match(/\d+/);
+                    if (!match) continue;
+                    const parsed = Number(match[0]);
+                    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+                }
+                return null;
+            };
             const parsePeriodToSeconds = (periodValue) => {
                 if (!periodValue) return null;
                 const text = String(periodValue).trim().toLowerCase();
@@ -476,6 +507,7 @@ class DataBase {
             }
 
             const expiryString = formatExpiration(expireAt);
+            const simultaneousUseLimit = normalizePositiveInteger(simultaneousUse, devices, maxSessions);
             await prisma.radcheck.deleteMany({ where: { username } });
             await prisma.radcheck.create({
                 data: {
@@ -492,6 +524,16 @@ class DataBase {
                         attribute: "Expiration",
                         op: ":=",
                         value: expiryString,
+                    },
+                });
+            }
+            if (simultaneousUseLimit) {
+                await prisma.radcheck.create({
+                    data: {
+                        username,
+                        attribute: "Simultaneous-Use",
+                        op: ":=",
+                        value: String(simultaneousUseLimit),
                     },
                 });
             }
@@ -522,20 +564,37 @@ class DataBase {
             }
 
             await prisma.radreply.deleteMany({
-                where: { username, attribute: "Mikrotik-Total-Limit" },
+                where: {
+                    username,
+                    attribute: { in: ["Mikrotik-Total-Limit", "Mikrotik-Total-Limit-Gigawords"] },
+                },
             });
-            const totalLimitKb = dataLimitBytes && Number(dataLimitBytes) > 0
-                ? Math.ceil(Number(dataLimitBytes) / 1024)
+            const totalLimitBytes = dataLimitBytes && Number(dataLimitBytes) > 0
+                ? Math.ceil(Number(dataLimitBytes))
                 : null;
-            if (totalLimitKb && Number(totalLimitKb) > 0) {
+            if (totalLimitBytes && Number(totalLimitBytes) > 0) {
+                const bytesBigInt = BigInt(totalLimitBytes);
+                const gigaword = 2n ** 32n;
+                const lowBytes = bytesBigInt % gigaword;
+                const highGigawords = bytesBigInt / gigaword;
                 await prisma.radreply.create({
                     data: {
                         username,
                         attribute: "Mikrotik-Total-Limit",
                         op: ":=",
-                        value: String(totalLimitKb),
+                        value: String(lowBytes),
                     },
                 });
+                if (highGigawords > 0n) {
+                    await prisma.radreply.create({
+                        data: {
+                            username,
+                            attribute: "Mikrotik-Total-Limit-Gigawords",
+                            op: ":=",
+                            value: String(highGigawords),
+                        },
+                    });
+                }
             }
 
             await prisma.radreply.deleteMany({
@@ -816,6 +875,33 @@ class DataBase {
         } catch (error) {
             console.error("Error aggregating RADIUS usage by usernames:", error);
             return {};
+        }
+    }
+
+    async getRadiusUsageByUsernameSince(username, since = null) {
+        const cleanUsername = String(username || "").trim();
+        if (!cleanUsername) return 0;
+        const sinceDate = since ? new Date(since) : null;
+        try {
+            const rows = await prisma.radacct.groupBy({
+                by: ["username"],
+                where: {
+                    username: cleanUsername,
+                    ...(sinceDate && !Number.isNaN(sinceDate.getTime()) ? { acctstarttime: { gte: sinceDate } } : {}),
+                },
+                _sum: {
+                    acctinputoctets: true,
+                    acctoutputoctets: true,
+                },
+            });
+            const row = rows[0];
+            if (!row) return 0;
+            const rx = row._sum?.acctinputoctets || 0n;
+            const tx = row._sum?.acctoutputoctets || 0n;
+            return Number(rx) + Number(tx);
+        } catch (error) {
+            console.error("Error aggregating RADIUS usage by username:", error);
+            return 0;
         }
     }
 
@@ -1347,10 +1433,12 @@ class DataBase {
                     { status: "PROCESSING", updatedAt: { lt: staleProcessingAt } },
                     { status: "MANUAL_REVIEW" },
                 ],
-                AND: [{ OR: [
-                    { reconciliationLeaseUntil: null },
-                    { reconciliationLeaseUntil: { lt: now } },
-                ] }],
+                AND: [{
+                    OR: [
+                        { reconciliationLeaseUntil: null },
+                        { reconciliationLeaseUntil: { lt: now } },
+                    ]
+                }],
             },
             data: { status: "PENDING", reconciliationLeaseUntil: leaseUntil },
         });
@@ -1460,11 +1548,13 @@ class DataBase {
                 AND: [
                     { OR: [{ service: "hotspot" }, { service: null }] },
                     { OR: [{ reversed: false }, { reversed: null }] },
-                    { OR: [
-                        { code: value },
-                        { reqcode: value },
-                        ...(phones.length > 0 ? [{ phone: { in: phones } }] : []),
-                    ] },
+                    {
+                        OR: [
+                            { code: value },
+                            { reqcode: value },
+                            ...(phones.length > 0 ? [{ phone: { in: phones } }] : []),
+                        ]
+                    },
                 ],
             };
 
@@ -2453,6 +2543,8 @@ class DataBase {
                         select: {
                             category: true,
                             routerHost: true,
+                            usage: true,
+                            fupLimit: true,
                         },
                     },
                 },
@@ -3666,8 +3758,13 @@ class DataBase {
             const pppoe = await prisma.pppoe.findMany({
                 where: {
                     platformID
-                }
-            })
+                },
+                orderBy: [
+                    { station: "asc" },
+                    { clientname: "asc" },
+                    { createdAt: "desc" },
+                ],
+            });
             return pppoe;
         } catch (error) {
             console.error("An error occured:", error);
@@ -5093,8 +5190,8 @@ class DataBase {
                     }),
                     includeAllPlatforms
                         ? prisma.platform.findMany({
-                              select: { platformID: true },
-                          })
+                            select: { platformID: true },
+                        })
                         : Promise.resolve([]),
                 ]);
 
@@ -6264,14 +6361,14 @@ class DataBase {
         }
     }
 
-	    async searchMpesa({ platformID, search, station, limit, offset, date }) {
-	        const where = {
-	            platformID,
-	            ...(search && {
-	                OR: [
-	                    { phone: { contains: search } },
-	                    { code: { contains: search } },
-	                    { account: { contains: search } },
+    async searchMpesa({ platformID, search, station, limit, offset, date }) {
+        const where = {
+            platformID,
+            ...(search && {
+                OR: [
+                    { phone: { contains: search } },
+                    { code: { contains: search } },
+                    { account: { contains: search } },
                     { status: { contains: search } },
                 ],
             }),
@@ -6283,35 +6380,35 @@ class DataBase {
             };
         }
 
-	        const [rows, totalCount] = await Promise.all([
-	            prisma.mpesa.findMany({
-	                where,
-	                include: { package: true },
-	                orderBy: { createdAt: "desc" },
-	                skip: offset,
-	                take: limit,
-	            }),
+        const [rows, totalCount] = await Promise.all([
+            prisma.mpesa.findMany({
+                where,
+                include: { package: true },
+                orderBy: { createdAt: "desc" },
+                skip: offset,
+                take: limit,
+            }),
             prisma.mpesa.count({ where }),
         ]);
 
         return { rows, totalCount };
     }
 
-	    async searchUsers({ platformID, search, station, limit, offset }) {
-            const stationRouterHosts = station
-                ? await this.resolveStationRouterHosts(platformID, station)
-                : [];
-	        const where = {
-	            platformID,
-	            ...(station && {
-	                package: {
-	                    is: { routerHost: { in: stationRouterHosts } },
-	                },
-	            }),
-	            ...(search && {
-	                OR: [
-	                    { username: { contains: search } },
-	                    { mac: { contains: search } },
+    async searchUsers({ platformID, search, station, limit, offset }) {
+        const stationRouterHosts = station
+            ? await this.resolveStationRouterHosts(platformID, station)
+            : [];
+        const where = {
+            platformID,
+            ...(station && {
+                package: {
+                    is: { routerHost: { in: stationRouterHosts } },
+                },
+            }),
+            ...(search && {
+                OR: [
+                    { username: { contains: search } },
+                    { mac: { contains: search } },
                     { phone: { contains: search } },
                     { id: { contains: search } },
                     { status: { contains: search } },
@@ -6404,15 +6501,19 @@ class DataBase {
         return { rows, totalCount };
     }
 
-	    async searchPppoe({ platformID, search, station, limit, offset }) {
-	        const where = this.buildPppoeSearchWhere({ platformID, search, station });
+    async searchPppoe({ platformID, search, station, limit, offset }) {
+        const where = this.buildPppoeSearchWhere({ platformID, search, station });
 
         const [rows, totalCount] = await Promise.all([
             prisma.pppoe.findMany({
                 where,
                 skip: offset,
                 take: limit,
-                orderBy: { createdAt: "desc" },
+                orderBy: [
+                    { station: "asc" },
+                    { clientname: "asc" },
+                    { createdAt: "desc" },
+                ],
             }),
             prisma.pppoe.count({ where }),
         ]);
@@ -6421,13 +6522,13 @@ class DataBase {
     }
 
     buildPppoeSearchWhere({ platformID, search, station }) {
-	        return {
-	            platformID,
-	            ...(station && { station }),
-	            ...(search && {
-	                OR: [
-	                    { name: { contains: search } },
-	                    { profile: { contains: search } },
+        return {
+            platformID,
+            ...(station && { station }),
+            ...(search && {
+                OR: [
+                    { name: { contains: search } },
+                    { profile: { contains: search } },
                     { servicename: { contains: search } },
                     { station: { contains: search } },
                     { pool: { contains: search } },
