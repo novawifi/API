@@ -73,7 +73,6 @@ class Socket {
         const stationSupportPhone =
             String(station.supportPhone || "").trim() ||
             String(platformData.supportPhone || "").trim() ||
-            String(platformData.phone || "").trim() ||
             "0712345678";
         return {
             ...platformData,

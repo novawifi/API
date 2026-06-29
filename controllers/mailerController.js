@@ -59,44 +59,171 @@ class Mailer {
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
             <title>${brandName}</title>
+            <style>
+              body {
+                margin: 0;
+                padding: 0;
+                background-color: #f5f7fa;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+                color: #2c3e50;
+              }
+              .email-container {
+                max-width: 600px;
+                margin: 0 auto;
+                background: #ffffff;
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07), 0 10px 20px rgba(0, 0, 0, 0.08);
+              }
+              .header-box {
+                background: linear-gradient(135deg, #0077cc 0%, #0057a0 100%);
+                padding: 32px 24px;
+                text-align: center;
+                border-bottom: 4px solid #0055a0;
+              }
+              .brand-name {
+                font-size: 28px;
+                font-weight: 700;
+                color: #ffffff;
+                margin: 0;
+                letter-spacing: -0.5px;
+              }
+              .greeting-box {
+                padding: 32px 24px;
+              }
+              .greeting-text {
+                margin: 0 0 20px 0;
+                font-size: 16px;
+                font-weight: 600;
+                color: #2c3e50;
+              }
+              .content-box {
+                padding: 24px;
+                background: #f9fbfc;
+                border-left: 4px solid #0077cc;
+                border-radius: 6px;
+                margin: 0 0 24px 0;
+              }
+              .message-content {
+                font-size: 15px;
+                line-height: 1.8;
+                color: #555a62;
+                margin: 0;
+              }
+              .message-content p {
+                margin: 0 0 16px 0;
+              }
+              .message-content p:last-child {
+                margin-bottom: 0;
+              }
+              .message-content a {
+                color: #0077cc;
+                text-decoration: none;
+                font-weight: 600;
+                transition: color 0.2s;
+              }
+              .message-content a:hover {
+                color: #0055a0;
+              }
+              .cta-button {
+                display: inline-block;
+                padding: 12px 28px;
+                background: #0077cc;
+                color: #ffffff !important;
+                text-decoration: none !important;
+                border-radius: 6px;
+                font-weight: 600;
+                font-size: 15px;
+                margin: 16px 0 0 0;
+                transition: background 0.2s;
+              }
+              .cta-button:hover {
+                background: #0055a0;
+              }
+              .divider {
+                height: 1px;
+                background: #e8ecf1;
+                margin: 24px 0;
+              }
+              .signature-box {
+                padding: 0;
+                color: #7f8c8d;
+                font-size: 14px;
+              }
+              .signature-box p {
+                margin: 0 0 8px 0;
+              }
+              .signature-name {
+                color: #2c3e50;
+                font-weight: 600;
+              }
+              .footer-box {
+                background: #f9fbfc;
+                padding: 20px 24px;
+                border-top: 1px solid #e8ecf1;
+                text-align: center;
+              }
+              .footer-text {
+                margin: 0;
+                font-size: 13px;
+                color: #7f8c8d;
+                line-height: 1.6;
+              }
+              .footer-text a {
+                color: #0077cc;
+                text-decoration: none;
+                font-weight: 600;
+              }
+              .footer-text a:hover {
+                text-decoration: underline;
+              }
+              .copyright {
+                margin-top: 12px;
+                padding-top: 12px;
+                border-top: 1px solid #e8ecf1;
+                font-size: 12px;
+                color: #bdc3c7;
+              }
+            </style>
           </head>
-          <body style="margin:0;padding:0;background-color:#0b1220;font-family:'Poppins', Arial, sans-serif;color:#0f172a;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#0b1220;padding:24px 0;">
-              <tr>
-                <td align="center">
-                  <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:600px;max-width:92%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 10px 30px rgba(2,6,23,0.35);">
-                    <tr>
-                      <td style="padding:18px 24px;background:#1f2937;color:#ffffff;">
-                        <h1 style="margin:0;font-size:20px;letter-spacing:0.5px;">${brandName}</h1>
-                        
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="padding:28px 24px 12px 24px;">
-                        <h2 style="margin:0 0 12px 0;font-size:18px;color:#0f172a;">Hello ${name || "User"},</h2>
-                        <div style="font-size:14px;line-height:1.7;color:#334155;">
-                          ${safeMessage}
-                        </div>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="padding:18px 24px 26px 24px;">
-                        <p style="margin:0;font-size:13px;color:#475569;">Best regards,</p>
-                        <p style="margin:4px 0 0 0;font-size:13px;color:#0f172a;font-weight:600;">${brandName}</p>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="padding:14px 24px;background:#f1f5f9;">
-                        <p style="margin:0;font-size:12px;color:#64748b;">
-                          Need help? Contact support at <a href="mailto:support@novawifi.co.ke" style="color:#0ea5e9;text-decoration:none;font-weight:600;">support@novawifi.co.ke</a>
-                        </p>
-                      </td>
-                    </tr>
-                  </table>
-                  <p style="margin:16px 0 0 0;font-size:11px;color:#94a3b8;">© ${brandName}. All rights reserved.</p>
-                </td>
-              </tr>
-            </table>
+          <body>
+            <div style="padding: 20px;">
+              <div class="email-container">
+                <!-- Header -->
+                <div class="header-box">
+                  <h1 class="brand-name">${brandName}</h1>
+                </div>
+
+                <!-- Main Content -->
+                <div style="padding: 40px 24px;">
+                  <p class="greeting-text">Hello ${name || "Valued User"},</p>
+                  
+                  <div class="content-box">
+                    <div class="message-content">
+                      ${safeMessage}
+                    </div>
+                  </div>
+
+                  <!-- Signature -->
+                  <div class="signature-box">
+                    <p>Best regards,</p>
+                    <p class="signature-name">${brandName} Team</p>
+                  </div>
+                </div>
+
+                <!-- Footer -->
+                <div class="footer-box">
+                  <p class="footer-text">
+                    <strong>Need assistance?</strong><br/>
+                    Contact our support team at <a href="mailto:support@novawifi.co.ke">support@novawifi.co.ke</a>
+                  </p>
+                  <div class="copyright">
+                    © ${new Date().getFullYear()} ${brandName}. All rights reserved.<br/>
+                    We value your business and are here to help.
+                  </div>
+                </div>
+              </div>
+            </div>
           </body>
         </html>
         `;

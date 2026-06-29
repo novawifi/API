@@ -4,6 +4,57 @@ const { Mikrotikcontroller } = require("../controllers/mikrotikController");
 const router = express.Router();
 const controller = new Mikrotikcontroller();
 
+const lockedPlatformMessage = "Platform is deactivated. Activate it in Settings to perform this operation.";
+const lockedPlatformHandlers = new Set([
+    "updateAddressPool",
+    "deleteAddressPool",
+    "createPPPProfile",
+    "createPPPoEServer",
+    "createPPPoEPlan",
+    "updatePPPoEPlan",
+    "deletePPPoEPlan",
+    "createPPPoEUser",
+    "updatePPPoEUser",
+    "importPPPoEUsersFromRouter",
+    "updateMikrotikPPPoE",
+    "togglePPPoEStatus",
+    "deletePppoE",
+    "updateMikrotikUser",
+    "autoConfigurePPPoE",
+    "autoConfigureHotspot",
+    "repairRouter",
+    "configureMikrotikRescue",
+    "startAutoRouter",
+    "importUsers",
+    "seedAutoBackupScript",
+    "uploadMikrotikFile",
+    "moveMikrotikFile",
+    "deleteMikrotikFile",
+    "updateRouterQuickSetting",
+    "rebootRouter",
+]);
+
+const getRequestToken = (req) =>
+    req.body?.token ||
+    req.body?.data?.token ||
+    req.query?.token ||
+    req.headers?.authorization ||
+    "";
+
+const isLockedPlatformRequest = async (req) => {
+    try {
+        const token = String(getRequestToken(req) || "").trim();
+        if (!token) return false;
+        const auth = await controller.auth.AuthenticateRequest(token);
+        if (!auth?.success || !auth?.admin?.platformID) return false;
+        const platform = await controller.db.getPlatformByplatformID(auth.admin.platformID);
+        const status = String(platform?.status || "").trim().toLowerCase();
+        return status === "deactivated" || status === "paused";
+    } catch {
+        return false;
+    }
+};
+
 const use = (name) => {
     const handler = controller[name];
     if (typeof handler !== "function") {
@@ -11,7 +62,12 @@ const use = (name) => {
         return (req, res) =>
             res.status(501).json({ success: false, message: `Handler ${name} not implemented` });
     }
-    return (req, res) => handler.call(controller, req, res);
+    return async (req, res) => {
+        if (lockedPlatformHandlers.has(name) && await isLockedPlatformRequest(req)) {
+            return res.status(423).json({ success: false, locked: true, message: lockedPlatformMessage });
+        }
+        return handler.call(controller, req, res);
+    };
 };
 
 router.post("/pools", use("fetchAddressPoolsFromConnections"));

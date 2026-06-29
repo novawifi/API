@@ -60,6 +60,37 @@ class MpesaController {
         return next;
     }
 
+    async isPlatformOperationsLocked(platformID) {
+        if (!platformID) return false;
+        const platform = await this.db.getPlatformByplatformID(platformID);
+        const status = String(platform?.status || "").trim().toLowerCase();
+        return status === "deactivated" || status === "paused";
+    }
+
+    getNextBillDueDate(bill, baseDate = new Date(), periods = 1) {
+        const match = String(bill?.period || "30 days").trim().toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+        if (!match) return null;
+        const paidAt = new Date(baseDate);
+        if (Number.isNaN(paidAt.getTime())) return null;
+        const currentDueDate = bill?.dueDate ? new Date(bill.dueDate) : null;
+        let renewalBase =
+            currentDueDate && !Number.isNaN(currentDueDate.getTime()) && currentDueDate > paidAt
+                ? currentDueDate
+                : paidAt;
+        const cycles = Math.max(1, Number(periods) || 1);
+        for (let i = 0; i < cycles; i += 1) {
+            renewalBase = Utils.addPeriod(renewalBase, parseInt(match[1]), match[2].toLowerCase());
+        }
+        return renewalBase;
+    }
+
+    getBillPaymentPeriods(payment) {
+        const match = String(payment?.reason || "").match(/billing-periods:(\d+)/i);
+        if (!match) return 1;
+        const periods = Number(match[1]);
+        return Number.isFinite(periods) && periods > 0 ? Math.floor(periods) : 1;
+    }
+
     async getPaymentPlatformConfig(platformID, stationHost = null) {
         const platform = await this.db.getPlatformConfig(platformID);
         if (!platform || !stationHost) return platform;
@@ -558,6 +589,18 @@ class MpesaController {
         }
     }
 
+    getMpesaErrorMessage(error, fallback = "M-PESA request failed.") {
+        const data = error?.response?.data;
+        return (
+            data?.errorMessage ||
+            data?.ResponseDescription ||
+            data?.ResultDesc ||
+            data?.message ||
+            error?.message ||
+            fallback
+        );
+    }
+
     async isMaintenanceHappening() {
         const settings = await this.db.getSettings();
         let ismaintenance = false;
@@ -633,10 +676,6 @@ class MpesaController {
         if (!/^\d{5,8}$/.test(shortCode)) {
             throw new Error("MPESA C2B destination must be 5 to 8 digits.");
         }
-        if (type === "paybill" && !account) {
-            throw new Error("MPESA C2B Paybill account number is required.");
-        }
-
         return { type, shortCode, account };
     }
 
@@ -666,10 +705,10 @@ class MpesaController {
                 account: "",
             };
         const isPaybill = destination.type === "paybill";
-        const businessShortCode = isPaybill ? destination.shortCode : String(c2bEnv.shortCode);
+        const businessShortCode = String(c2bEnv.shortCode);
         const partyB = destination.shortCode;
         const reference = this.sanitizeDarajaText(
-            isPaybill ? destination.account : accountReference,
+            isPaybill ? (destination.account || accountReference) : accountReference,
             isPaybill ? "PAYBILL" : "NOVA WIFI",
             12
         );
@@ -1200,12 +1239,33 @@ class MpesaController {
             const config = await this.db.getPlatformConfig(platformID);
             if (!config) return;
 
-            if (!config.IsAPI) return;
-            if (config.registeredURL === true) return;
-            if (config.offlinePayments === true) return;
+            const registrationTargets = [];
+            if (config.IsAPI && config.mpesaShortCode) {
+                registrationTargets.push({
+                    shortCode: config.mpesaShortCode,
+                    label: "API",
+                });
+            }
+            if ((config.offlinePayments || config.IsC2B) && config.mpesaC2BShortCode) {
+                registrationTargets.push({
+                    shortCode: config.mpesaC2BShortCode,
+                    label: "C2B",
+                });
+            }
 
-            const shortCode = config.mpesaShortCode;
-            if (!shortCode) {
+            const uniqueTargets = Array.from(
+                new Map(
+                    registrationTargets
+                        .map((target) => ({
+                            ...target,
+                            shortCode: String(target.shortCode || "").trim(),
+                        }))
+                        .filter((target) => target.shortCode)
+                        .map((target) => [target.shortCode, target])
+                ).values()
+            );
+
+            if (uniqueTargets.length === 0) {
                 this.logPayment(platformID, "Register URL skipped: missing shortcode", "warn");
                 return;
             }
@@ -1214,26 +1274,36 @@ class MpesaController {
                 return;
             }
 
-            const accessToken = await this.getAccessToken(platform);
+            const accessToken = await this.getAccessToken(config);
 
             const http = this.getDarajaAxios();
-            const response = await http.post(
-                this.mpesa.MPESA_REGISTER_URL || "",
-                {
-                    ShortCode: shortCode,
-                    ResponseType: "Completed",
-                    ConfirmationURL: `${process.env.BASE_URL}/mpesa/confirmation`,
-                    ValidationURL: `${process.env.BASE_URL}/mpesa/validation`
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json',
+            let registeredCount = 0;
+            for (const target of uniqueTargets) {
+                const response = await http.post(
+                    this.mpesa.MPESA_REGISTER_URL || "",
+                    {
+                        ShortCode: target.shortCode,
+                        ResponseType: "Completed",
+                        ConfirmationURL: `${process.env.BASE_URL}/mpesa/confirmation`,
+                        ValidationURL: `${process.env.BASE_URL}/mpesa/validation`
                     },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json',
+                        },
+                    }
+                );
+                const data = response.data;
+                if (data.ResponseCode === "0") {
+                    registeredCount += 1;
+                    this.logPayment(platformID, `Register URL completed for ${target.label} shortcode ${target.shortCode}`, "success");
+                } else {
+                    this.logPayment(platformID, `Register URL failed for ${target.label} shortcode ${target.shortCode}`, "warn");
                 }
-            );
-            const data = response.data
-            if (data.ResponseCode === "0") {
+            }
+
+            if (registeredCount === uniqueTargets.length) {
                 await this.db.updatePlatformConfig(platformID, {
                     registeredURL: true
                 })
@@ -1258,6 +1328,13 @@ class MpesaController {
             return res.status(400).json({
                 success: false,
                 message: "Phone number and amount are required."
+            });
+        }
+        if (await this.isPlatformOperationsLocked(platformID)) {
+            return res.status(423).json({
+                success: false,
+                locked: true,
+                message: "Platform is deactivated. Hotspot payments are disabled until the platform is activated.",
             });
         }
 
@@ -1314,15 +1391,16 @@ class MpesaController {
                         message: "Configure MPESA C2B destination as Till or Paybill.",
                     });
                 }
+                const c2bAccountReference = pkg?.accountNumber || client?.name || platformID;
                 checkoutRequestId = await this.initiateC2BStkPush({
                     platformID,
                     phone,
                     amount,
-                    accountReference: client?.name || platformID,
+                    accountReference: c2bAccountReference,
                     transactionDesc: 'WiFi Subscription Payment',
                     destinationType: platform.mpesaC2BShortCodeType,
                     destinationShortCode: platform.mpesaC2BShortCode,
-                    destinationAccount: platform.mpesaC2BAccountNumber,
+                    destinationAccount: platform.mpesaC2BAccountNumber || pkg?.accountNumber,
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
@@ -1339,7 +1417,7 @@ class MpesaController {
                     paymentMethod: "Mpesa C2B",
                     till: !isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     paybill: isPaybill ? String(platform.mpesaC2BShortCode) : "null",
-                    account: isPaybill ? String(platform.mpesaC2BAccountNumber || "") : "null",
+                    account: isPaybill ? String(platform.mpesaC2BAccountNumber || c2bAccountReference) : "null",
                 };
                 const addMpesaCodeTodb = await this.db.addMpesaCode(mpesaCode);
                 if (addMpesaCodeTodb) {
@@ -1486,15 +1564,16 @@ class MpesaController {
                 message: "Failed to initiate STK Push"
             });
         } catch (error) {
-            console.error('Error initiating STK Push:', this.decodeBuffer(error));
-            socketManager.log(platformID, `STK push error: ${error.message || "unknown error"}`, {
+            const publicError = this.getMpesaErrorMessage(error, "Failed to initiate STK Push");
+            console.error('Error initiating STK Push:', error.response?.data || this.decodeBuffer(error));
+            socketManager.log(platformID, `STK push error: ${publicError}`, {
                 context: "payments",
                 level: "error",
             });
-            return res.status(500).json({
+            return res.status(error.response?.status || 500).json({
                 success: false,
                 message: "Failed to initiate STK Push",
-                error: error.message
+                error: publicError
             });
         }
     };
@@ -1526,6 +1605,13 @@ class MpesaController {
         let amount = 0;
         amount = Number(pkg.amount) > 0 ? pkg.amount : pkg.price;
         const platformID = pkg.platformID;
+        if (await this.isPlatformOperationsLocked(platformID)) {
+            return res.status(423).json({
+                success: false,
+                locked: true,
+                message: "Platform is deactivated. PPPoE payments are disabled until the platform is activated.",
+            });
+        }
 
         try {
             const platform = await this.getPaymentPlatformConfig(platformID, pkg.station);
@@ -1563,15 +1649,16 @@ class MpesaController {
                         message: "Configure MPESA C2B destination as Till or Paybill.",
                     });
                 }
+                const c2bAccountReference = pkg?.accountNumber || paymentLink || "PPPOE";
                 checkoutRequestId = await this.initiateC2BStkPush({
                     platformID,
                     phone,
                     amount,
-                    accountReference: "PPPOE",
+                    accountReference: c2bAccountReference,
                     transactionDesc: 'PPPoE Subscription Payment',
                     destinationType: platform.mpesaC2BShortCodeType,
                     destinationShortCode: platform.mpesaC2BShortCode,
-                    destinationAccount: platform.mpesaC2BAccountNumber,
+                    destinationAccount: platform.mpesaC2BAccountNumber || pkg?.accountNumber,
                 });
                 const c2bType = String(platform.mpesaC2BShortCodeType || "").toLowerCase();
                 const isPaybill = c2bType === "paybill";
@@ -1589,7 +1676,7 @@ class MpesaController {
                     paymentMethod: "Mpesa C2B",
                     till: !isPaybill ? String(platform.mpesaC2BShortCode) : "null",
                     paybill: isPaybill ? String(platform.mpesaC2BShortCode) : "null",
-                    account: isPaybill ? String(platform.mpesaC2BAccountNumber || "") : "null",
+                    account: isPaybill ? String(platform.mpesaC2BAccountNumber || c2bAccountReference) : "null",
                 };
                 const addMpesaCodeTodb = await this.db.addMpesaCode(mpesaCode);
                 if (addMpesaCodeTodb) {
@@ -1740,15 +1827,16 @@ class MpesaController {
                 message: "Failed to initiate STK Push"
             });
         } catch (error) {
+            const publicError = this.getMpesaErrorMessage(error, "Failed to initiate STK Push");
             console.error('Error initiating STK Push:', error.response?.data || error.message);
-            socketManager.log(platformID, `PPPoE STK push error: ${error.message || "unknown error"}`, {
+            socketManager.log(platformID, `PPPoE STK push error: ${publicError}`, {
                 context: "payments",
                 level: "error",
             });
-            return res.status(500).json({
+            return res.status(error.response?.status || 500).json({
                 success: false,
                 message: "Failed to initiate STK Push",
-                error: error.message
+                error: publicError
             });
         }
     };
@@ -1786,6 +1874,13 @@ class MpesaController {
         }
 
         const platformID = auth.admin.platformID;
+        if (await this.isPlatformOperationsLocked(platformID)) {
+            return res.status(423).json({
+                success: false,
+                locked: true,
+                message: "Platform is deactivated. Activate it in Settings before making payments.",
+            });
+        }
         const bill = await this.db.getPlatformBillingByID(service);
         if (!bill) {
             return res.status(400).json({
@@ -1793,8 +1888,17 @@ class MpesaController {
                 message: "Bill does not exist!"
             });
         }
-        const payingmonths = Number(months) || 0;
-        const amount = Number(bill.amount) + (Number(bill.price * Number(payingmonths)));
+        const payingmonths = Math.max(0, Number(months) || 0);
+        const billPrice = Number(bill.price || 0);
+        const baseAmount = Number(bill.amount || 0) > 0 ? Number(bill.amount || 0) : billPrice;
+        const amount = baseAmount + (billPrice * payingmonths);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Bill amount is invalid."
+            });
+        }
+        const billingPeriods = 1 + payingmonths;
         const maskedPhone = phone?.toString().slice(-4) || "unknown";
         socketManager.log(platformID, `Bill payment request started (KES ${amount}, phone ****${maskedPhone})`, {
             context: "payments",
@@ -1840,7 +1944,7 @@ class MpesaController {
                     status: "PENDING",
                     reqcode: checkoutRequestId,
                     service: "bill",
-                    reason: null,
+                    reason: `billing-periods:${billingPeriods}`,
                     referenceID: bill.id,
                     type: "deposit"
                 };
@@ -1869,15 +1973,16 @@ class MpesaController {
                 message: "Failed to initiate STK Push"
             });
         } catch (error) {
+            const publicError = this.getMpesaErrorMessage(error, "Failed to initiate STK Push");
             console.error('Error initiating STK Push:', error.response?.data || error.message);
-            socketManager.log(platformID, `Bill STK push error: ${error.message || "unknown error"}`, {
+            socketManager.log(platformID, `Bill STK push error: ${publicError}`, {
                 context: "payments",
                 level: "error",
             });
-            return res.status(500).json({
+            return res.status(error.response?.status || 500).json({
                 success: false,
                 message: "Failed to initiate STK Push",
-                error: error.message
+                error: publicError
             });
         }
     };
@@ -3455,12 +3560,13 @@ class MpesaController {
             this.logPayment(platformID, "Failed to initiate SMS STK push", "error");
             return res.status(400).json({ success: false, message: "Failed to initiate STK Push" });
         } catch (error) {
+            const publicError = this.getMpesaErrorMessage(error, "Failed to initiate STK Push");
             console.error('Error initiating STK Push:', error.response?.data || error.message);
-            this.logPayment(platformID, `SMS STK push error: ${error.message || "unknown error"}`, "error");
-            return res.status(500).json({
+            this.logPayment(platformID, `SMS STK push error: ${publicError}`, "error");
+            return res.status(error.response?.status || 500).json({
                 success: false,
                 message: "Failed to initiate STK Push",
-                error: error.message
+                error: publicError
             });
         }
     }
@@ -3555,6 +3661,11 @@ class MpesaController {
                     pppoe = await this.db.getPPPoEByOfflinePaymentReference(platformID, ref, amount);
                     if (pppoe) matchedService = "pppoe";
                 }
+            }
+
+            if (!matchedService && !isPaybill && typeof this.db.getUniqueHotspotPackageByAmount === "function") {
+                pkg = await this.db.getUniqueHotspotPackageByAmount(platformID, amount);
+                if (pkg) matchedService = "hotspot";
             }
 
             if (matchedService === "hotspot" && pkg) {
@@ -4728,6 +4839,9 @@ class MpesaController {
         const paidTransactionCode = (payment.mpesaReceiptNumber || (!isCheckoutRequestId(payment.code) ? payment.code : "") || "").trim();
 
         if (service === "hotspot") {
+            if (await this.isPlatformOperationsLocked(platformID)) {
+                return { status: "LOCKED", message: "Platform is deactivated. Hotspot fulfillment is disabled." };
+            }
             if (!payment.reason) return null;
             if (!paidTransactionCode) {
                 return { status: "PENDING", message: "Missing completed M-Pesa receipt number." };
@@ -4757,6 +4871,9 @@ class MpesaController {
         }
 
         if (service === "pppoe") {
+            if (await this.isPlatformOperationsLocked(platformID)) {
+                return { status: "LOCKED", message: "Platform is deactivated. PPPoE fulfillment is disabled." };
+            }
             const paymentLink = payment.referenceID || payment.reason;
             if (!paymentLink) return null;
             let pppoe = await this.db.getPPPoEByPaymentLink(paymentLink);
@@ -4807,10 +4924,18 @@ class MpesaController {
             if (!billId) return null;
             const bill = await this.db.getPlatformBillingByID(billId);
             if (!bill) return null;
+            const paidAt = payment.transactionDate ? new Date(payment.transactionDate) : new Date();
+            const dueDate = this.getNextBillDueDate(bill, paidAt, this.getBillPaymentPeriods(payment));
+            const meta = bill?.meta && typeof bill.meta === "object" ? { ...bill.meta } : {};
+            delete meta.billingDueNotifiedAt;
+            delete meta.billingGraceEndsAt;
+            delete meta.billingDisabledAt;
             await this.db.updatePlatformBilling(billId, {
                 status: "Paid",
-                paidAt: new Date(),
+                paidAt,
+                dueDate,
                 amount: "0",
+                meta,
             });
             await this.db.updatePlatform(bill.platformID, {
                 status: "active"

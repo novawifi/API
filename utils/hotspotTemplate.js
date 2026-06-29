@@ -103,7 +103,7 @@ function renderOfflineBoxLoginTemplate(options = {}) {
     platform.name || platform.brandName || platform.url || config.brandName || "WIFI"
   ).toUpperCase();
   const supportPhone = String(
-    config.supportPhone || platform.supportPhone || platform.admin_phone || platform.phone || ""
+    options.supportPhone || config.supportPhone || platform.supportPhone || "0712345678"
   );
 
   let html = readTemplate();

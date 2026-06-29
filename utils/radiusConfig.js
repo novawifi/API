@@ -34,6 +34,12 @@ const getRadiusServerIp = () =>
 const getRadiusClientSecret = (fallbackSecret = "") =>
   String(process.env.RADIUS_SHARED_SECRET || fallbackSecret || "").trim();
 
+const getRadiusCatchAllCidr = () =>
+  String(process.env.RADIUS_CLIENT_CIDR || "").trim();
+
+const getRadiusCatchAllClientName = () =>
+  sanitizeToken(process.env.RADIUS_CATCH_ALL_CLIENT_NAME || "nova-any-ip");
+
 const getRadiusClientIp = (stationOrHost, fallbackIp = "") => {
   const configuredClientIp = typeof stationOrHost === "object"
     ? stationOrHost?.radiusClientIp
@@ -64,7 +70,7 @@ const buildClientBlock = ({ name, ip, secret, shortname, description }) => {
     `client ${safeName} {`,
     `    ipaddr = ${ip}`,
     `    secret = ${secret}`,
-    `    require_message_authenticator = auto`,
+    `    require_message_authenticator = true`,
   ];
   if (safeShortname) lines.push(`    shortname = ${safeShortname}`);
   if (safeDescription) lines.push(`    description = ${safeDescription}`);
@@ -173,7 +179,7 @@ const updateClientIp = async ({ name, ip }) => {
   }
 };
 
-const ensureRadiusClient = async ({
+const ensureExactRadiusClient = async ({
   name,
   ip,
   secret,
@@ -182,16 +188,7 @@ const ensureRadiusClient = async ({
   description,
 }) => {
   if (!name || !ip || !secret) {
-    return { success: false, message: "Missing RADIUS client data" };
-  }
-
-  const catchAllCidr = String(process.env.RADIUS_CLIENT_CIDR || "").trim();
-  if (catchAllCidr) {
-    return {
-      success: true,
-      message: `RADIUS clients are managed by catch-all ${catchAllCidr}`,
-      updated: false,
-    };
+    return { success: false, message: "Missing RADIUS exact client data" };
   }
 
   const readResult = await readClientsConf();
@@ -203,25 +200,95 @@ const ensureRadiusClient = async ({
 
   if (found) {
     if (found.block.trim() === block.trim()) {
-      return { success: true, message: "RADIUS client already exists", updated: false };
+      return { success: true, message: "RADIUS exact client already exists", updated: false };
     }
 
     const updatedContent = content.slice(0, found.start) + block + content.slice(found.end);
     try {
       await writeClientsConf(confPath, updatedContent);
-      return { success: true, message: "RADIUS client updated", updated: true };
+      return { success: true, message: "RADIUS exact client updated", updated: true };
     } catch (error) {
-      return { success: false, message: "Failed to update RADIUS clients.conf", error };
+      return { success: false, message: "Failed to update RADIUS exact client", error };
     }
   }
 
   const updated = `${content.trim()}\n\n${block}\n`;
   try {
     await writeClientsConf(confPath, updated);
-    return { success: true, message: "RADIUS client added" };
+    return { success: true, message: "RADIUS exact client added", updated: true };
   } catch (error) {
-    return { success: false, message: "Failed to write RADIUS clients.conf", error };
+    return { success: false, message: "Failed to write RADIUS exact client", error };
   }
+};
+
+const ensureRadiusClient = async ({
+  name,
+  ip,
+  secret,
+  shortname,
+  server,
+  description,
+}) => {
+  const catchAllCidr = getRadiusCatchAllCidr();
+  if (catchAllCidr) {
+    const catchAllSecret = getRadiusClientSecret(secret);
+    if (!catchAllSecret) {
+      return { success: false, message: "Missing RADIUS shared secret for catch-all client" };
+    }
+
+    const readResult = await readClientsConf();
+    if (!readResult.success) return readResult;
+    const { confPath, content } = readResult;
+    const catchAllName = getRadiusCatchAllClientName();
+    const block = buildClientBlock({
+      name: catchAllName,
+      ip: catchAllCidr,
+      secret: catchAllSecret,
+      shortname: catchAllName,
+      description: "Nova catch-all RADIUS client",
+    });
+    const found = findClientBlock(content, catchAllName) || findClientBlockByIp(content, catchAllCidr);
+
+    if (found) {
+      if (found.block.trim() === block.trim()) {
+        return {
+          success: true,
+          message: `RADIUS clients are managed by catch-all ${catchAllCidr}`,
+          updated: false,
+        };
+      }
+
+      const updatedContent = content.slice(0, found.start) + block + content.slice(found.end);
+      try {
+        await writeClientsConf(confPath, updatedContent);
+        return {
+          success: true,
+          message: `RADIUS catch-all client updated for ${catchAllCidr}`,
+          updated: true,
+        };
+      } catch (error) {
+        return { success: false, message: "Failed to update RADIUS catch-all client", error };
+      }
+    }
+
+    const updated = `${content.trim()}\n\n${block}\n`;
+    try {
+      await writeClientsConf(confPath, updated);
+      return {
+        success: true,
+        message: `RADIUS catch-all client added for ${catchAllCidr}`,
+        updated: true,
+      };
+    } catch (error) {
+      return { success: false, message: "Failed to write RADIUS catch-all client", error };
+    }
+  }
+
+  if (!name || !ip || !secret) {
+    return { success: false, message: "Missing RADIUS client data" };
+  }
+
+  return ensureExactRadiusClient({ name, ip, secret, shortname, server, description });
 };
 
 const removeRadiusClient = async ({ name }) => {
@@ -247,6 +314,7 @@ const removeRadiusClient = async ({ name }) => {
 };
 
 module.exports = {
+  ensureExactRadiusClient,
   ensureRadiusClient,
   getRadiusClientIp,
   getRadiusClientSecret,

@@ -569,7 +569,9 @@ class DataBase {
                     attribute: { in: ["Mikrotik-Total-Limit", "Mikrotik-Total-Limit-Gigawords"] },
                 },
             });
-            const totalLimitBytes = dataLimitBytes && Number(dataLimitBytes) > 0
+            const shouldWriteMikrotikTotalLimit =
+                String(process.env.RADIUS_WRITE_MIKROTIK_TOTAL_LIMIT || "").toLowerCase() === "true";
+            const totalLimitBytes = shouldWriteMikrotikTotalLimit && dataLimitBytes && Number(dataLimitBytes) > 0
                 ? Math.ceil(Number(dataLimitBytes))
                 : null;
             if (totalLimitBytes && Number(totalLimitBytes) > 0) {
@@ -615,6 +617,23 @@ class DataBase {
         } catch (error) {
             console.error("Error upserting RADIUS user:", error);
             throw error;
+        }
+    }
+
+    async deleteRadiusTotalLimitReplies(usernames = []) {
+        try {
+            const unique = Array.isArray(usernames)
+                ? [...new Set(usernames.map((value) => String(value || "").trim()).filter(Boolean))]
+                : [];
+            return await prisma.radreply.deleteMany({
+                where: {
+                    ...(unique.length ? { username: { in: unique } } : {}),
+                    attribute: { in: ["Mikrotik-Total-Limit", "Mikrotik-Total-Limit-Gigawords"] },
+                },
+            });
+        } catch (error) {
+            console.error("Error deleting RADIUS total limit replies:", error);
+            return { count: 0 };
         }
     }
 
@@ -909,7 +928,7 @@ class DataBase {
         if (!Array.isArray(usernames) || usernames.length === 0) return {};
         const uniqueUsernames = [...new Set(usernames.map((value) => String(value || "").trim()).filter(Boolean))];
         if (uniqueUsernames.length === 0) return {};
-        const staleSeconds = Math.max(Number(process.env.RADIUS_ONLINE_STALE_SECONDS || 600), 60);
+        const staleSeconds = Math.max(Number(process.env.RADIUS_ONLINE_STALE_SECONDS || 180), 60);
         const onlineSince = new Date(Date.now() - staleSeconds * 1000);
         const requireRecentActivity = options?.requireRecentActivity !== false;
 
@@ -1999,6 +2018,27 @@ class DataBase {
         } catch (error) {
             console.error("Error getting packages:", error);
             throw error;
+        }
+    }
+
+    async getUniqueHotspotPackageByAmount(platformID, amount) {
+        if (!platformID || amount === null || amount === undefined || amount === "") return null;
+        const amountVariants = this.getAmountVariants(amount);
+        if (amountVariants.length === 0) return null;
+        try {
+            const packages = await prisma.package.findMany({
+                where: {
+                    platformID,
+                    price: { in: amountVariants },
+                    status: { not: "deleted" },
+                },
+                orderBy: { createdAt: "asc" },
+                take: 2,
+            });
+            return packages.length === 1 ? packages[0] : null;
+        } catch (error) {
+            console.error("Error getting unique package by amount:", error);
+            return null;
         }
     }
 
@@ -4365,7 +4405,7 @@ class DataBase {
     async getDashboardStatsBundle(platformID) {
         if (!platformID) return null;
         try {
-            const now = new Date(this.timestamp);
+            const now = new Date();
             const startOfToday = new Date(now);
             startOfToday.setHours(0, 0, 0, 0);
             const endOfToday = new Date(now);
@@ -4488,7 +4528,7 @@ class DataBase {
             const dailyRevenue = sumAmounts(dailyPayments);
             const yesterdayRevenue = sumAmounts(yesterdayPayments);
             const lastMonthRevenue = sumAmounts(lastMonthPayments);
-            const thisMonthRevenue = sumAmounts(thisMonthPayments);
+            const thisMonthRevenue = Math.max(sumAmounts(thisMonthPayments), dailyRevenue);
 
             const months = [];
             for (let i = 2; i <= 6; i += 1) {
@@ -4902,7 +4942,7 @@ class DataBase {
                 .flatMap((account) => [account.id, account.paymentLink])
                 .filter(Boolean);
 
-            const now = new Date(this.timestamp);
+            const now = new Date();
             const startOfToday = new Date(now);
             startOfToday.setHours(0, 0, 0, 0);
             const endOfToday = new Date(now);
@@ -5019,7 +5059,7 @@ class DataBase {
             const dailyRevenue = sumAmounts(dailyPayments);
             const yesterdayRevenue = sumAmounts(yesterdayPayments);
             const lastMonthRevenue = sumAmounts(lastMonthPayments);
-            const thisMonthRevenue = sumAmounts(thisMonthPayments);
+            const thisMonthRevenue = Math.max(sumAmounts(thisMonthPayments), dailyRevenue);
 
             const months = [];
             for (let i = 2; i <= 6; i += 1) {
@@ -5610,7 +5650,7 @@ class DataBase {
     async getPlatformNotifications(platformID, includeDismissed = false) {
         if (!platformID) return [];
         try {
-            return prisma.platformNotification.findMany({
+            const notifications = await prisma.platformNotification.findMany({
                 where: {
                     platformID,
                     ...(includeDismissed ? {} : { dismissedAt: null }),
@@ -5620,6 +5660,13 @@ class DataBase {
                     ],
                 },
                 orderBy: { createdAt: "desc" },
+            });
+            const seen = new Set();
+            return notifications.filter((notification) => {
+                const key = `${notification.title || ""}::${notification.actionUrl || ""}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
             });
         } catch (error) {
             console.error("Error getting platform notifications:", error);
@@ -5640,26 +5687,43 @@ class DataBase {
     async upsertPlatformNotification(platformID, title, data) {
         if (!platformID || !title || !data?.message) return null;
         try {
+            const where = {
+                platformID,
+                title,
+                ...(data.actionUrl !== undefined ? { actionUrl: data.actionUrl } : {}),
+            };
             const existing = await prisma.platformNotification.findFirst({
-                where: { platformID, title, dismissedAt: null },
+                where,
                 orderBy: { createdAt: "desc" },
             });
+            let notification;
             if (existing) {
-                return prisma.platformNotification.update({
+                notification = await prisma.platformNotification.update({
                     where: { id: existing.id },
                     data: {
                         ...data,
                         dismissedAt: null,
                     },
                 });
+            } else {
+                notification = await prisma.platformNotification.create({
+                    data: {
+                        ...data,
+                        platformID,
+                        title,
+                    },
+                });
             }
-            return prisma.platformNotification.create({
-                data: {
-                    ...data,
-                    platformID,
-                    title,
+
+            await prisma.platformNotification.updateMany({
+                where: {
+                    ...where,
+                    id: { not: notification.id },
+                    dismissedAt: null,
                 },
+                data: { dismissedAt: new Date() },
             });
+            return notification;
         } catch (error) {
             console.error("Error upserting platform notification:", error);
             throw error;
@@ -5675,6 +5739,24 @@ class DataBase {
             });
         } catch (error) {
             console.error("Error dismissing platform notification:", error);
+            throw error;
+        }
+    }
+
+    async dismissPlatformNotificationsByTitle(platformID, titles = [], actionUrl = undefined) {
+        if (!platformID || !Array.isArray(titles) || titles.length === 0) return null;
+        try {
+            return prisma.platformNotification.updateMany({
+                where: {
+                    platformID,
+                    title: { in: titles },
+                    dismissedAt: null,
+                    ...(actionUrl !== undefined ? { actionUrl } : {}),
+                },
+                data: { dismissedAt: new Date() },
+            });
+        } catch (error) {
+            console.error("Error dismissing platform notifications by title:", error);
             throw error;
         }
     }

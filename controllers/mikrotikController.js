@@ -435,6 +435,12 @@ class Mikrotikcontroller {
         const platform = await this.db.getPlatform(platformID);
         const config = await this.db.getPlatformConfig(platformID);
         const host = String(stationHost || config?.mikrotikHost || "").trim();
+        const stationRecord = host && typeof this.db.getStationByHost === "function"
+            ? await this.db.getStationByHost(platformID, host).catch(() => null)
+            : null;
+        const stationSupportPhone = String(stationRecord?.supportPhone || "").trim();
+        const platformSupportPhone = String(config?.supportPhone || platform?.supportPhone || "").trim();
+        const supportPhone = stationSupportPhone || platformSupportPhone || "0712345678";
         let packages = [];
         if (host) {
             packages = await this.db.getPackagesByHost(platformID, host);
@@ -448,6 +454,7 @@ class Mikrotikcontroller {
             platformID,
             host,
             hash: getHotspotHash(host),
+            supportPhone,
         });
     }
 
@@ -4256,7 +4263,7 @@ function autoLogin() {
             const isRadius = stationRecord?.systemBasis === "RADIUS";
             if (isRadius) {
                 const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
-                const radiusSecret = stationRecord?.radiusClientSecret;
+                const radiusSecret = getRadiusClientSecret(stationRecord?.radiusClientSecret);
                 if (!radiusServerIp || !radiusSecret) {
                     return res.status(400).json({
                         success: false,
@@ -4359,7 +4366,7 @@ function autoLogin() {
                 }
                 if (isRadius) {
                     const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
-                    const radiusSecret = stationRecord?.radiusClientSecret;
+                    const radiusSecret = getRadiusClientSecret(stationRecord?.radiusClientSecret);
                     if (radiusServerIp && radiusSecret) {
                         const radiusEntries = await channel.write("/radius/print", []);
                         const matchingRadius = Array.isArray(radiusEntries)
@@ -4540,7 +4547,7 @@ function autoLogin() {
                 if (!matchedServer) return res.json({ autoconfigured: false, message: "PPPoE Server configuration mismatch" });
                 if (isRadius) {
                     const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
-                    const radiusSecret = stationRecord?.radiusClientSecret;
+                    const radiusSecret = getRadiusClientSecret(stationRecord?.radiusClientSecret);
                     if (!radiusServerIp || !radiusSecret) {
                         return res.json({ autoconfigured: false, message: "Missing RADIUS credentials for this station." });
                     }
@@ -4786,7 +4793,8 @@ function autoLogin() {
                     }
                 }
 
-                if (isRadius && stationRecord?.radiusClientSecret) {
+                const radiusSecret = getRadiusClientSecret(stationRecord?.radiusClientSecret);
+                if (isRadius && radiusSecret) {
                     const radiusServerIp = stationRecord.radiusServerIp || getRadiusServerIp();
                     if (radiusServerIp) {
                         const radiusEntries = await channel.write("/radius/print", []);
@@ -4806,7 +4814,7 @@ function autoLogin() {
                         if (hasRadius?.[".id"]) {
                             await channel.write("/radius/set", [
                                 `=.id=${hasRadius[".id"]}`,
-                                `=secret=${stationRecord.radiusClientSecret}`,
+                                `=secret=${radiusSecret}`,
                                 `=service=hotspot`,
                                 `=timeout=3s`,
                                 `=require-message-auth=no`,
@@ -4814,7 +4822,7 @@ function autoLogin() {
                         } else {
                             await channel.write("/radius/add", [
                                 `=address=${radiusServerIp}`,
-                                `=secret=${stationRecord.radiusClientSecret}`,
+                                `=secret=${radiusSecret}`,
                                 `=service=hotspot`,
                                 `=timeout=3s`,
                                 `=require-message-auth=no`,
@@ -4896,7 +4904,7 @@ function autoLogin() {
                 }
 
                 const radiusServerIp = stationRecord?.radiusServerIp || getRadiusServerIp();
-                const radiusSecret = stationRecord?.radiusClientSecret;
+                const radiusSecret = getRadiusClientSecret(stationRecord?.radiusClientSecret);
                 if (!radiusServerIp || !radiusSecret) {
                     warnings.push("Missing RADIUS credentials for this station.");
                 }
@@ -5919,7 +5927,12 @@ function autoLogin() {
             const sharedRadiusStation = systemBasis === "RADIUS"
                 ? await this.findRadiusStationSharingClientIp(radiusClientIp, existing?.id || "")
                 : null;
-            const radiusClientSecret = sharedRadiusStation?.radiusClientSecret || session.radiusClientSecret || existing?.radiusClientSecret || null;
+            const radiusClientSecret = getRadiusClientSecret(
+                sharedRadiusStation?.radiusClientSecret ||
+                session.radiusClientSecret ||
+                existing?.radiusClientSecret ||
+                ""
+            ) || null;
             if (systemBasis === "RADIUS" && radiusClientSecret) {
                 session.radiusClientSecret = radiusClientSecret;
             }
@@ -6078,8 +6091,14 @@ function autoLogin() {
     async fetchActiveHotspotConnections(platformID) {
         try {
             const stations = await this.db.getStations(platformID);
+            const dbActiveUsers = await this.db.getActivePlatformUsers(platformID);
             let totalActive = 0;
             for (const station of stations) {
+                const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+                if (isRadius) {
+                    totalActive += await this.countRadiusHotspotActiveUsers(platformID, station, dbActiveUsers);
+                    continue;
+                }
                 const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
                 if (!connection?.channel) continue;
                 const { channel } = connection;
@@ -6096,8 +6115,46 @@ function autoLogin() {
         }
     }
 
+    getActiveHotspotUsername(row = {}) {
+        return String(row?.user || row?.name || row?.username || "").trim();
+    }
+
+    async countRadiusHotspotActiveUsers(platformID, station, dbActiveUsers = null) {
+        const host = station?.mikrotikHost;
+        if (!platformID || !host) return 0;
+
+        const users = Array.isArray(dbActiveUsers)
+            ? dbActiveUsers
+            : await this.db.getActivePlatformUsers(platformID);
+        const routerHosts = typeof this.db.resolveStationRouterHosts === "function"
+            ? await this.db.resolveStationRouterHosts(platformID, host)
+            : [host];
+        const routerHostSet = new Set(routerHosts);
+        const usernames = Array.from(new Set((users || [])
+            .filter((user) => routerHostSet.has(user?.package?.routerHost))
+            .map((user) => String(user?.username || "").trim())
+            .filter(Boolean)));
+
+        const [usage, routerStatus] = await Promise.all([
+            this.db.getRadiusUsageDetailsByUsernames(usernames),
+            this.checkHotspotUserStatus(platformID, host).catch(() => null),
+        ]);
+        const online = new Set();
+        for (const username of usernames) {
+            if (usage?.[username]?.online) online.add(username);
+        }
+        if (routerStatus?.success) {
+            for (const user of routerStatus.users || []) {
+                const username = this.getActiveHotspotUsername(user);
+                if (username && usernames.includes(username)) online.add(username);
+            }
+        }
+        return online.size;
+    }
+
     async fetchActiveConnectionsPerStation(platformID) {
         const stations = await this.db.getStations(platformID);
+        const dbActiveUsers = await this.db.getActivePlatformUsers(platformID);
         const perStation = {};
         let totalHotspot = 0;
         let totalPPPoE = 0;
@@ -6109,22 +6166,29 @@ function autoLogin() {
             let hotspotCount = 0;
             let pppoeCount = 0;
             try {
+                const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+                if (isRadius) {
+                    hotspotCount = await this.countRadiusHotspotActiveUsers(platformID, station, dbActiveUsers);
+                }
                 const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
                 if (!connection?.channel) {
-                    perStation[stationId] = { hotspot: 0, pppoe: 0 };
+                    perStation[stationId] = { hotspot: hotspotCount, pppoe: 0 };
+                    totalHotspot += hotspotCount;
                     continue;
                 }
                 const { channel } = connection;
                 try {
-                    const hotspotActive = await this.mikrotik.listHotspotActiveUsers(channel);
+                    const hotspotActive = isRadius ? null : await this.mikrotik.listHotspotActiveUsers(channel);
                     const pppActive = await this.mikrotik.listPPPActiveUsers(channel);
-                    hotspotCount = (hotspotActive && hotspotActive.length) ? hotspotActive.length : 0;
+                    if (!isRadius) {
+                        hotspotCount = (hotspotActive && hotspotActive.length) ? hotspotActive.length : 0;
+                    }
                     pppoeCount = (pppActive && pppActive.length) ? pppActive.length : 0;
                 } finally {
                     await this.safeCloseChannel(channel);
                 }
             } catch (error) {
-                hotspotCount = 0;
+                hotspotCount = hotspotCount || 0;
                 pppoeCount = 0;
             }
 
@@ -6144,15 +6208,21 @@ function autoLogin() {
         const station = await this.db.getStation(stationId);
         if (!station || station.platformID !== platformID) return { hotspot: 0, pppoe: 0 };
 
+        const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+        let radiusHotspotCount = 0;
+        if (isRadius) {
+            radiusHotspotCount = await this.countRadiusHotspotActiveUsers(platformID, station);
+        }
+
         const connection = await this.config.createSingleMikrotikClient(platformID, station.mikrotikHost);
-        if (!connection?.channel) return { hotspot: 0, pppoe: 0 };
+        if (!connection?.channel) return { hotspot: radiusHotspotCount, pppoe: 0 };
 
         const { channel } = connection;
         try {
-            const hotspotActive = await this.mikrotik.listHotspotActiveUsers(channel);
+            const hotspotActive = isRadius ? null : await this.mikrotik.listHotspotActiveUsers(channel);
             const pppActive = await this.mikrotik.listPPPActiveUsers(channel);
             return {
-                hotspot: (hotspotActive && hotspotActive.length) ? hotspotActive.length : 0,
+                hotspot: isRadius ? radiusHotspotCount : ((hotspotActive && hotspotActive.length) ? hotspotActive.length : 0),
                 pppoe: (pppActive && pppActive.length) ? pppActive.length : 0,
             };
         } finally {
@@ -6447,12 +6517,14 @@ function autoLogin() {
 
     getAutoBackupUploadScriptSource({ ftpTargetBase, notifyUrl, token, platformID, host }) {
         const safeFtpTargetBase = String(ftpTargetBase || "").trim();
+        const safeSftpTargetBase = safeFtpTargetBase.replace(/^ftp:\/\//i, "sftp://");
         const safeNotifyUrl = String(notifyUrl || "").trim();
         const safeToken = this.sanitizeBackupPathPart(token);
         const safePlatformID = this.sanitizeBackupPathPart(platformID);
         const safeHost = this.sanitizeBackupPathPart(host);
 
         return `:local ftpTargetBase "${safeFtpTargetBase}"
+:local sftpTargetBase "${safeSftpTargetBase}"
 :local notifyUrl "${safeNotifyUrl}"
 :local token "${safeToken}"
 :local platformID "${safePlatformID}"
@@ -6510,8 +6582,9 @@ function autoLogin() {
 }
 
 :if ($uploaded = false) do={
+    :local targetSftp ($sftpTargetBase . "/" . $host . "/" . $fileName)
     :do {
-        /tool fetch url=$targetFtp mode=sftp upload=yes src-path=$fileName keep-result=no
+        /tool fetch url=$targetSftp mode=sftp upload=yes src-path=$fileName keep-result=no
         :set uploaded true
     } on-error={
         :set uploaded false

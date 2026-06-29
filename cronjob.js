@@ -19,7 +19,7 @@ const { MpesaController } = require("./controllers/mpesaController");
 const { Mikrotikcontroller } = require("./controllers/mikrotikController");
 const { Utils } = require("./utils/Functions");
 const { socketManager } = require("./controllers/socketController");
-const { ensureRadiusClient, getRadiusClientIp, isWireGuardMikrotikIp, updateClientIp } = require("./utils/radiusConfig");
+const { ensureExactRadiusClient, getRadiusClientIp, getRadiusClientSecret, isWireGuardMikrotikIp } = require("./utils/radiusConfig");
 const { WebdockService } = require("./services/webdockService");
 
 class CronJob {
@@ -997,6 +997,39 @@ Price: KSH ${service.price}</p>
         return Math.round(amount * factor);
     }
 
+    getPeriodStartFromExpiry(expiresAt, period) {
+        const end = expiresAt ? new Date(expiresAt) : null;
+        if (!end || Number.isNaN(end.getTime())) return null;
+        const match = String(period || "").trim().toLowerCase().match(/^(\d+)\s*(minute|min|hour|hr|day|month|year)s?$/i);
+        if (!match) return null;
+        const value = Number(match[1]);
+        if (!Number.isFinite(value) || value <= 0) return null;
+        const unit = match[2].toLowerCase();
+        const start = new Date(end);
+        switch (unit) {
+            case "min":
+            case "minute":
+                start.setMinutes(start.getMinutes() - value);
+                break;
+            case "hr":
+            case "hour":
+                start.setHours(start.getHours() - value);
+                break;
+            case "day":
+                start.setDate(start.getDate() - value);
+                break;
+            case "month":
+                start.setMonth(start.getMonth() - value);
+                break;
+            case "year":
+                start.setFullYear(start.getFullYear() - value);
+                break;
+            default:
+                return null;
+        }
+        return start;
+    }
+
     async expireRadiusPPPoEFupForPlatform(platform) {
         const platformID = platform.platformID;
         const [stations, pppoeAccounts, plans] = await Promise.all([
@@ -1026,7 +1059,11 @@ Price: KSH ${service.price}</p>
             const limitBytes = this.parseDataLimitBytes(account.fupLimit) || this.parseDataLimitBytes(plan?.fupLimit);
             if (limitBytes <= 0) continue;
 
-            const cycleStartedAt = account.updatedAt || account.createdAt || null;
+            const cycleStartedAt =
+                this.getPeriodStartFromExpiry(account.expiresAt, account.period || plan?.period) ||
+                account.updatedAt ||
+                account.createdAt ||
+                null;
             const usedBytes = await this.db.getRadiusUsageByUsernameSince(account.clientname, cycleStartedAt);
             if (Number(usedBytes) < limitBytes) continue;
 
@@ -1302,6 +1339,38 @@ Price: KSH ${service.price}</p>
         }
     }
 
+    normalizePlatformPlan(plan) {
+        const normalized = String(plan || "basic").trim().toLowerCase();
+        if (normalized === "stater") return "starter";
+        if (["basic", "starter", "professional"].includes(normalized)) return normalized;
+        return "basic";
+    }
+
+    isTrialLimitedPlan(plan) {
+        return ["basic", "starter"].includes(this.normalizePlatformPlan(plan));
+    }
+
+    getAccountPlan(plan) {
+        const plans = {
+            basic: { id: "basic", price: 500 },
+            starter: { id: "starter", price: 999 },
+            professional: { id: "professional", price: 2499 },
+        };
+        return plans[this.normalizePlatformPlan(plan)] || plans.basic;
+    }
+
+    isPlatformBillingPaused(platform) {
+        const status = String(platform?.status || "").trim().toLowerCase();
+        return status === "deactivated" || status === "paused";
+    }
+
+    toValidDate(value) {
+        if (!value) return null;
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return null;
+        return parsed;
+    }
+
     async manageBillingForPlatform(platform) {
         const platformID = platform.platformID;
         const now = new Date();
@@ -1311,20 +1380,51 @@ Price: KSH ${service.price}</p>
         if (!service) return;
 
         let billing = await this.db.getPlatformBillingByName(service.name, platformID);
+        const plan = this.getAccountPlan(platform.subscriptionPlan);
+
+        if (this.isPlatformBillingPaused(platform)) {
+            const meta = billing?.meta && typeof billing.meta === "object" ? billing.meta : {};
+            const pausedBill = {
+                period: service.period,
+                platformID,
+                name: service.name,
+                price: String(plan.price || service.price || "500"),
+                currency: service.currency || "KES",
+                status: "Paused",
+                description: service.description,
+                meta: {
+                    ...meta,
+                    serviceKey,
+                    plan: plan.id,
+                    billingPaused: true,
+                    billingPausedAt: meta.billingPausedAt || now.toISOString(),
+                },
+            };
+            if (billing) {
+                await this.db.updatePlatformBilling(billing.id, pausedBill);
+            } else {
+                await this.db.createPlatformBilling({
+                    ...pausedBill,
+                    amount: "0",
+                    dueDate: null,
+                });
+            }
+            return;
+        }
 
         if (String(platform.status || "").toLowerCase() === "premium") {
             const premiumBill = {
                 period: service.period,
                 platformID,
                 name: service.name,
-                price: String(service.price || "500"),
+                price: String(plan.price || service.price || "500"),
                 amount: "0",
                 currency: service.currency || "KES",
                 dueDate: null,
                 paidAt: billing?.paidAt || now,
                 status: "Paid",
                 description: service.description,
-                meta: { serviceKey, plan: "basic", premium: true },
+                meta: { serviceKey, plan: plan.id, premium: true },
             };
             if (billing) {
                 await this.db.updatePlatformBilling(billing.id, premiumBill);
@@ -1345,32 +1445,85 @@ Price: KSH ${service.price}</p>
         };
         const periodSpec = parsePeriod(billing?.period || service.period) || { value: 1, unit: "month" };
         const addServicePeriod = (dateValue) => Utils.addPeriod(dateValue, periodSpec.value, periodSpec.unit);
+        const trialEndsAt = this.toValidDate(platform.trialEndsAt);
+        const trialActive = this.isTrialLimitedPlan(plan.id) && trialEndsAt && trialEndsAt > now;
 
         if (!billing) {
             const createdAt = new Date(platform.createdAt);
-
-            const dueDate = addServicePeriod(createdAt);
+            const dueDate = trialActive ? trialEndsAt : addServicePeriod(createdAt);
 
             billing = await this.db.createPlatformBilling({
                 period: service.period,
                 platformID,
                 name: service.name,
-                price: service.price,
-                amount: String(service.price),
+                price: String(plan.price || service.price || "500"),
+                amount: String(plan.price || service.price || "500"),
                 currency: "KES",
                 dueDate,
                 status: "Unpaid",
-                description: service.description
+                description: service.description,
+                meta: { serviceKey, plan: plan.id },
             });
         }
 
-        const toValidDate = (value) => {
-            const parsed = new Date(value);
-            if (Number.isNaN(parsed.getTime())) return null;
-            return parsed;
-        };
+        if (trialActive) {
+            const meta = billing?.meta && typeof billing.meta === "object" ? billing.meta : {};
+            const trialBillUpdate = {
+                price: String(plan.price || billing.price || service.price || "500"),
+                period: service.period,
+                currency: service.currency || billing.currency || "KES",
+                description: service.description,
+                meta: {
+                    ...meta,
+                    serviceKey,
+                    plan: plan.id,
+                    trialProtected: true,
+                    trialProtectedUntil: trialEndsAt.toISOString(),
+                },
+            };
+            if (String(billing.status || "").toLowerCase() !== "paid") {
+                trialBillUpdate.amount = "0";
+                trialBillUpdate.status = "Upcoming";
+                trialBillUpdate.dueDate = trialEndsAt;
+            }
+            await this.db.updatePlatformBilling(billing.id, trialBillUpdate);
+            if (String(platform.status || "").toLowerCase() === "inactive") {
+                await this.db.updatePlatform(platformID, { status: "active" });
+                platform.status = "active";
+            }
+            return;
+        }
 
-        let baseDate = toValidDate(billing.paidAt) || toValidDate(platform.createdAt);
+        const addPeriods = (dateValue, count = 1) => {
+            let nextDate = new Date(dateValue);
+            const cycles = Math.max(1, Number(count) || 1);
+            for (let i = 0; i < cycles; i += 1) {
+                nextDate = addServicePeriod(nextDate);
+            }
+            return nextDate;
+        };
+        const getRenewalBaseDate = (bill, paidAt) => {
+            const paidDate = this.toValidDate(paidAt);
+            if (!paidDate) return null;
+            const currentDueDate = this.toValidDate(bill?.dueDate);
+            if (currentDueDate && currentDueDate > paidDate) return currentDueDate;
+            return paidDate;
+        };
+        const getPaidPeriods = (payment) => {
+            const match = String(payment?.reason || "").match(/billing-periods:(\d+)/i);
+            if (!match) return 1;
+            const periods = Number(match[1]);
+            return Number.isFinite(periods) && periods > 0 ? Math.floor(periods) : 1;
+        };
+        const countDueCycles = (dueDate) => {
+            let cursor = new Date(dueDate);
+            let cycles = 0;
+            while (now >= cursor && cycles < 120) {
+                cycles += 1;
+                cursor = addServicePeriod(cursor);
+            }
+            return { cycles, nextDueDate: cursor };
+        };
 
         // If a bill payment was made, mark as paid and re-enable the platform if needed.
         // Prefer payments referencing this exact bill. Fallback: match known bill amounts (485/500) for legacy records without referenceID.
@@ -1379,70 +1532,126 @@ Price: KSH ${service.price}</p>
             ? null
             : await this.db.getPlatformLastBillPaymentByAmounts(platformID, [485, 500]);
         const prevPayment = referencedPayment || legacyAmountPayment;
-        const mpesaPaidAt = toValidDate(prevPayment?.createdAt);
+        const mpesaPaidAt = this.toValidDate(prevPayment?.createdAt);
         if (mpesaPaidAt) {
-            const billingPaidAt = toValidDate(billing.paidAt);
+            const billingPaidAt = this.toValidDate(billing.paidAt);
             const paidAtChanged = !billingPaidAt || mpesaPaidAt > billingPaidAt;
             if (paidAtChanged) {
-                const nextDueDate = addServicePeriod(new Date(mpesaPaidAt));
+                const nextDueDate = addPeriods(getRenewalBaseDate(billing, mpesaPaidAt), getPaidPeriods(prevPayment));
+                const meta = billing?.meta && typeof billing.meta === "object" ? { ...billing.meta } : {};
+                delete meta.billingDueNotifiedAt;
+                delete meta.billingGraceEndsAt;
+                delete meta.billingDisabledAt;
                 await this.db.updatePlatformBilling(billing.id, {
                     status: "Paid",
                     amount: "0",
                     paidAt: mpesaPaidAt,
                     dueDate: nextDueDate,
+                    meta,
                 });
                 billing.status = "Paid";
                 billing.amount = "0";
                 billing.paidAt = mpesaPaidAt;
                 billing.dueDate = nextDueDate;
+                billing.meta = meta;
             }
 
             if (String(platform.status || "").toLowerCase() === "inactive") {
                 await this.db.updatePlatform(platformID, { status: "active" });
                 platform.status = "active";
             }
-
-            if (!baseDate || mpesaPaidAt > baseDate) baseDate = mpesaPaidAt;
         }
 
-        if (!baseDate) return;
-
-        const firstDueDate = addServicePeriod(baseDate);
-        const disableOn = new Date(firstDueDate);
-        disableOn.setDate(disableOn.getDate() + 3);
-
-        // Keep a dueDate on the bill, but never use a "pushed-ahead" dueDate to decide disabling.
-        let effectiveDueDate = billing.dueDate ? new Date(billing.dueDate) : firstDueDate;
-        if (Number.isNaN(effectiveDueDate.getTime()) || effectiveDueDate <= baseDate) {
-            effectiveDueDate = firstDueDate;
-        }
-        if (!billing.dueDate || new Date(billing.dueDate).getTime() !== effectiveDueDate.getTime()) {
+        let effectiveDueDate = this.toValidDate(billing.dueDate);
+        if (!effectiveDueDate) {
+            const baseDate = this.toValidDate(billing.paidAt) || this.toValidDate(platform.createdAt) || now;
+            effectiveDueDate = addPeriods(baseDate, 1);
             await this.db.updatePlatformBilling(billing.id, { dueDate: effectiveDueDate });
+            billing.dueDate = effectiveDueDate;
         }
 
-        // If overdue, accrue per missed billing cycle(s) using the real service period.
-        if (now >= effectiveDueDate) {
-            const price = Number(billing.price || service.price || 0);
-            let amount = Number(billing.amount || 0);
-            let nextDue = addServicePeriod(new Date(effectiveDueDate));
-            let cycles = 0;
-            while (now >= nextDue && cycles < 120) {
-                amount += price;
-                nextDue = addServicePeriod(nextDue);
-                cycles += 1;
+        const price = Number(plan.price || billing.price || service.price || 0);
+        const dueState = countDueCycles(effectiveDueDate);
+        const meta = billing?.meta && typeof billing.meta === "object" ? { ...billing.meta } : {};
+
+        if (dueState.cycles === 0) {
+            const upcomingUpdate = {
+                price: String(price || billing.price || service.price || "500"),
+                period: service.period,
+                currency: service.currency || billing.currency || "KES",
+                description: service.description,
+                status: "Upcoming",
+                amount: "0",
+                meta: {
+                    ...meta,
+                    serviceKey,
+                    plan: plan.id,
+                },
+            };
+            delete upcomingUpdate.meta.billingDueNotifiedAt;
+            delete upcomingUpdate.meta.billingGraceEndsAt;
+            delete upcomingUpdate.meta.billingDisabledAt;
+            if (
+                String(billing.status || "").toLowerCase() !== "upcoming" ||
+                Number(billing.amount || 0) !== 0
+            ) {
+                await this.db.updatePlatformBilling(billing.id, upcomingUpdate);
             }
-            await this.db.updatePlatformBilling(billing.id, {
-                amount: String(amount),
-                status: "Unpaid",
-                dueDate: nextDue,
+            if (String(platform.status || "").toLowerCase() === "inactive") {
+                await this.db.updatePlatform(platformID, { status: "active" });
+                platform.status = "active";
+            }
+            return;
+        }
+
+        const amountDue = price * dueState.cycles;
+        const graceEndsAt = new Date(effectiveDueDate);
+        graceEndsAt.setDate(graceEndsAt.getDate() + 3);
+        const dueMeta = {
+            ...meta,
+            serviceKey,
+            plan: plan.id,
+            billingDueNotifiedAt: meta.billingDueNotifiedAt || now.toISOString(),
+            billingGraceEndsAt: graceEndsAt.toISOString(),
+        };
+        await this.db.updatePlatformBilling(billing.id, {
+            amount: String(amountDue),
+            status: "Unpaid",
+            dueDate: effectiveDueDate,
+            price: String(price || billing.price || service.price || "500"),
+            period: service.period,
+            currency: service.currency || billing.currency || "KES",
+            description: service.description,
+            meta: dueMeta,
+        });
+
+        await this.db.upsertPlatformNotification(platformID, "Billing payment due", {
+            message: `Your ${plan.name || plan.id} plan bill is due. Amount due: KES ${amountDue}. Pay by ${graceEndsAt.toLocaleDateString()} to keep your platform active.`,
+            status: "warning",
+            actionLabel: "Pay Bill",
+            actionUrl: "/admin/bills",
+        });
+
+        // Disable after 3 days past the first unpaid due date.
+        if (now >= graceEndsAt) {
+            if (String(platform.status || "").toLowerCase() !== "inactive") {
+                await this.db.updatePlatform(platformID, { status: "inactive" });
+                platform.status = "inactive";
+            }
+            if (!dueMeta.billingDisabledAt) {
+                await this.db.updatePlatformBilling(billing.id, {
+                    meta: {
+                        ...dueMeta,
+                        billingDisabledAt: now.toISOString(),
+                    },
+                });
+            }
+            await this.db.upsertPlatformNotification(platformID, "Platform disabled: payment required", {
+                message: `Your ${plan.name || plan.id} plan bill is unpaid after the 3 day grace period. Pay KES ${amountDue} to reactivate your platform.`,
+                status: "error",
+                actionLabel: "Pay Now",
+                actionUrl: "/admin/bills",
             });
-        }
-
-        // Disable after 3 days past due since last payment (or platform creation if never paid).
-        if (now >= disableOn) {
-            if (platform.status !== "Inactive") {
-                await this.db.updatePlatform(platformID, { status: "Inactive" });
-            }
         }
     }
 
@@ -1592,6 +1801,7 @@ Price: KSH ${service.price}</p>
 
     async retryPaystackCardBillingForPlatform(platform) {
         const platformID = platform.platformID;
+        if (this.isPlatformBillingPaused(platform)) return;
         if (!this.getPaystackSecretKey()) return;
 
         const bills = await this.db.getUnpaidPlatformBilling(platformID);
@@ -1687,6 +1897,7 @@ Price: KSH ${service.price}</p>
 
     async managePluginBillsForPlatform(platform) {
         const platformID = platform.platformID;
+        if (this.isPlatformBillingPaused(platform)) return;
         const bills = await this.db.getPlatformBilling(platformID);
         if (!bills || bills.length === 0) return;
 
@@ -2211,46 +2422,61 @@ Price: KSH ${service.price}</p>
         for (const station of stations) {
             try {
                 if (station.systemBasis !== "RADIUS") continue;
-                const internalClientIp = getRadiusClientIp(station, station.radiusClientIp || "");
-                if (isWireGuardMikrotikIp(internalClientIp)) {
-                    if (station.radiusClientIp !== internalClientIp) {
-                        const updateResult = await updateClientIp({
-                            name: station.radiusClientName,
-                            ip: internalClientIp,
-                        });
-                        if (updateResult?.updated) {
-                            await this.db.updateStation(station.id, { radiusClientIp: internalClientIp });
-                        }
+                const configuredClientIp = getRadiusClientIp(station, station.radiusClientIp || "");
+                const legacySecret = String(station.radiusClientSecret || "").trim();
+                const exactSecret = legacySecret || getRadiusClientSecret("");
+                const syncExactClient = async (ip) => {
+                    if (!station.radiusClientName || !ip || !exactSecret) return null;
+                    return ensureExactRadiusClient({
+                        name: station.radiusClientName,
+                        ip,
+                        secret: exactSecret,
+                        shortname: station.name || station.mikrotikHost,
+                        server: station.radiusServerIp || "",
+                        description: `Nova legacy RADIUS client for ${station.name || station.mikrotikHost}`,
+                    });
+                };
+
+                if (isWireGuardMikrotikIp(configuredClientIp)) {
+                    const updateResult = await syncExactClient(configuredClientIp);
+                    if (updateResult?.updated && station.radiusClientIp !== configuredClientIp) {
+                        await this.db.updateStation(station.id, { radiusClientIp: configuredClientIp });
                     }
                     continue;
                 }
+
                 const publicHost = station.mikrotikPublicHost || station.mikrotikDDNS || "";
-                if (!publicHost) continue;
-                if (Utils.isValidIP && Utils.isValidIP(publicHost)) continue;
                 if (!station.radiusClientName) continue;
 
-                const resolved = await dns.resolve4(publicHost);
-                const publicIp = Array.isArray(resolved) && resolved.length > 0 ? resolved[0] : null;
+                let publicIp = "";
+                if (publicHost) {
+                    if (Utils.isValidIP && Utils.isValidIP(publicHost)) {
+                        publicIp = publicHost;
+                    } else {
+                        const resolved = await dns.resolve4(publicHost);
+                        publicIp = Array.isArray(resolved) && resolved.length > 0 ? resolved[0] : "";
+                    }
+                }
+                if (!publicIp && configuredClientIp && Utils.isValidIP && Utils.isValidIP(configuredClientIp)) {
+                    publicIp = configuredClientIp;
+                }
                 if (!publicIp) continue;
 
                 const sharedRadiusStation = await this.findRadiusStationSharingClientIp(publicIp, station.id);
-                const radiusSecret = sharedRadiusStation?.radiusClientSecret || station.radiusClientSecret;
+                const radiusSecret = String(sharedRadiusStation?.radiusClientSecret || exactSecret || "").trim();
                 let updateResult;
                 if (sharedRadiusStation?.radiusClientSecret && sharedRadiusStation.radiusClientSecret !== station.radiusClientSecret) {
-                    updateResult = await ensureRadiusClient({
+                    updateResult = await ensureExactRadiusClient({
                         name: station.radiusClientName,
                         ip: publicIp,
-                        secret: sharedRadiusStation.radiusClientSecret,
+                        secret: radiusSecret,
                         shortname: station.name || station.mikrotikHost,
                         server: station.radiusServerIp || "",
                         description: `Nova RADIUS client for ${station.name || station.mikrotikHost}`,
                     });
                     updateResult.updated = Boolean(updateResult?.success);
                 } else {
-                    updateResult = await updateClientIp({
-                        name: station.radiusClientName,
-                        ip: publicIp,
-                    });
+                    updateResult = await syncExactClient(publicIp);
                 }
 
                 if (updateResult?.updated) {
@@ -2530,6 +2756,13 @@ Price: KSH ${service.price}</p>
 
             this.minuteDbExpiryRunning = true;
             try {
+                if (String(process.env.RADIUS_WRITE_MIKROTIK_TOTAL_LIMIT || "").toLowerCase() !== "true") {
+                    await withTimeout(
+                        this.db.deleteRadiusTotalLimitReplies(),
+                        30_000,
+                        "radius total limit cleanup"
+                    );
+                }
                 await withTimeout(
                     this.markAllExpiredUserCodesInDB(),
                     60_000,

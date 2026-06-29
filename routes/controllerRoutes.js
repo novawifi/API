@@ -3,6 +3,99 @@ const router = require("express").Router();
 
 const controller = new Controller();
 
+const lockedPlatformMessage = "Platform is deactivated. Activate it in Settings to perform this operation.";
+const lockedPlatformHandlers = new Set([
+  "addSettings",
+  "deleteCodes",
+  "updatePackages",
+  "addPackages",
+  "deletePackages",
+  "updateSettings",
+  "updateCodes",
+  "updateModerators",
+  "deleteModerators",
+  "deletePayment",
+  "updateName",
+  "updateStations",
+  "deleteStations",
+  "addCode",
+  "UpdateDDNSViaScript",
+  "updateDDNSR",
+  "deleteDDNSR",
+  "removeUser",
+  "updatePPPoE",
+  "updateTemplate",
+  "addTemplates",
+  "updateTemplates",
+  "removeTemplates",
+  "updateDedicatedServer",
+  "restartDedicatedServerService",
+  "provisionDedicatedServer",
+  "rebootDedicatedServer",
+  "deleteDedicatedServer",
+  "resizeDedicatedServer",
+  "migratePlatformHosting",
+  "deleteMySession",
+  "enableSMS",
+  "saveSMSTemplates",
+  "updatePayments",
+  "togglePlugin",
+  "updateSidebarArchive",
+  "saveTermsOfService",
+  "updateManagerSettings",
+  "updateAdmin",
+  "deleteAdmin",
+  "saveEmailTemplates",
+  "uploadConfig",
+  "deleteConfig",
+  "updateConfig",
+  "saveSMSConfig",
+  "uploadBrandingLogo",
+  "saveBrandingSupport",
+  "installLetsEncryptSSLCert",
+  "sendBulkSMS",
+  "scheduleBulkSMS",
+  "sendInternalSMS",
+  "sendInternalEmail",
+  "scheduleInternalSMS",
+  "scheduleInternalEmail",
+  "addBlockedUser",
+  "deleteBlockedUsers",
+  "requestHomeFibre",
+  "resolveHomeFibreCallback",
+  "deleteHomeFibreCallback",
+  "saveMikrotikInfo",
+  "migrateSystemBasis",
+  "managerOpsRun",
+  "managerRepairSite",
+  "managerCreateSubdomainSite",
+  "linkStations",
+  "unlinkStation",
+  "setupCardBilling",
+  "cancelCardBilling",
+  "verifyPaystackCardBilling",
+]);
+
+const getRequestToken = (req) =>
+  req.body?.token ||
+  req.body?.data?.token ||
+  req.query?.token ||
+  req.headers?.authorization ||
+  "";
+
+const isLockedPlatformRequest = async (req) => {
+  try {
+    const token = String(getRequestToken(req) || "").trim();
+    if (!token) return false;
+    const auth = await controller.auth.AuthenticateRequest(token);
+    if (!auth?.success || !auth?.admin?.platformID) return false;
+    const platform = await controller.db.getPlatformByplatformID(auth.admin.platformID);
+    return controller.isPlatformBillingPaused(platform);
+  } catch {
+    return false;
+  }
+};
+
 const use = (name) => {
   const handler = controller[name];
   if (typeof handler !== "function") {
@@ -10,7 +103,12 @@ const use = (name) => {
     return (req, res) =>
       res.status(501).json({ success: false, message: `Handler ${name} not implemented` });
   }
-  return (req, res) => handler.call(controller, req, res);
+  return async (req, res) => {
+    if (lockedPlatformHandlers.has(name) && await isLockedPlatformRequest(req)) {
+      return res.status(423).json({ success: false, locked: true, message: lockedPlatformMessage });
+    }
+    return handler.call(controller, req, res);
+  };
 };
 
 // POST
@@ -136,6 +234,7 @@ router.post("/fetchPlatform", use("fetchPlatform"))
 router.post("/notifications", use("fetchPlatformNotifications"));
 router.post("/notifications/dismiss", use("dismissPlatformNotification"));
 router.post("/updateAccountPlan", use("updateAccountPlan"));
+router.post("/updatePlatformActivity", use("updatePlatformActivity"));
 router.post("/updatePlatformSettings", use("updateManagerSettings"))
 router.post("/updateAdmin", use("updateAdmin"));
 router.post("/deleteAdmin", use("deleteAdmin"));

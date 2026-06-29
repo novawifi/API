@@ -16,6 +16,9 @@ class MailerConnection {
     }
 
     async transporter() {
+        if (!this.host || !this.user || !this.pass) {
+            throw new Error("Mailer SMTP configuration is incomplete.");
+        }
         return nodemailer.createTransport({
             host: this.host,
             port: this.port,

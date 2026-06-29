@@ -90,6 +90,53 @@ class Controller {
     }
   }
 
+  isRadiusStation(station) {
+    return String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+  }
+
+  buildStationAliasContext(stations = []) {
+    const stationAliasMap = new Map();
+    const radiusHosts = new Set();
+
+    for (const station of Array.isArray(stations) ? stations : []) {
+      const canonicalHost = station?.mikrotikHost || station?.name || station?.id || "";
+      const aliases = typeof this.db.stationRouterAliases === "function"
+        ? this.db.stationRouterAliases(station)
+        : [station?.mikrotikHost, station?.name, station?.id].filter(Boolean);
+
+      for (const alias of aliases) {
+        stationAliasMap.set(alias, canonicalHost);
+      }
+      if (this.isRadiusStation(station) && canonicalHost) {
+        radiusHosts.add(canonicalHost);
+      }
+    }
+
+    return { stationAliasMap, radiusHosts };
+  }
+
+  getActiveHotspotUsername(row = {}) {
+    return String(row?.user || row?.name || row?.username || "").trim();
+  }
+
+  async getRadiusHotspotActiveUsernames(platformID, stations = []) {
+    const activeUsernames = new Set();
+    const radiusStations = (Array.isArray(stations) ? stations : [])
+      .filter((station) => this.isRadiusStation(station) && station?.mikrotikHost);
+
+    await Promise.all(radiusStations.map(async (station) => {
+      const status = await this.mikrotik.checkHotspotUserStatus(platformID, station.mikrotikHost)
+        .catch(() => null);
+      if (!status?.success) return;
+      for (const user of status.users || []) {
+        const username = this.getActiveHotspotUsername(user);
+        if (username) activeUsernames.add(username);
+      }
+    }));
+
+    return activeUsernames;
+  }
+
   buildDashboardResponse(payload, role = "admin") {
     if (!payload) return null;
     const IsB2B = role === "superuser" ? payload.IsB2B : false;
@@ -185,6 +232,17 @@ class Controller {
     return String(platform?.status || "").trim().toLowerCase() === "premium";
   }
 
+  isPlatformBillingPaused(platform) {
+    const status = String(platform?.status || "").trim().toLowerCase();
+    return status === "deactivated" || status === "paused";
+  }
+
+  async isPlatformOperationsLocked(platformID) {
+    if (!platformID) return false;
+    const platform = await this.db.getPlatformByplatformID(platformID);
+    return this.isPlatformBillingPaused(platform);
+  }
+
   addDays(date, days) {
     const next = new Date(date || Date.now());
     next.setDate(next.getDate() + days);
@@ -278,6 +336,50 @@ class Controller {
     return dueDate;
   }
 
+  getNextServiceDueDate(service, baseDate = new Date(), periods = 1) {
+    if (!service?.period) return null;
+    const match = String(service.period || "").toLowerCase().match(/^(\d+)\s+(hour|minute|day|month|year)s?$/i);
+    if (!match) return null;
+    const date = new Date(baseDate);
+    if (Number.isNaN(date.getTime())) return null;
+    const cycles = Math.max(1, Number(periods) || 1);
+    let dueDate = date;
+    for (let i = 0; i < cycles; i += 1) {
+      dueDate = Utils.addPeriod(dueDate, parseInt(match[1]), match[2].toLowerCase());
+    }
+    return dueDate;
+  }
+
+  getBillingSystemRenewalDate(bill, service) {
+    const paidAt = bill?.paidAt ? new Date(bill.paidAt) : null;
+    if (!paidAt || Number.isNaN(paidAt.getTime())) return null;
+    const currentDueDate = bill?.dueDate ? new Date(bill.dueDate) : null;
+    if (currentDueDate && !Number.isNaN(currentDueDate.getTime()) && currentDueDate > paidAt) {
+      return currentDueDate;
+    }
+    return this.getNextServiceDueDate({ period: bill?.period || service?.period || "30 days" }, paidAt);
+  }
+
+  async normalizeBillingSystemBillDueDate(bill, service) {
+    if (!bill || !service) return bill;
+    const billMeta = bill?.meta && typeof bill.meta === "object" ? bill.meta : {};
+    const isBillingSystemBill = billMeta.serviceKey === "billing" || String(bill.name || "") === String(service.name || "");
+    if (!isBillingSystemBill) return bill;
+
+    const renewalDate = this.getBillingSystemRenewalDate(bill, service);
+    if (!renewalDate) return bill;
+
+    const currentDueDate = bill.dueDate ? new Date(bill.dueDate) : null;
+    if (currentDueDate && !Number.isNaN(currentDueDate.getTime()) && currentDueDate.getTime() === renewalDate.getTime()) {
+      return bill;
+    }
+
+    return this.db.updatePlatformBilling(bill.id, {
+      dueDate: renewalDate,
+      period: bill.period || service.period || "30 days",
+    });
+  }
+
   async notifyPlatform(platformID, title, data) {
     if (!platformID || !title) return null;
     try {
@@ -305,13 +407,45 @@ class Controller {
 
     const plan = this.getAccountPlan(platform.subscriptionPlan);
     const isPremium = this.isPremiumPlatform(platform);
+    const isPaused = this.isPlatformBillingPaused(platform);
     const amount = String(plan.price);
     const dueDate = this.getBillingDueDate(platform, service, plan.id);
     const existing = await this.db.getPlatformBillingByName(service.name, platformID);
+    const existingMeta = existing?.meta && typeof existing.meta === "object" ? existing.meta : {};
+
+    if (isPaused) {
+      const pausedData = {
+        name: service.name,
+        platformID,
+        price: amount,
+        currency: service.currency,
+        period: service.period,
+        description: service.description,
+        status: "Paused",
+        meta: {
+          ...existingMeta,
+          serviceKey: "billing",
+          plan: plan.id,
+          billingPaused: true,
+          billingPausedAt: existingMeta.billingPausedAt || new Date().toISOString(),
+        },
+      };
+      if (!existing) {
+        return this.db.createPlatformBilling({
+          ...pausedData,
+          amount: "0",
+          dueDate: null,
+        });
+      }
+      return this.db.updatePlatformBilling(existing.id, pausedData);
+    }
+
+    const now = new Date();
+    const dueDateIsReached = dueDate && new Date(dueDate).getTime() <= now.getTime();
     const data = {
       name: service.name,
       platformID,
-      amount: isPremium ? "0" : amount,
+      amount: isPremium || !dueDateIsReached ? "0" : amount,
       price: amount,
       currency: service.currency,
       period: service.period,
@@ -321,7 +455,7 @@ class Controller {
     };
 
     if (!existing) {
-      return this.db.createPlatformBilling({ ...data, status: isPremium ? "Paid" : "Unpaid" });
+      return this.db.createPlatformBilling({ ...data, status: isPremium ? "Paid" : dueDateIsReached ? "Unpaid" : "Upcoming" });
     }
 
     if (isPremium) {
@@ -333,10 +467,22 @@ class Controller {
     }
 
     if (String(existing.status || "").toLowerCase() === "paid") {
-      return existing;
+      return this.normalizeBillingSystemBillDueDate(existing, service);
     }
 
-    return this.db.updatePlatformBilling(existing.id, data);
+    const updateData = {
+      name: service.name,
+      platformID,
+      price: amount,
+      currency: service.currency,
+      period: service.period,
+      description: service.description,
+      meta: { ...existingMeta, serviceKey: "billing", plan: plan.id, premium: false },
+    };
+    if (!existing.dueDate) updateData.dueDate = dueDate;
+    if (existing.amount === undefined || existing.amount === null) updateData.amount = "0";
+    if (!existing.status) updateData.status = "Upcoming";
+    return this.db.updatePlatformBilling(existing.id, updateData);
   }
 
   async enforcePlatformSubscription(platformID) {
@@ -347,34 +493,64 @@ class Controller {
     if (this.isPremiumPlatform(platform)) {
       return { ...platform, subscriptionPlan: this.normalizePlatformPlan(platform.subscriptionPlan) };
     }
+    if (this.isPlatformBillingPaused(platform)) {
+      return { ...platform, subscriptionPlan: this.normalizePlatformPlan(platform.subscriptionPlan), billingPaused: true };
+    }
 
     const plan = this.normalizePlatformPlan(platform.subscriptionPlan);
     const trialEndsAt = platform.trialEndsAt || this.addDays(platform.createdAt, 3);
-    const unpaidBills = await this.getUnpaidPlatformBilling(platformID);
-    const hasUnpaidAmount = unpaidBills.some((bill) => Number(bill?.amount || 0) > 0);
-    const shouldDisable =
+    const trialEndsAtDate = new Date(trialEndsAt);
+    const trialIsActive =
       this.isTrialLimitedPlan(plan) &&
+      !Number.isNaN(trialEndsAtDate.getTime()) &&
+      trialEndsAtDate.getTime() > Date.now();
+    if (trialIsActive && String(platform.status || "").toLowerCase() === "inactive") {
+      await this.db.updatePlatform(platformID, { status: "active" });
+      platform.status = "active";
+    }
+    const now = new Date();
+    const unpaidBills = await this.getUnpaidPlatformBilling(platformID);
+    const dueUnpaidBills = unpaidBills.filter((bill) => {
+      const amount = Number(bill?.amount || 0);
+      const dueDate = bill?.dueDate ? new Date(bill.dueDate) : null;
+      return amount > 0 && dueDate && !Number.isNaN(dueDate.getTime()) && dueDate <= now;
+    });
+    const hasUnpaidAmount = dueUnpaidBills.length > 0;
+    const unpaidBill = dueUnpaidBills[0];
+    const unpaidDueDate = unpaidBill?.dueDate ? new Date(unpaidBill.dueDate) : trialEndsAtDate;
+    const hasValidUnpaidDueDate = unpaidDueDate && !Number.isNaN(unpaidDueDate.getTime());
+    const graceEndsAt = hasValidUnpaidDueDate ? this.addDays(unpaidDueDate, 3) : null;
+    const shouldDisable =
       hasUnpaidAmount &&
-      new Date(trialEndsAt).getTime() < Date.now();
+      hasValidUnpaidDueDate &&
+      graceEndsAt &&
+      graceEndsAt.getTime() <= now.getTime();
 
     if (shouldDisable && String(platform.status || "").toLowerCase() !== "inactive") {
       await this.db.updatePlatform(platformID, { status: "inactive" });
       platform.status = "inactive";
     }
 
-    const unpaidBill = unpaidBills.find((bill) => Number(bill?.amount || 0) > 0);
+    if (!shouldDisable && typeof this.db.dismissPlatformNotificationsByTitle === "function") {
+      await this.db.dismissPlatformNotificationsByTitle(
+        platformID,
+        ["Platform disabled: payment required", "Trial payment due", "Billing payment due"],
+        "/admin/bills"
+      );
+    }
+
     if (shouldDisable && unpaidBill) {
       await this.db.upsertPlatformNotification(platformID, "Platform disabled: payment required", {
-        message: `Your ${plan} plan trial ended and KES ${unpaidBill.amount} is unpaid. Pay now to reactivate your platform.`,
+        message: `Your ${plan} plan bill due on ${unpaidDueDate.toLocaleDateString()} has KES ${unpaidBill.amount} unpaid after the 3 day grace period. Pay now to reactivate your platform.`,
         status: "error",
         actionLabel: "Pay Now",
         actionUrl: "/admin/bills",
       });
-    } else if (this.isTrialLimitedPlan(plan) && hasUnpaidAmount && unpaidBill) {
-      const daysLeft = Math.max(0, Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000)));
-      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
-        message: `Your ${plan} plan has ${daysLeft} day(s) left before it is disabled. Amount due: KES ${unpaidBill.amount}.`,
-        status: "info",
+    } else if (hasUnpaidAmount && unpaidBill && graceEndsAt) {
+      const daysLeft = Math.max(0, Math.ceil((graceEndsAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)));
+      await this.db.upsertPlatformNotification(platformID, "Billing payment due", {
+        message: `Your ${plan} plan bill is due. Amount due: KES ${unpaidBill.amount}. Pay within ${daysLeft} day(s) to avoid deactivation.`,
+        status: "warning",
         actionLabel: "Pay Bill",
         actionUrl: "/admin/bills",
       });
@@ -1040,22 +1216,10 @@ class Controller {
           let mikrotikFailed = true;
           let codes = result?.rows || [];
           const stations = await this.db.getStations(platformID);
-          const stationAliasMap = new Map();
-          for (const st of Array.isArray(stations) ? stations : []) {
-            const canonicalHost = st?.mikrotikHost || st?.name || st?.id || "";
-            for (const alias of this.db.stationRouterAliases(st)) {
-              stationAliasMap.set(alias, canonicalHost);
-            }
-          }
+          const { stationAliasMap, radiusHosts } = this.buildStationAliasContext(stations);
           const stationsToCheck = station
             ? stations.filter((s) => this.db.stationRouterAliases(s).includes(station))
             : stations;
-          const radiusHosts = new Set(
-            (Array.isArray(stations) ? stations : [])
-              .filter((item) => String(item?.systemBasis || "API").toUpperCase() === "RADIUS")
-              .map((item) => stationAliasMap.get(item?.mikrotikHost) || item?.mikrotikHost)
-              .filter(Boolean)
-          );
           const radiusUsernames = codes
             .filter((code) => {
               const pkg = code.package;
@@ -1064,11 +1228,13 @@ class Controller {
             })
             .map((code) => code.username)
             .filter(Boolean);
-          const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
-            requireRecentActivity: false,
-          });
+          const radiusStationsToCheck = stationsToCheck.filter((st) => this.isRadiusStation(st));
+          const [radiusUsage, radiusActiveUsernames] = await Promise.all([
+            this.db.getRadiusUsageDetailsByUsernames(radiusUsernames),
+            this.getRadiusHotspotActiveUsernames(platformID, radiusStationsToCheck),
+          ]);
           const apiStationsToCheck = stationsToCheck.filter(
-            (st) => String(st?.systemBasis || "API").toUpperCase() !== "RADIUS"
+            (st) => !this.isRadiusStation(st)
           );
           for (const st of apiStationsToCheck) {
             const activeRes = await this.mikrotik.checkHotspotUserStatus(platformID, st.mikrotikHost);
@@ -1078,29 +1244,6 @@ class Controller {
             }
           }
           if (apiStationsToCheck.length === 0) mikrotikFailed = false;
-
-          if (mikrotikFailed) {
-            const newCodes = await Promise.all(
-              codes.map(async (code) => {
-                const pkg = code.package;
-                const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
-                const isRadius = radiusHosts.has(rowStation);
-                const userRadiusUsage = isRadius
-                  ? radiusUsage[code.username] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
-                  : null;
-                return {
-                  ...code,
-                  station: rowStation,
-                  package: pkg?.name,
-                  active: isRadius && code.status === "active" && userRadiusUsage?.online ? "Online" : "Offline",
-                  systemBasis: isRadius ? "RADIUS" : "API",
-                  bandwidthUsage: userRadiusUsage,
-                };
-              })
-            );
-
-            return rows = newCodes;
-          }
 
           const newCodes = [];
           for (const code of codes) {
@@ -1123,8 +1266,8 @@ class Controller {
             }
 
             const isActive = isRadius
-              ? Boolean(userRadiusUsage?.online)
-              : allActiveUsers.some(u => u.user === code.username);
+              ? Boolean(userRadiusUsage?.online) || radiusActiveUsernames.has(code.username)
+              : !mikrotikFailed && allActiveUsers.some(u => u.user === code.username);
             newCodes.push({
               ...code,
               station: rowStation,
@@ -1309,7 +1452,8 @@ class Controller {
         totalCount: result.totalCount,
         ...(summary && { summary }),
       };
-      this.cache.set(cacheKey, response, 15000);
+      const ttl = ["users", "pppoe"].includes(entity) ? 3000 : 15000;
+      this.cache.set(cacheKey, response, ttl);
       return res.status(200).json(response);
 
     } catch (error) {
@@ -3276,19 +3420,22 @@ class Controller {
       const stationByHost = new Map(
         (stations || []).map((station) => [station.mikrotikHost, station])
       );
+      const { stationAliasMap, radiusHosts } = this.buildStationAliasContext(stations);
       const apiStations = (stations || []).filter(
-        (station) => String(station?.systemBasis || "API").toUpperCase() !== "RADIUS"
+        (station) => !this.isRadiusStation(station)
       );
       const radiusUsernames = (codes || [])
         .filter((code) => {
-          const station = stationByHost.get(code.package?.routerHost);
-          return String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+          const rowStation = stationAliasMap.get(code.package?.routerHost) || code.package?.routerHost;
+          return radiusHosts.has(rowStation);
         })
         .map((code) => code.username)
         .filter(Boolean);
-      const radiusUsage = await this.db.getRadiusUsageDetailsByUsernames(radiusUsernames, {
-        requireRecentActivity: false,
-      });
+      const radiusStations = (stations || []).filter((station) => this.isRadiusStation(station));
+      const [radiusUsage, radiusActiveUsernames] = await Promise.all([
+        this.db.getRadiusUsageDetailsByUsernames(radiusUsernames),
+        this.getRadiusHotspotActiveUsernames(platformID, radiusStations),
+      ]);
 
       let allActiveUsers = [];
       let reachableApiStations = 0;
@@ -3304,15 +3451,16 @@ class Controller {
       const newCodes = [];
       for (const code of codes) {
         const pkg = code.package;
-        const station = stationByHost.get(pkg?.routerHost);
-        const isRadius = String(station?.systemBasis || "API").toUpperCase() === "RADIUS";
+        const rowStation = stationAliasMap.get(pkg?.routerHost) || pkg?.routerHost;
+        const station = stationByHost.get(rowStation);
+        const isRadius = radiusHosts.has(rowStation) || this.isRadiusStation(station);
         const userRadiusUsage = isRadius
           ? radiusUsage[code.username] || { uploadBytes: 0, downloadBytes: 0, totalBytes: 0, online: false }
           : null;
         if (code.status !== "active") {
           newCodes.push({
             ...code,
-            station: pkg?.routerHost,
+            station: rowStation,
             package: pkg?.name,
             active: "Offline",
             systemBasis: isRadius ? "RADIUS" : "API",
@@ -3322,11 +3470,11 @@ class Controller {
         }
 
         const isActive = isRadius
-          ? Boolean(userRadiusUsage?.online)
+          ? Boolean(userRadiusUsage?.online) || radiusActiveUsernames.has(code.username)
           : allActiveUsers.some(u => u.user === code.username);
         newCodes.push({
           ...code,
-          station: pkg?.routerHost,
+          station: rowStation,
           package: pkg?.name,
           active: isActive ? "Online" : "Offline",
           systemBasis: isRadius ? "RADIUS" : "API",
@@ -3346,7 +3494,7 @@ class Controller {
         limit,
         offset,
       };
-      this.cache.set(cacheKey, response, 15000);
+      this.cache.set(cacheKey, response, 3000);
       return res.json(response);
 
     } catch (error) {
@@ -3396,7 +3544,7 @@ class Controller {
       }
       const packages = await this.db.getPackagesByPlatformID(platformID);
       const config = await this.db.getPlatformConfig(platformID);
-      if (config?.mpesaShortCodeType?.toLowerCase() === "paybill" && Array.isArray(packages)) {
+      if (this.requiresPackageAccountNumbers(config) && Array.isArray(packages)) {
         for (const pkg of packages) {
           if (!pkg.accountNumber) {
             const accountNumber = await this.generatePackageAccountNumber(platformID);
@@ -3443,7 +3591,7 @@ class Controller {
       ? data.mpesaC2BShortCodeType
       : "Till";
 
-    return {
+    const payload = {
       IsC2B: data.IsC2B === true,
       IsAPI: data.IsAPI === true,
       IsB2B: data.IsB2B === true,
@@ -3459,15 +3607,21 @@ class Controller {
       mpesaAccountInitiatorPassword: data.mpesaAccountInitiatorPassword || "",
       mpesaPassKey: data.mpesaPassKey || "",
     };
+
+    if (Object.prototype.hasOwnProperty.call(data, "supportPhone")) {
+      payload.supportPhone = String(data.supportPhone || "").trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(data, "brandingImage")) {
+      payload.brandingImage = String(data.brandingImage || "").trim();
+    }
+
+    return payload;
   }
 
   validateMpesaSettings(data = {}, adminID) {
     if (data.IsC2B === true) {
       if (!data.mpesaC2BShortCode || !data.mpesaC2BShortCodeType || !adminID) {
         return "All MPESA fields must be filled out!";
-      }
-      if (String(data.mpesaC2BShortCodeType).toLowerCase() === "paybill" && !data.mpesaC2BAccountNumber) {
-        return "Account Number is required for Paybill!";
       }
     } else if (data.IsAPI === true) {
       if (!data.mpesaConsumerKey || !data.mpesaConsumerSecret || !data.mpesaShortCode || !data.mpesaShortCodeType || !data.mpesaPassKey || !adminID) {
@@ -3479,6 +3633,14 @@ class Controller {
       }
     }
     return null;
+  }
+
+  requiresPackageAccountNumbers(config = {}) {
+    return (
+      (config.IsC2B === true && String(config.mpesaC2BShortCodeType || "").toLowerCase() === "paybill") ||
+      (config.IsAPI === true && String(config.mpesaShortCodeType || "").toLowerCase() === "paybill") ||
+      (config.IsB2B === true && String(config.mpesaShortCodeType || "").toLowerCase() === "paybill")
+    );
   }
 
   buildStationMpesaSettings(station, platformSettings) {
@@ -3600,6 +3762,7 @@ class Controller {
       };
 
       platformSettings.brandingImage = normalizeBrandingImage(platformSettings.brandingImage);
+      platformSettings.effectiveSupportPhone = String(platformSettings.supportPhone || "").trim() || "0712345678";
 
       let stationBranding = null;
       let stationMpesa = null;
@@ -3759,20 +3922,42 @@ class Controller {
       });
     }
     try {
+      const normalizedSupportPhone = String(supportPhone || "").trim();
+      const normalizedBrandingImage = String(brandingImage || "").trim();
+      const platformSettings = await this.db.getPlatformConfig(platformID);
+
       if (!stationId) {
-        return res.json({ success: false, message: "Select a station first." });
+        const payload = {
+          supportPhone: normalizedSupportPhone,
+          brandingImage: normalizedBrandingImage,
+          adminID: auth.admin.adminID,
+        };
+        const savedConfig = platformSettings
+          ? await this.db.updatePlatformConfig(platformID, payload)
+          : await this.db.createPlatformConfig(platformID, payload);
+        const savedSupportPhone = String(savedConfig.supportPhone || "").trim();
+        this.cache.del(`main:settings:${platformID}`);
+        return res.json({
+          success: true,
+          message: "Platform branding & support updated.",
+          stationBranding: null,
+          settings: {
+            supportPhone: savedSupportPhone,
+            effectiveSupportPhone: savedSupportPhone || "0712345678",
+            brandingImage: savedConfig.brandingImage || "",
+            inheritsSupportPhone: false,
+            inheritsBrandingImage: false,
+          },
+        });
       }
       const station = await this.db.getStation(stationId);
       if (!station || station.platformID !== platformID) {
         return res.json({ success: false, message: "Station not found." });
       }
-      const normalizedSupportPhone = String(supportPhone || "").trim() || null;
-      const normalizedBrandingImage = String(brandingImage || "").trim() || null;
       const updatedStation = await this.db.updateStation(stationId, {
-        supportPhone: normalizedSupportPhone,
-        brandingImage: normalizedBrandingImage,
+        supportPhone: normalizedSupportPhone || null,
+        brandingImage: normalizedBrandingImage || null,
       });
-      const platformSettings = await this.db.getPlatformConfig(platformID);
       const platformSupportPhone = String(platformSettings?.supportPhone || "").trim();
       const savedSupportPhone = String(updatedStation.supportPhone || "").trim();
       const effectiveSupportPhone = savedSupportPhone || platformSupportPhone || "0712345678";
@@ -3911,7 +4096,7 @@ class Controller {
       }
 
       const config = await this.db.getPlatformConfig(platformID);
-      const needsAccountNumber = config?.mpesaShortCodeType?.toLowerCase() === "paybill";
+      const needsAccountNumber = this.requiresPackageAccountNumbers(config);
       const accountNumber = needsAccountNumber && !pkg.accountNumber
         ? await this.generatePackageAccountNumber(platformID)
         : pkg.accountNumber || "";
@@ -4053,7 +4238,7 @@ class Controller {
       }
 
       const config = await this.db.getPlatformConfig(platformID);
-      const needsAccountNumber = config?.mpesaShortCodeType?.toLowerCase() === "paybill";
+      const needsAccountNumber = this.requiresPackageAccountNumbers(config);
       const accountNumber = needsAccountNumber ? await this.generatePackageAccountNumber(platformID) : "";
 
       const packageData = {
@@ -4775,10 +4960,11 @@ class Controller {
         await this.db.updateStation(stationResult.id, {
           radiusClientIp: radiusHost || "",
         });
+        const radiusSecret = getRadiusClientSecret(stationResult.radiusClientSecret || "");
         const addResult = await ensureRadiusClient({
           name: stationResult.radiusClientName,
           ip: radiusHost || "",
-          secret: stationResult.radiusClientSecret,
+          secret: radiusSecret,
           shortname: stationResult.name,
           server: stationResult.radiusServerIp || "",
           description: `Nova RADIUS client for ${stationResult.name}`,
@@ -5024,7 +5210,7 @@ class Controller {
       apiPort: existing.apiPort || "8728",
       webfigUrl: webfigHost ? `http://${webfigHost}` : existing.webfigUrl || "",
       radiusAddress: isRadiusStation ? station.radiusServerIp || existing.radiusAddress || "" : "",
-      radiusSecret: isRadiusStation ? station.radiusClientSecret || existing.radiusSecret || "" : "",
+      radiusSecret: isRadiusStation ? getRadiusClientSecret(station.radiusClientSecret || existing.radiusSecret || "") : "",
       radiusAccountingPort: isRadiusStation ? existing.radiusAccountingPort || "1813" : "",
       radiusAuthPort: isRadiusStation ? existing.radiusAuthPort || "1812" : "",
       cpuUsage: cpuLoad !== undefined && cpuLoad !== "" ? `${cpuLoad}%` : existing.cpuUsage || "",
@@ -6975,6 +7161,13 @@ class Controller {
       });
     }
     try {
+      if (await this.isPlatformOperationsLocked(platformID)) {
+        return res.status(423).json({
+          success: false,
+          locked: true,
+          message: "Platform is deactivated. Voucher login is disabled until the platform is activated.",
+        });
+      }
       const submittedCode = String(code).trim();
       let existingcode = await this.db.getUniqueCode(submittedCode, platformID);
       if (!existingcode) {
@@ -8282,6 +8475,16 @@ class Controller {
       station: options.station || options.host,
       config,
     });
+    let stationRecord = null;
+    if (options.station && typeof options.station === "object") {
+      stationRecord = options.station;
+    } else if (host && typeof this.db.getStationByHost === "function") {
+      stationRecord = await this.db.getStationByHost(platformID, host).catch(() => null);
+    }
+    const stationSupportPhone = String(stationRecord?.supportPhone || "").trim();
+    const platformSupportPhone = String(config?.supportPhone || platform?.supportPhone || "").trim();
+    const supportPhone = stationSupportPhone || platformSupportPhone || "0712345678";
+
     let packages = [];
     if (host) {
       packages = await this.db.getPackagesByHost(platformID, host);
@@ -8297,6 +8500,7 @@ class Controller {
       platformID,
       host,
       hash: options.hash || getHotspotHash(host),
+      supportPhone,
       preview: Boolean(options.preview),
     });
   }
@@ -8349,6 +8553,14 @@ class Controller {
     }
 
     try {
+      if (await this.isPlatformOperationsLocked(platformID)) {
+        return res.status(423).json({
+          type: "error",
+          success: false,
+          locked: true,
+          message: "Platform is deactivated. Packages are unavailable until the platform is activated.",
+        });
+      }
       let packages;
       const config = await this.db.getPlatformConfig(platformID);
       if (!station && stationId) {
@@ -8365,7 +8577,7 @@ class Controller {
       }
       packages = Array.isArray(packages) ? packages : [];
 
-      if (config?.mpesaShortCodeType?.toLowerCase() === "paybill" && Array.isArray(packages)) {
+      if (this.requiresPackageAccountNumbers(config) && Array.isArray(packages)) {
         for (const pkg of packages) {
           if (!pkg.accountNumber) {
             const accountNumber = await this.generatePackageAccountNumber(platformID);
@@ -8414,6 +8626,13 @@ class Controller {
         return res.status(404).json({
           success: false,
           message: "Platform not found.",
+        });
+      }
+      if (this.isPlatformBillingPaused(platform)) {
+        return res.status(423).json({
+          success: false,
+          locked: true,
+          message: "Platform is deactivated. Requests are disabled until the platform is activated.",
         });
       }
 
@@ -8991,7 +9210,7 @@ class Controller {
       const normalizedStatus = status
         ? String(status).trim().toLowerCase()
         : String(existing.status || "active").trim().toLowerCase();
-      const allowedStatuses = new Set(["active", "inactive", "premium"]);
+      const allowedStatuses = new Set(["active", "inactive", "deactivated", "premium"]);
       if (!allowedStatuses.has(normalizedStatus)) {
         return res.status(400).json({
           success: false,
@@ -9097,6 +9316,143 @@ class Controller {
         platform,
         bill,
         migration,
+      });
+    } catch (error) {
+      console.log("An error occured", error);
+      return res.json({ success: false, message: "An error occured" });
+    }
+  };
+
+  async updatePlatformActivity(req, res) {
+    const { token, status, action } = req.body || {};
+    if (!token) {
+      return res.json({
+        success: false,
+        message: "Missing credentials are required!",
+      });
+    }
+
+    const requested = String(status || action || "").trim().toLowerCase();
+    const nextStatus =
+      ["deactivate", "deactivated", "pause", "paused"].includes(requested)
+        ? "deactivated"
+        : ["activate", "active", "resume"].includes(requested)
+          ? "active"
+          : "";
+
+    if (!nextStatus) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid platform activity status.",
+      });
+    }
+
+    try {
+      const auth = await this.auth.AuthenticateRequest(token);
+      if (!auth.success) {
+        return res.json({ success: false, message: auth.message });
+      }
+      if (auth.admin.role !== "superuser") {
+        return res.json({ success: false, message: "Unauthorised!" });
+      }
+
+      const platformID = auth.admin.platformID;
+      const existing = await this.db.getPlatformByplatformID(platformID);
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          message: "Platform not found!",
+        });
+      }
+
+      const service = await this.db.getSystemServiceByKey("billing");
+      const plan = this.getAccountPlan(existing.subscriptionPlan);
+      let bill = service ? await this.db.getPlatformBillingByName(service.name, platformID) : null;
+      const now = new Date();
+      const meta = bill?.meta && typeof bill.meta === "object" ? { ...bill.meta } : {};
+      let billUpdate = null;
+
+      if (service) {
+        if (nextStatus === "deactivated") {
+          billUpdate = {
+            status: "Paused",
+            price: String(plan.price),
+            currency: service.currency,
+            period: service.period,
+            description: service.description,
+            meta: {
+              ...meta,
+              serviceKey: "billing",
+              plan: plan.id,
+              billingPaused: true,
+              billingPausedAt: meta.billingPausedAt || now.toISOString(),
+              billingPausedBy: auth.admin.adminID || auth.admin.id || auth.admin.email || "superuser",
+            },
+          };
+        } else {
+          delete meta.billingPaused;
+          delete meta.billingPausedAt;
+          delete meta.billingPausedBy;
+          const trialEndsAt = existing.trialEndsAt ? new Date(existing.trialEndsAt) : null;
+          const trialDueDate =
+            this.isTrialLimitedPlan(plan.id) &&
+              trialEndsAt &&
+              !Number.isNaN(trialEndsAt.getTime()) &&
+              trialEndsAt > now
+              ? trialEndsAt
+              : null;
+          billUpdate = {
+            status: "Unpaid",
+            amount: String(Math.max(Number(bill?.amount || 0), plan.price)),
+            price: String(plan.price),
+            currency: service.currency,
+            period: service.period,
+            dueDate: trialDueDate || this.getNextServiceDueDate(service, now),
+            description: service.description,
+            meta: {
+              ...meta,
+              serviceKey: "billing",
+              plan: plan.id,
+              resumedAt: now.toISOString(),
+            },
+          };
+        }
+
+        if (bill) {
+          bill = await this.db.updatePlatformBilling(bill.id, billUpdate);
+        } else {
+          bill = await this.db.createPlatformBilling({
+            name: service.name,
+            platformID,
+            amount: nextStatus === "deactivated" ? "0" : String(plan.price),
+            dueDate: nextStatus === "deactivated" ? null : billUpdate.dueDate,
+            ...billUpdate,
+          });
+        }
+      }
+
+      const platform = await this.db.updatePlatform(platformID, { status: nextStatus });
+      await this.db.upsertPlatformNotification(
+        platformID,
+        nextStatus === "deactivated" ? "Platform deactivated" : "Platform activated",
+        {
+          message:
+            nextStatus === "deactivated"
+              ? "Your platform is deactivated. Billing accrual is paused until you activate it again."
+              : "Your platform is active again. Billing has resumed from the current period.",
+          status: nextStatus === "deactivated" ? "info" : "success",
+          actionLabel: "View Settings",
+          actionUrl: "/admin/settings",
+        }
+      );
+      this.cache.del(`main:platform:${platformID}`);
+      this.cache.del("main:platforms:all");
+
+      return res.json({
+        success: true,
+        message: nextStatus === "deactivated" ? "Platform deactivated" : "Platform activated",
+        platform,
+        bill,
       });
     } catch (error) {
       console.log("An error occured", error);
@@ -10022,7 +10378,11 @@ class Controller {
         });
       }
       await this.enforcePlatformSubscription(platformID);
-      const bills = await this.db.getPlatformBilling(platformID);
+      const service = await this.db.getSystemServiceByKey("billing");
+      const rawBills = await this.db.getPlatformBilling(platformID);
+      const bills = service && Array.isArray(rawBills)
+        ? await Promise.all(rawBills.map((bill) => this.normalizeBillingSystemBillDueDate(bill, service)))
+        : rawBills;
       const response = {
         success: true,
         message: `Bills fetched successfully!`,
@@ -11397,7 +11757,7 @@ class Controller {
 
   async uploadBrandingLogo(req, res) {
     const { token, stationId, file, filename } = req.body || {};
-    if (!token || !stationId || !file) {
+    if (!token || !file) {
       return res.json({ success: false, message: "Missing credentials required!" });
     }
 
@@ -11414,9 +11774,12 @@ class Controller {
       if (!platformID) {
         return res.json({ success: false, message: "Missing platform ID" });
       }
-      const station = await this.db.getStation(stationId);
-      if (!station || station.platformID !== platformID) {
-        return res.json({ success: false, message: "Station not found." });
+      let station = null;
+      if (stationId) {
+        station = await this.db.getStation(stationId);
+        if (!station || station.platformID !== platformID) {
+          return res.json({ success: false, message: "Station not found." });
+        }
       }
 
       const match = String(file).match(/^data:image\/(png|jpe?g);base64,/i);
@@ -11435,7 +11798,8 @@ class Controller {
       const safeNameBase = (filename || "branding-logo")
         .replace(/\.[^/.]+$/, "")
         .replace(/[^a-zA-Z0-9._-]/g, "_");
-      const finalName = `${safeNameBase}-${platformID}-${stationId}-${Date.now()}.${ext}`;
+      const ownerId = stationId || "platform";
+      const finalName = `${safeNameBase}-${platformID}-${ownerId}-${Date.now()}.${ext}`;
       const finalPath = path.join(folderPath, finalName);
       fs.writeFileSync(finalPath, Buffer.from(base64Data, "base64"));
 
@@ -11443,7 +11807,20 @@ class Controller {
       const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
       const host = (req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
       const absoluteUrl = host ? `${proto}://${host}${imageUrl}` : imageUrl;
-      await this.db.updateStation(stationId, { brandingImage: imageUrl });
+      if (stationId) {
+        await this.db.updateStation(stationId, { brandingImage: imageUrl });
+      } else {
+        const existingConfig = await this.db.getPlatformConfig(platformID);
+        if (existingConfig) {
+          await this.db.updatePlatformConfig(platformID, { brandingImage: imageUrl });
+        } else {
+          await this.db.createPlatformConfig(platformID, {
+            adminID: auth.admin.adminID,
+            brandingImage: imageUrl,
+            supportPhone: "",
+          });
+        }
+      }
       this.cache.del(`main:settings:${platformID}`);
 
       return res.status(200).json({
@@ -11924,9 +12301,18 @@ class Controller {
     }
 
     try {
-      const auth = await this.auth.AuthenticateRequest(token);
-      if (!auth.success || (!auth.admin && !auth.superuser)) {
-        return res.json({ success: false, message: auth.message });
+      let authorized = false;
+      let authMessage = "Unauthorised!";
+      const managerSession = await this.authManagerSession(token);
+      if (managerSession.success) {
+        authorized = true;
+      } else {
+        const auth = await this.auth.AuthenticateRequest(token);
+        authorized = Boolean(auth.success && (auth.superuser || auth.admin?.role === "superuser"));
+        authMessage = auth.message || managerSession.message || authMessage;
+      }
+      if (!authorized) {
+        return res.json({ success: false, message: authMessage });
       }
 
       const recipients = Array.isArray(emails)
@@ -11954,8 +12340,9 @@ class Controller {
         }
       }
 
+      const allFailed = recipients.length > 0 && success.length === 0;
       return res.status(200).json({
-        success: true,
+        success: !allFailed,
         message: "Internal email process completed.",
         summary: {
           total: recipients.length,

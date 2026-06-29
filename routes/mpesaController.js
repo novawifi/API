@@ -6,6 +6,34 @@ const { MpesaController } = require("../controllers/mpesaController");
 
 const controller = new MpesaController();
 
+const lockedPlatformMessage = "Platform is deactivated. Activate it in Settings to perform this payment operation.";
+const lockedPlatformHandlers = new Set([
+    "WithdrawFunds",
+    "paySMS",
+    "verifyTransaction",
+    "reverseTransaction",
+    "transferToBusiness",
+]);
+
+const getRequestToken = (req) =>
+    req.body?.token ||
+    req.body?.data?.token ||
+    req.query?.token ||
+    req.headers?.authorization ||
+    "";
+
+const isLockedPlatformRequest = async (req) => {
+    try {
+        const token = String(getRequestToken(req) || "").trim();
+        if (!token) return false;
+        const auth = await controller.auth.AuthenticateRequest(token);
+        if (!auth?.success || !auth?.admin?.platformID) return false;
+        return controller.isPlatformOperationsLocked(auth.admin.platformID);
+    } catch {
+        return false;
+    }
+};
+
 const use = (name) => {
     const handler = controller[name];
     if (typeof handler !== "function") {
@@ -13,7 +41,12 @@ const use = (name) => {
         return (req, res) =>
             res.status(501).json({ success: false, message: `Handler ${name} not implemented` });
     }
-    return (req, res) => handler.call(controller, req, res);
+    return async (req, res) => {
+        if (lockedPlatformHandlers.has(name) && await isLockedPlatformRequest(req)) {
+            return res.status(423).json({ success: false, locked: true, message: lockedPlatformMessage });
+        }
+        return handler.call(controller, req, res);
+    };
 };
 
 router.post("/stkpush", use("stkPush"));
