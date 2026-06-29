@@ -36,14 +36,16 @@ class Mailer {
                 .replace(/>/g, "&gt;")
                 .replace(/\n/g, "<br />")
                 .replace(/(https?:\/\/[^\s<]+)/g, (match) => {
-                    const lower = match.toLowerCase();
+                    const trailingPunctuation = match.match(/[.,!?;:]+$/)?.[0] || "";
+                    const url = trailingPunctuation ? match.slice(0, -trailingPunctuation.length) : match;
+                    const lower = url.toLowerCase();
                     let label = "Open Link";
                     if (lower.includes("/admin") || lower.includes("dashboard")) {
                         label = "Open Dashboard";
                     } else if (lower.includes("login")) {
                         label = "Open Login";
                     }
-                    return `<a href="${match}">${label}</a>`;
+                    return `<a href="${url}">${label}</a>${trailingPunctuation}`;
                 });
         }
         return this.formatLinksAsButtons(html);
@@ -51,6 +53,7 @@ class Mailer {
 
     buildEmailHtml({ name, message, company }) {
         const brandName = company || "Nova WiFi";
+        const legalName = "NOVA NETCORE SYSTEMS";
         const safeMessage = this.normalizeEmailMessage(message);
         return `
         <!DOCTYPE html>
@@ -218,7 +221,7 @@ class Mailer {
                     Contact our support team at <a href="mailto:support@novawifi.co.ke">support@novawifi.co.ke</a>
                   </p>
                   <div class="copyright">
-                    © ${new Date().getFullYear()} ${brandName}. All rights reserved.<br/>
+                    &copy; ${new Date().getFullYear()} ${legalName}. All rights reserved.<br/>
                     We value your business and are here to help.
                   </div>
                 </div>

@@ -19,7 +19,16 @@ const { MpesaController } = require("./controllers/mpesaController");
 const { Mikrotikcontroller } = require("./controllers/mikrotikController");
 const { Utils } = require("./utils/Functions");
 const { socketManager } = require("./controllers/socketController");
-const { ensureExactRadiusClient, getRadiusClientIp, getRadiusClientSecret, isWireGuardMikrotikIp } = require("./utils/radiusConfig");
+const {
+    ensureExactRadiusClient,
+    ensureRadiusClient,
+    getRadiusCatchAllCidr,
+    getRadiusClientIp,
+    getRadiusClientSecret,
+    getRadiusServerIp,
+    isWireGuardMikrotikIp,
+    removeRadiusClient,
+} = require("./utils/radiusConfig");
 const { WebdockService } = require("./services/webdockService");
 
 class CronJob {
@@ -1391,6 +1400,8 @@ Price: KSH ${service.price}</p>
                 price: String(plan.price || service.price || "500"),
                 currency: service.currency || "KES",
                 status: "Paused",
+                amount: "0",
+                dueDate: null,
                 description: service.description,
                 meta: {
                     ...meta,
@@ -1451,16 +1462,17 @@ Price: KSH ${service.price}</p>
         if (!billing) {
             const createdAt = new Date(platform.createdAt);
             const dueDate = trialActive ? trialEndsAt : addServicePeriod(createdAt);
+            const dueDateReached = dueDate && dueDate <= now;
 
             billing = await this.db.createPlatformBilling({
                 period: service.period,
                 platformID,
                 name: service.name,
                 price: String(plan.price || service.price || "500"),
-                amount: String(plan.price || service.price || "500"),
+                amount: dueDateReached ? String(plan.price || service.price || "500") : "0",
                 currency: "KES",
                 dueDate,
-                status: "Unpaid",
+                status: dueDateReached ? "Unpaid" : "Upcoming",
                 description: service.description,
                 meta: { serviceKey, plan: plan.id },
             });
@@ -2422,6 +2434,44 @@ Price: KSH ${service.price}</p>
         for (const station of stations) {
             try {
                 if (station.systemBasis !== "RADIUS") continue;
+                const catchAllCidr = getRadiusCatchAllCidr();
+                if (catchAllCidr) {
+                    const sharedSecret = getRadiusClientSecret(station.radiusClientSecret || "");
+                    const radiusServerIp = station.radiusServerIp || getRadiusServerIp();
+                    const ensureResult = await ensureRadiusClient({
+                        name: station.radiusClientName || `rad-${platformID}`,
+                        ip: catchAllCidr,
+                        secret: sharedSecret,
+                        shortname: "nova-any-ip",
+                        server: radiusServerIp || "",
+                        description: "Nova catch-all RADIUS client",
+                    });
+                    const canonicalSecret = ensureResult?.sharedSecret || sharedSecret;
+                    if (station.radiusClientSecret !== canonicalSecret || station.radiusServerIp !== radiusServerIp) {
+                        await this.db.updateStation(station.id, {
+                            radiusClientSecret: canonicalSecret,
+                            radiusServerIp,
+                        });
+                    }
+                    if (station.radiusClientName) {
+                        await removeRadiusClient({ name: station.radiusClientName }).catch(() => null);
+                    }
+                    if (station.mikrotikHost && radiusServerIp && canonicalSecret) {
+                        const routerResult = await this.mikrotikController.normalizeRouterRadiusClient(
+                            platformID,
+                            station.mikrotikHost,
+                            radiusServerIp,
+                            canonicalSecret
+                        );
+                        if (!routerResult?.success) {
+                            socketManager.log(platformID, `Router RADIUS sync skipped for ${station.name || station.id}: ${routerResult?.message || "router unavailable"}`, {
+                                context: "cron",
+                                level: "warn",
+                            });
+                        }
+                    }
+                    continue;
+                }
                 const configuredClientIp = getRadiusClientIp(station, station.radiusClientIp || "");
                 const legacySecret = String(station.radiusClientSecret || "").trim();
                 const exactSecret = legacySecret || getRadiusClientSecret("");

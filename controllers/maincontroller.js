@@ -67,6 +67,26 @@ class Controller {
     });
   }
 
+  buildPlatformAdminWelcomeMessage({ platformName, dashboardUrl, adminEmail, adminPhone, adminPassword }) {
+    const lines = [
+      `Your platform ${platformName || "platform"} has been created.`,
+      `Open Dashboard: ${dashboardUrl}`,
+      "",
+      "Admin login credentials:",
+      `Email: ${adminEmail || "N/A"}`,
+    ];
+
+    if (adminPhone) {
+      lines.push(`Phone: ${adminPhone}`);
+    }
+
+    lines.push(`Password: ${adminPassword || "N/A"}`);
+    lines.push("");
+    lines.push("Please change this password after logging in.");
+
+    return lines.join("\n");
+  }
+
   logPlatform(platformID, message, meta = {}) {
     socketManager.log(platformID, message, {
       context: meta.context || "main",
@@ -9129,15 +9149,22 @@ class Controller {
         dueDate = resolvedTrialEndsAt;
         totalAmount = planPrice;
       }
+      const billingDueDate = dueDate ? new Date(dueDate) : null;
+      const billingIsDue =
+        billingDueDate &&
+        !Number.isNaN(billingDueDate.getTime()) &&
+        billingDueDate <= new Date();
+      const billingAmount = billingIsDue ? totalAmount.toString() : "0";
+      const billingStatus = billingIsDue ? "Unpaid" : "Upcoming";
 
       const subdata = {
         name: service?.name,
         platformID,
-        amount: totalAmount.toString(),
+        amount: billingAmount,
         price: planPrice.toString(),
         currency: service?.currency,
         dueDate,
-        status: "Unpaid",
+        status: billingStatus,
         description: service?.description,
         meta: { serviceKey: "billing", plan },
       };
@@ -9146,12 +9173,14 @@ class Controller {
 
       data.url = sanitizedUrl;
       const add = await this.db.createPlatform(data);
-      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
-        message: `Your ${plan} plan includes trial access. Pay KES ${totalAmount} before ${resolvedTrialEndsAt ? resolvedTrialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
-        status: "info",
-        actionLabel: "Pay Bill",
-        actionUrl: "/admin/bills",
-      });
+      if (billingIsDue) {
+        await this.db.upsertPlatformNotification(platformID, "Billing payment due", {
+          message: `Your ${plan} plan bill is due. Amount due: KES ${billingAmount}.`,
+          status: "warning",
+          actionLabel: "Pay Bill",
+          actionUrl: "/admin/bills",
+        });
+      }
       await this.refreshDashboardStats(platformID);
       const saltRounds = 10;
       const hashedPassword = await bcrypt.hash(password, saltRounds);
@@ -9166,6 +9195,27 @@ class Controller {
         name: adminName || name,
         token: adminToken,
       });
+      try {
+        const dashboardUrl = `https://${sanitizedUrl}/admin/login`;
+        const welcomeEmail = await this.mailer.EmailTemplate({
+          name: adminName || name,
+          type: "accounts",
+          email,
+          subject: "Account created!",
+          message: this.buildPlatformAdminWelcomeMessage({
+            platformName: name,
+            dashboardUrl,
+            adminEmail: email,
+            adminPhone: phone,
+            adminPassword: password,
+          }),
+        });
+        if (!welcomeEmail.success) {
+          console.warn(`[AddPlatform] Platform ${platformID} created but welcome email failed:`, welcomeEmail.message);
+        }
+      } catch (emailError) {
+        console.warn(`[AddPlatform] Platform ${platformID} created but welcome email failed:`, emailError?.message || emailError);
+      }
       this.notifyNewPlatformCreatedSilently(
         { name, url: sanitizedUrl, platformID },
         { phone, name: adminName || name, email }
@@ -9376,9 +9426,11 @@ class Controller {
         if (nextStatus === "deactivated") {
           billUpdate = {
             status: "Paused",
+            amount: "0",
             price: String(plan.price),
             currency: service.currency,
             period: service.period,
+            dueDate: null,
             description: service.description,
             meta: {
               ...meta,
@@ -9402,8 +9454,8 @@ class Controller {
               ? trialEndsAt
               : null;
           billUpdate = {
-            status: "Unpaid",
-            amount: String(Math.max(Number(bill?.amount || 0), plan.price)),
+            status: "Upcoming",
+            amount: "0",
             price: String(plan.price),
             currency: service.currency,
             period: service.period,
@@ -9584,15 +9636,22 @@ class Controller {
         dueDate = trialEndsAt;
         totalAmount = planPrice;
       }
+      const billingDueDate = dueDate ? new Date(dueDate) : null;
+      const billingIsDue =
+        billingDueDate &&
+        !Number.isNaN(billingDueDate.getTime()) &&
+        billingDueDate <= new Date();
+      const billingAmount = billingIsDue ? totalAmount.toString() : "0";
+      const billingStatus = billingIsDue ? "Unpaid" : "Upcoming";
 
       const billingdata = {
         name: service?.name,
         platformID,
-        amount: totalAmount.toString(),
+        amount: billingAmount,
         price: planPrice.toString(),
         currency: service?.currency,
         dueDate,
-        status: "Unpaid",
+        status: billingStatus,
         description: service?.description,
         meta: { serviceKey: "billing", plan },
       };
@@ -9610,16 +9669,25 @@ class Controller {
         { name, url: sanitizedUrl, platformID },
         { phone, name, email }
       );
-      await this.db.upsertPlatformNotification(platformID, "Trial payment due", {
-        message: `Your ${plan} plan includes 3 trial days. Pay KES ${totalAmount} before ${trialEndsAt ? trialEndsAt.toLocaleDateString() : "the due date"} to keep your platform active.`,
-        status: "info",
-        actionLabel: "Pay Bill",
-        actionUrl: "/admin/bills",
-      });
+      if (billingIsDue) {
+        await this.db.upsertPlatformNotification(platformID, "Billing payment due", {
+          message: `Your ${plan} plan bill is due. Amount due: KES ${billingAmount}.`,
+          status: "warning",
+          actionLabel: "Pay Bill",
+          actionUrl: "/admin/bills",
+        });
+      }
       await this.refreshDashboardStats(platformID);
 
       const subject = `Account created!`
-      const message = `Your platform ${name} has been created. Login to your Admin dashboard at https://${sanitizedUrl}/admin/login.`;
+      const dashboardUrl = `https://${sanitizedUrl}/admin/login`;
+      const message = this.buildPlatformAdminWelcomeMessage({
+        platformName: name,
+        dashboardUrl,
+        adminEmail: email,
+        adminPhone: phone,
+        adminPassword: password,
+      });
       const data = {
         name: name,
         type: "accounts",

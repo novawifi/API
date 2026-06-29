@@ -5772,6 +5772,7 @@ class DataBase {
                     OR: [
                         { title: "Platform disabled: payment required" },
                         { title: "Trial payment due" },
+                        { title: "Billing payment due" },
                         { title: "Dedicated server deleted for unpaid bill" },
                         { title: "Dedicated resource upgrade payment" },
                     ],
