@@ -7190,6 +7190,38 @@ class DataBase {
         }
     }
 
+    getReferralMinimumWithdrawalAmount() {
+        const configured = this.toReferralDecimal(process.env.REFERRAL_MIN_WITHDRAWAL_KES || "100");
+        return configured.gt(0) ? configured : new Prisma.Decimal(100);
+    }
+
+    getMpesaB2BCharge(amount) {
+        const value = Number(amount);
+        if (!Number.isFinite(value) || value <= 0) return 0;
+        const bands = [
+            [1, 49, 2],
+            [50, 100, 3],
+            [101, 500, 8],
+            [501, 1000, 13],
+            [1001, 1500, 18],
+            [1501, 2500, 25],
+            [2501, 3500, 30],
+            [3501, 5000, 39],
+            [5001, 7500, 48],
+            [7501, 10000, 54],
+            [10001, 15000, 63],
+            [15001, 20000, 68],
+            [20001, 25000, 74],
+            [25001, 30000, 79],
+            [30001, 35000, 90],
+            [35001, 40000, 106],
+            [40001, 45000, 110],
+            [45001, 50000000, 115],
+        ];
+        const band = bands.find(([min, max]) => value >= min && value <= max);
+        return band ? band[2] : 115;
+    }
+
     async generateUniqueReferralCode(name, email) {
         const baseSource = `${name || ""}${email || ""}`;
         const base = this.normalizeReferralCode(baseSource).slice(0, 8) || "NOVA";
@@ -7485,6 +7517,18 @@ class DataBase {
         if (!referralPartnerId || !data) return null;
         const amount = this.toReferralDecimal(data.amount);
         if (amount.lte(0)) throw new Error("Invalid withdrawal amount.");
+        const minimumAmount = this.getReferralMinimumWithdrawalAmount();
+        if (amount.lt(minimumAmount)) {
+            throw new Error(`Minimum referral withdrawal is KES ${minimumAmount.toFixed(0)}.`);
+        }
+        const charges = data.charges !== undefined
+            ? this.toReferralDecimal(data.charges)
+            : this.toReferralDecimal(this.getMpesaB2BCharge(amount.toNumber()));
+        const netAmount = data.netAmount !== undefined
+            ? this.toReferralDecimal(data.netAmount)
+            : amount.minus(charges).toDecimalPlaces(2);
+        if (charges.lt(0)) throw new Error("Invalid withdrawal fee.");
+        if (netAmount.lte(0)) throw new Error("Withdrawal amount is too small after M-PESA fees.");
         const destinationType = String(data.destinationType || "").trim().toLowerCase();
         if (!["till", "paybill"].includes(destinationType)) {
             throw new Error("Withdrawal destination must be Till or Paybill.");
@@ -7514,6 +7558,8 @@ class DataBase {
                     data: {
                         referralPartnerId,
                         amount,
+                        charges,
+                        netAmount,
                         destinationType,
                         shortCode,
                         accountNumber: destinationType === "paybill" ? accountNumber : null,

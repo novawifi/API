@@ -663,7 +663,7 @@ class Controller {
       process.env.REFERRAL_PORTAL_URL ||
       process.env.LANDING_URL ||
       process.env.NEXT_PUBLIC_LANDING_URL ||
-      this.getClientBaseUrl()
+      "https://novawifi.co.ke"
     ).replace(/\/+$/, "");
   }
 
@@ -710,21 +710,55 @@ class Controller {
   }
 
   getReferralProgramCopy() {
+    const minimumWithdrawal = Number(this.db.getReferralMinimumWithdrawalAmount?.().toFixed?.(0) || 100);
     return {
       commissionRate: Number(process.env.REFERRAL_COMMISSION_RATE || 0.2),
+      minimumWithdrawal,
       headline: "Earn 20% monthly for every ISP you refer to Nova WiFi.",
       description: "Share Nova WiFi with ISP owners. When a referred platform activates and pays its monthly package, your referral account earns 20% of that monthly package payment.",
+      withdrawalDescription: `Minimum withdrawal is KES ${minimumWithdrawal}. M-PESA B2B transfer fees are deducted before payout.`,
       seoTitle: "Nova WiFi Referral Program for ISPs | Earn Monthly Recurring Rewards",
       seoDescription: "Join the Nova WiFi ISP referral program and earn 20% monthly recurring rewards from referred ISP platforms that activate and pay their subscription.",
     };
+  }
+
+  formatReferralKes(value) {
+    const amount = Number(value || 0);
+    if (!Number.isFinite(amount)) return "KES 0.00";
+    return `KES ${amount.toLocaleString("en-KE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  async sendReferralWithdrawalEmail(referrer, withdrawal) {
+    if (!referrer?.email || !withdrawal) return { success: false, message: "Referral email not available." };
+    const destinationType = String(withdrawal.destinationType || "").toUpperCase();
+    const destination = withdrawal.accountNumber
+      ? `${destinationType} ${withdrawal.shortCode}, Account ${withdrawal.accountNumber}`
+      : `${destinationType} ${withdrawal.shortCode}`;
+    const message = [
+      "Your referral withdrawal request has been received.",
+      "",
+      `Requested amount: ${this.formatReferralKes(withdrawal.amount)}`,
+      `M-PESA transfer fee: ${this.formatReferralKes(withdrawal.charges)}`,
+      `Amount to be sent: ${this.formatReferralKes(withdrawal.netAmount)}`,
+      `Destination: ${destination}`,
+      "",
+      "The request is pending review. You will be notified after processing.",
+    ].join("\n");
+
+    return this.mailer.EmailTemplate({
+      name: referrer.name || referrer.email,
+      type: "accounts",
+      email: referrer.email,
+      subject: "Referral withdrawal request received",
+      message,
+      company: "NOVA NETCORE SYSTEMS",
+    });
   }
 
   async sendReferralVerificationEmail(referrer, verificationToken) {
     const verifyUrl = `${this.getServerBaseUrl()}/req/referrals/verify?token=${encodeURIComponent(verificationToken)}`;
     const loginUrl = `${this.getReferralPortalBaseUrl()}/referrals`;
     const message = [
-      `Hello ${referrer.name || "there"},`,
-      "",
       "Verify your email to activate your Nova WiFi Referral Program account.",
       "",
       `Verify Email: ${verifyUrl}`,
@@ -1880,18 +1914,33 @@ class Controller {
     const session = await this.authReferralSession(req.body?.token);
     if (!session.success) return res.status(401).json(session);
     try {
+      const grossAmount = Number(req.body?.amount || 0);
+      const charges = this.db.getMpesaB2BCharge(grossAmount);
+      const netAmount = grossAmount - charges;
       const withdrawal = await this.db.createReferralWithdrawalRequest(session.referrer.id, {
         amount: req.body?.amount,
+        charges,
+        netAmount,
         destinationType: req.body?.destinationType,
         shortCode: req.body?.shortCode,
         accountNumber: req.body?.accountNumber,
       });
+      let emailWarning = null;
+      try {
+        const emailResult = await this.sendReferralWithdrawalEmail(session.referrer, withdrawal);
+        if (!emailResult?.success) {
+          emailWarning = emailResult?.message || "Withdrawal email could not be sent.";
+        }
+      } catch (emailError) {
+        emailWarning = emailError?.message || "Withdrawal email could not be sent.";
+      }
       const dashboard = await this.db.getReferralDashboard(session.referrer.id);
       return res.json({
         success: true,
-        message: "Withdrawal request submitted for review.",
+        message: `Withdrawal request submitted. ${this.formatReferralKes(withdrawal.netAmount)} will be sent after M-PESA fees.`,
         withdrawal,
         dashboard: this.buildReferralDashboardPayload(dashboard),
+        emailWarning,
       });
     } catch (error) {
       return res.status(400).json({ success: false, message: error?.message || "Failed to submit withdrawal request." });

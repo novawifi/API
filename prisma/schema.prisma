@@ -251,6 +251,8 @@ model ReferralWithdrawal {
   id                String    @id @default(uuid())
   referralPartnerId String
   amount            Decimal   @default(0.00) @db.Decimal(14, 2)
+  charges           Decimal   @default(0.00) @db.Decimal(14, 2)
+  netAmount         Decimal   @default(0.00) @db.Decimal(14, 2)
   destinationType   String
   shortCode         String
   accountNumber     String?
