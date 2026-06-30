@@ -64,7 +64,7 @@ class MpesaController {
         if (!platformID) return false;
         const platform = await this.db.getPlatformByplatformID(platformID);
         const status = String(platform?.status || "").trim().toLowerCase();
-        return status === "deactivated" || status === "paused";
+        return status === "deactivated" || status === "paused" || status === "pending_verification";
     }
 
     getNextBillDueDate(bill, baseDate = new Date(), periods = 1) {

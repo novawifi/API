@@ -125,6 +125,35 @@ class Socket {
             .filter(Boolean);
     };
 
+    async emitSupportAlert(thread, message, senderName = "") {
+        try {
+            if (!this.io || !thread?.platformID || !thread?.id || !message?.id) return;
+            if (thread.type !== "live" || thread.channel !== "public") return;
+            if (String(message.senderRole || "").toLowerCase() !== "customer") return;
+
+            const plugin = await this.db.getPlatformPlugin(thread.platformID, "live-support");
+            if (!plugin || (plugin.status && plugin.status !== "active")) return;
+
+            const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+            this.emitToRoom(`support-alerts-${thread.platformID}`, "support:alert", {
+                platformID: thread.platformID,
+                threadId: thread.id,
+                messageId: message.id,
+                type: thread.type,
+                channel: thread.channel,
+                status: thread.status,
+                subject: thread.subject,
+                senderRole: message.senderRole,
+                senderName: senderName || thread.subject || "Customer",
+                body: message.body,
+                createdAt: message.createdAt,
+                hasAttachments: attachments.length > 0,
+            });
+        } catch (error) {
+            console.error("Error emitting live support alert:", error?.message || error);
+        }
+    };
+
     async emitCachedDashboardStats(socket) {
         const platformID = socket?.user?.platformID;
         if (!platformID) return;
@@ -184,6 +213,7 @@ class Socket {
                         if (platformData) {
                             const platformRoom = `platform-${platformData.platformID}`;
                             socket.join(platformRoom);
+                            socket.join(`support-alerts-${platformData.platformID}`);
                             console.log(
                                 `User ${socket.user.id} joined secure room platform-${platformData.platformID}`
                             );
@@ -346,6 +376,18 @@ class Socket {
                             this.supportPlatformSubscribers.delete(platformID);
                         }
                     }
+                });
+
+                socket.on("support:alerts:join", () => {
+                    const platformID = socket.user?.platformID;
+                    if (!platformID) return;
+                    socket.join(`support-alerts-${platformID}`);
+                });
+
+                socket.on("support:alerts:leave", () => {
+                    const platformID = socket.user?.platformID;
+                    if (!platformID) return;
+                    socket.leave(`support-alerts-${platformID}`);
                 });
 
                 socket.on("support:public:join", async (data) => {
@@ -549,6 +591,7 @@ class Socket {
                         threadId,
                         message: { ...message, senderName: thread.subject || "Customer" },
                     });
+                    await this.emitSupportAlert(thread, message, thread.subject || "Customer");
                 });
 
 

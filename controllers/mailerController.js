@@ -283,9 +283,31 @@ class Mailer {
                 html: emailHtml,
             });
 
+            const accepted = Array.isArray(sendmail?.accepted) ? sendmail.accepted : [];
+            const rejected = Array.isArray(sendmail?.rejected) ? sendmail.rejected : [];
+            const pending = Array.isArray(sendmail?.pending) ? sendmail.pending : [];
+            if (rejected.length > 0 || accepted.length === 0) {
+                return {
+                    success: false,
+                    message: rejected.length > 0
+                        ? `Email rejected by SMTP for: ${rejected.join(", ")}`
+                        : "SMTP did not accept any recipient.",
+                    accepted,
+                    rejected,
+                    pending,
+                    messageId: sendmail?.messageId || null,
+                    response: sendmail?.response || null,
+                };
+            }
+
             return {
                 success: true,
                 message: "Email sent successfully!",
+                accepted,
+                rejected,
+                pending,
+                messageId: sendmail?.messageId || null,
+                response: sendmail?.response || null,
             };
 
         } catch (error) {
@@ -304,15 +326,32 @@ class Mailer {
         }
         const settings = await this.db.getSettings();
         const brandName = company || settings?.name || "Nova WiFi";
-        const supportFrom = process.env.INTERNAL_EMAIL_FROM || `${brandName} <support@novawifi.co.ke>`;
-        return this.sendEmail({
-            from: supportFrom,
-            to,
-            subject,
-            message,
-            name,
-            company: brandName
-        });
+      const emailfrominfo = `${brandName} <info@novawifi.co.ke>`;
+      const emailfromaccounts = `${brandName} <accounts@novawifi.co.ke>`;
+      const emailfromsupport = process.env.INTERNAL_EMAIL_FROM || `${brandName} <support@novawifi.co.ke>`;
+
+      // allow caller to override sender via data.from (full "Name <email@...>")
+      // or pick via data.fromType: 'info' | 'accounts' | 'support'
+      const { fromType, from: fromOverride } = data || {};
+      let selectedFrom = emailfromsupport;
+      if (fromOverride && String(fromOverride).trim()) {
+        selectedFrom = String(fromOverride).trim();
+      } else if (fromType === "info") {
+        selectedFrom = emailfrominfo;
+      } else if (fromType === "accounts") {
+        selectedFrom = emailfromaccounts;
+      } else {
+        selectedFrom = emailfromsupport;
+      }
+
+      return this.sendEmail({
+        from: selectedFrom,
+        to,
+        subject,
+        message,
+        name,
+        company: brandName
+      });
     }
 
     async sendMail(res, req) {

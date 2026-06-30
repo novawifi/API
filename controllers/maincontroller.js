@@ -67,14 +67,26 @@ class Controller {
     });
   }
 
-  buildPlatformAdminWelcomeMessage({ platformName, dashboardUrl, adminEmail, adminPhone, adminPassword }) {
+  buildPlatformAdminWelcomeMessage({ platformName, dashboardUrl, adminEmail, adminPhone, adminPassword, verificationUrl }) {
     const lines = [
       `Your platform ${platformName || "platform"} has been created.`,
-      `Open Dashboard: ${dashboardUrl}`,
+    ];
+
+    if (verificationUrl) {
+      lines.push("Verify your email to activate the platform:");
+      lines.push(verificationUrl);
+      lines.push("");
+      lines.push("After verification, open your dashboard:");
+      lines.push(dashboardUrl);
+    } else {
+      lines.push(`Open Dashboard: ${dashboardUrl}`);
+    }
+
+    lines.push(
       "",
       "Admin login credentials:",
       `Email: ${adminEmail || "N/A"}`,
-    ];
+    );
 
     if (adminPhone) {
       lines.push(`Phone: ${adminPhone}`);
@@ -82,9 +94,77 @@ class Controller {
 
     lines.push(`Password: ${adminPassword || "N/A"}`);
     lines.push("");
-    lines.push("Please change this password after logging in.");
+    lines.push(
+      verificationUrl
+        ? "For security, the dashboard remains locked until this email is verified."
+        : "Please change this password after logging in."
+    );
 
     return lines.join("\n");
+  }
+
+  getPlatformEmailVerificationBaseUrl() {
+    return (
+      process.env.SERVER_URL ||
+      process.env.NEXT_PUBLIC_SERVER_URL ||
+      "https://api.novawifi.co.ke"
+    ).replace(/\/+$/, "");
+  }
+
+  hashPlatformVerificationToken(token) {
+    return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+  }
+
+  createPlatformEmailVerificationToken({ platformID, adminId, email, adminToken }) {
+    return jwt.sign(
+      {
+        type: "platform-email-verification",
+        platformID,
+        adminId,
+        email: String(email || "").trim().toLowerCase(),
+        tokenHash: this.hashPlatformVerificationToken(adminToken),
+      },
+      this.JWT_SECRET,
+      { expiresIn: "48h" }
+    );
+  }
+
+  buildPlatformEmailVerificationUrl(payload) {
+    const token = this.createPlatformEmailVerificationToken(payload);
+    return `${this.getPlatformEmailVerificationBaseUrl()}/req/verify-platform-email?token=${encodeURIComponent(token)}`;
+  }
+
+  sendPlatformVerificationPage(res, { success, title, message, redirectUrl }) {
+    const escapeHtml = (value) =>
+      String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    const safeRedirectUrl = redirectUrl ? escapeHtml(redirectUrl) : "";
+    return res.status(success ? 200 : 400).send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  ${safeRedirectUrl ? `<meta http-equiv="refresh" content="4;url=${safeRedirectUrl}" />` : ""}
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: Arial, sans-serif; background: #f7fafc; color: #102033; }
+    main { width: min(92vw, 520px); background: #fff; border: 1px solid #e5edf5; border-radius: 12px; padding: 28px; box-shadow: 0 18px 50px rgba(15, 23, 42, .08); }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    p { margin: 0 0 18px; line-height: 1.6; color: #46566a; }
+    a { display: inline-block; padding: 12px 16px; border-radius: 8px; background: #0ea5e9; color: #fff; text-decoration: none; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+    ${safeRedirectUrl ? `<a href="${safeRedirectUrl}">Open Dashboard</a>` : ""}
+  </main>
+</body>
+</html>`);
   }
 
   logPlatform(platformID, message, meta = {}) {
@@ -257,10 +337,14 @@ class Controller {
     return status === "deactivated" || status === "paused";
   }
 
+  isPlatformPendingVerification(platform) {
+    return String(platform?.status || "").trim().toLowerCase() === "pending_verification";
+  }
+
   async isPlatformOperationsLocked(platformID) {
     if (!platformID) return false;
     const platform = await this.db.getPlatformByplatformID(platformID);
-    return this.isPlatformBillingPaused(platform);
+    return this.isPlatformBillingPaused(platform) || this.isPlatformPendingVerification(platform);
   }
 
   addDays(date, days) {
@@ -2334,6 +2418,91 @@ class Controller {
     }
   }
 
+  async sendPlatformNotification(req, res) {
+    const {
+      token,
+      title,
+      message,
+      status = "info",
+      actionLabel,
+      actionUrl,
+      expiresAt,
+      targetAll = false,
+      platformIDs = [],
+    } = req.body || {};
+
+    const cleanTitle = String(title || "").trim();
+    const cleanMessage = String(message || "").trim();
+    if (!token || !cleanTitle || !cleanMessage) {
+      return res.json({ success: false, message: "Missing credentials required!" });
+    }
+
+    try {
+      const session = await this.authManagerSession(token);
+      if (!session.success) {
+        return res.json({ success: false, message: session.message });
+      }
+
+      const allowedStatuses = new Set(["info", "success", "warning", "error"]);
+      const cleanStatus = allowedStatuses.has(String(status).toLowerCase())
+        ? String(status).toLowerCase()
+        : "info";
+      const cleanActionLabel = String(actionLabel || "").trim();
+      const cleanActionUrl = String(actionUrl || "").trim();
+      const expiresDate = expiresAt ? new Date(expiresAt) : null;
+      if (expiresAt && Number.isNaN(expiresDate.getTime())) {
+        return res.json({ success: false, message: "Invalid expiry date." });
+      }
+
+      const platforms = await this.db.getAllPlatforms();
+      const allPlatformIDs = new Set((platforms || []).map((platform) => platform.platformID).filter(Boolean));
+      const requestedIDs = Array.isArray(platformIDs)
+        ? platformIDs.map((id) => String(id).trim()).filter(Boolean)
+        : String(platformIDs || "").split(",").map((id) => id.trim()).filter(Boolean);
+      const targetIDs = targetAll
+        ? [...allPlatformIDs]
+        : [...new Set(requestedIDs)].filter((platformID) => allPlatformIDs.has(platformID));
+
+      if (targetIDs.length === 0) {
+        return res.json({ success: false, message: "Select at least one platform." });
+      }
+
+      let sent = 0;
+      const failed = [];
+      for (const platformID of targetIDs) {
+        try {
+          await this.db.upsertPlatformNotification(platformID, cleanTitle, {
+            message: cleanMessage,
+            status: cleanStatus,
+            actionLabel: cleanActionLabel || null,
+            actionUrl: cleanActionUrl || null,
+            expiresAt: expiresDate,
+          });
+          sent += 1;
+        } catch (error) {
+          failed.push({ platformID, reason: error?.message || "Failed to create notification" });
+        }
+      }
+
+      return res.json({
+        success: sent > 0,
+        message: sent > 0
+          ? `Notification published to ${sent} platform${sent === 1 ? "" : "s"}.`
+          : "Failed to publish notification.",
+        summary: {
+          target: targetAll ? "all" : "selected",
+          requested: targetIDs.length,
+          sent,
+          failed: failed.length,
+        },
+        failed,
+      });
+    } catch (error) {
+      console.error("Error sending platform notification:", error);
+      return res.status(500).json({ success: false, message: "Internal server error." });
+    }
+  }
+
   async authAdmin(req, res) {
 
     try {
@@ -3300,7 +3469,11 @@ class Controller {
       if (cached) {
         return res.json(cached);
       }
-      const admins = await this.db.getAdminsWithPlatforms();
+      const admins = (await this.db.getAdminsWithPlatforms()).sort((a, b) => {
+        const bTime = new Date(b.createdAt || b.updatedAt || 0).getTime();
+        const aTime = new Date(a.createdAt || a.updatedAt || 0).getTime();
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+      });
       const response = {
         success: true,
         message: "Admins fetched!",
@@ -12894,7 +13067,7 @@ class Controller {
   }
 
   async sendInternalEmail(req, res) {
-    const { token, subject, message, emails } = req.body || {};
+    const { token, subject, message, emails, fromType, from } = req.body || {};
     if (!token || !subject || !message || !emails) {
       return res.json({ success: false, message: "Missing credentials required!" });
     }
@@ -12920,6 +13093,7 @@ class Controller {
 
       const success = [];
       const failed = [];
+      const deliveryInfo = [];
 
       for (const email of recipients) {
         if (!email.includes("@")) {
@@ -12931,11 +13105,25 @@ class Controller {
           subject,
           message,
           name: email,
+          fromType: fromType || null,
+          from: from || null,
         });
         if (result?.success) {
           success.push(email);
+          deliveryInfo.push({
+            email,
+            messageId: result.messageId || null,
+            response: result.response || null,
+            accepted: result.accepted || [],
+            pending: result.pending || [],
+          });
         } else {
-          failed.push({ email, reason: result?.message || "Failed to send" });
+          failed.push({
+            email,
+            reason: result?.message || "Failed to send",
+            rejected: result?.rejected || [],
+            response: result?.response || null,
+          });
         }
       }
 
@@ -12949,7 +13137,8 @@ class Controller {
           failed: failed.length
         },
         sentEmails: success,
-        failedEmails: failed
+        failedEmails: failed,
+        deliveryInfo
       });
     } catch (error) {
       console.error("Error sending internal email:", error);

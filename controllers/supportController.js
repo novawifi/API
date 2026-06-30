@@ -83,6 +83,15 @@ class SupportController {
         return { ...thread, messages };
     }
 
+    async emitSupportAlert(thread, message, senderName = "") {
+        try {
+            const { socketManager } = require("./socketController");
+            await socketManager.emitSupportAlert(thread, message, senderName);
+        } catch {
+            // Live support alerts are best-effort and must not block chat delivery.
+        }
+    }
+
     getToken(req) {
         const header = req.headers.authorization || "";
         if (header.startsWith("Bearer ")) {
@@ -451,6 +460,7 @@ class SupportController {
 
         const enrichedThread = await this.enrichThread(thread);
         const senderName = await this.resolveSenderName(msg, thread);
+        await this.emitSupportAlert(thread, msg, senderName);
         return res.status(201).json({ success: true, thread: enrichedThread, message: { ...msg, senderName } });
     }
 
@@ -527,6 +537,7 @@ class SupportController {
             this.cache.delPrefix(`support:live:${thread.platformID}:`);
             this.cache.delPrefix("support:live:all:");
             const senderName = await this.resolveSenderName(newMsg, newThread);
+            await this.emitSupportAlert(newThread, newMsg, senderName);
             return res.status(201).json({ success: true, thread: newThread, message: { ...newMsg, senderName } });
         }
 
@@ -545,6 +556,7 @@ class SupportController {
         this.cache.delPrefix("support:live:all:");
 
         const senderName = await this.resolveSenderName(msg, thread);
+        await this.emitSupportAlert(thread, msg, senderName);
         return res.status(201).json({ success: true, message: { ...msg, senderName } });
     }
 }

@@ -245,6 +245,7 @@ router.post("/fetchPlatformSettings", use("fetchPlatformSettings"))
 router.post("/fetchPlatform", use("fetchPlatform"))
 router.post("/notifications", use("fetchPlatformNotifications"));
 router.post("/notifications/dismiss", use("dismissPlatformNotification"));
+router.post("/sendPlatformNotification", use("sendPlatformNotification"));
 router.post("/updateAccountPlan", use("updateAccountPlan"));
 router.post("/updatePlatformActivity", use("updatePlatformActivity"));
 router.post("/updatePlatformSettings", use("updateManagerSettings"))
