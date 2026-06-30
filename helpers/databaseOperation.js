@@ -14,6 +14,13 @@ const offsetDate = new Date(
     now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
 );
 
+const isLikelyMpesaReceiptCode = (value) => {
+    const text = String(value || "").trim().toUpperCase();
+    if (!text || text === "NULL" || text === "UNDEFINED") return false;
+    if (/^ws_CO_/i.test(text) || text.startsWith("NOVA-")) return false;
+    return /^[A-Z0-9]{10,12}$/.test(text) && /[A-Z]/.test(text) && /\d/.test(text);
+};
+
 class DataBase {
     constructor() {
         this.timestamp = offsetDate;
@@ -1380,25 +1387,42 @@ class DataBase {
 
     async findPendingStkPayments({ minCreatedAt, dueAt, batchSize }) {
         const now = dueAt || new Date();
-        return prisma.mpesa.findMany({
+        const rows = await prisma.mpesa.findMany({
             where: {
                 status: { in: ["PENDING", "PROCESSING", "MANUAL_REVIEW"] },
-                checkoutRequestId: { not: null },
                 createdAt: { lte: minCreatedAt },
-                OR: [
-                    { nextReconciliationAt: null },
-                    { nextReconciliationAt: { lte: now } },
+                AND: [
+                    {
+                        OR: [
+                            { nextReconciliationAt: null },
+                            { nextReconciliationAt: { lte: now } },
+                        ],
+                    },
+                    {
+                        OR: [
+                            { reconciliationLeaseUntil: null },
+                            { reconciliationLeaseUntil: { lt: now } },
+                        ],
+                    },
+                    {
+                        OR: [
+                            { checkoutRequestId: { not: null } },
+                            { mpesaReceiptNumber: { not: null } },
+                            { NOT: { code: { startsWith: "ws_CO_" } } },
+                        ],
+                    },
                 ],
-                AND: [{
-                    OR: [
-                        { reconciliationLeaseUntil: null },
-                        { reconciliationLeaseUntil: { lt: now } },
-                    ],
-                }],
             },
             orderBy: { createdAt: "asc" },
-            take: batchSize,
+            take: Math.max(batchSize * 3, batchSize),
         });
+        return rows
+            .filter((payment) =>
+                payment.checkoutRequestId ||
+                isLikelyMpesaReceiptCode(payment.mpesaReceiptNumber) ||
+                isLikelyMpesaReceiptCode(payment.code)
+            )
+            .slice(0, batchSize);
     }
 
     async getMpesaManualReviewSummary() {
@@ -7148,6 +7172,458 @@ class DataBase {
             });
         } catch (error) {
             console.error("Error fetching last bill payment by amounts:", error);
+            throw error;
+        }
+    }
+
+    normalizeReferralCode(code) {
+        return String(code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    }
+
+    toReferralDecimal(value, places = 2) {
+        try {
+            const decimal = new Prisma.Decimal(value || 0);
+            if (!decimal.isFinite()) return new Prisma.Decimal(0);
+            return decimal.toDecimalPlaces(places);
+        } catch (_error) {
+            return new Prisma.Decimal(0);
+        }
+    }
+
+    async generateUniqueReferralCode(name, email) {
+        const baseSource = `${name || ""}${email || ""}`;
+        const base = this.normalizeReferralCode(baseSource).slice(0, 8) || "NOVA";
+        for (let i = 0; i < 12; i++) {
+            const random = Math.random().toString(36).slice(2, 6).toUpperCase();
+            const code = `${base}${random}`.slice(0, 12);
+            const existing = await this.getReferralPartnerByCode(code);
+            if (!existing) return code;
+        }
+        return `NOVA${Date.now().toString(36).toUpperCase()}`.slice(0, 12);
+    }
+
+    async getReferralPartnerByEmail(email) {
+        if (!email) return null;
+        try {
+            return await prisma.referralPartner.findUnique({
+                where: { email: String(email).trim().toLowerCase() },
+            });
+        } catch (error) {
+            console.error("Error fetching referral partner by email:", error);
+            throw error;
+        }
+    }
+
+    async getReferralPartnerByPhone(phone) {
+        if (!phone) return null;
+        try {
+            return await prisma.referralPartner.findUnique({
+                where: { phone: String(phone).trim() },
+            });
+        } catch (error) {
+            console.error("Error fetching referral partner by phone:", error);
+            throw error;
+        }
+    }
+
+    async getReferralPartnerByCode(code) {
+        const referralCode = this.normalizeReferralCode(code);
+        if (!referralCode) return null;
+        try {
+            return await prisma.referralPartner.findUnique({
+                where: { referralCode },
+            });
+        } catch (error) {
+            console.error("Error fetching referral partner by code:", error);
+            throw error;
+        }
+    }
+
+    async getReferralPartnerByToken(token) {
+        if (!token) return null;
+        try {
+            return await prisma.referralPartner.findUnique({
+                where: { token: String(token).trim() },
+            });
+        } catch (error) {
+            console.error("Error fetching referral partner by token:", error);
+            throw error;
+        }
+    }
+
+    async getReferralPartnerByVerificationHash(hash) {
+        if (!hash) return null;
+        try {
+            return await prisma.referralPartner.findUnique({
+                where: { emailVerificationTokenHash: hash },
+            });
+        } catch (error) {
+            console.error("Error fetching referral partner by verification hash:", error);
+            throw error;
+        }
+    }
+
+    async createReferralPartner(data) {
+        if (!data) return null;
+        try {
+            return await prisma.referralPartner.create({
+                data: this.stripUnsupportedModelFields("ReferralPartner", data),
+            });
+        } catch (error) {
+            console.error("Error creating referral partner:", error);
+            throw error;
+        }
+    }
+
+    async updateReferralPartner(id, data) {
+        if (!id || !data) return null;
+        try {
+            return await prisma.referralPartner.update({
+                where: { id },
+                data: this.stripUnsupportedModelFields("ReferralPartner", data),
+            });
+        } catch (error) {
+            console.error("Error updating referral partner:", error);
+            throw error;
+        }
+    }
+
+    async getReferralAttributionByPlatform(platformID) {
+        if (!platformID) return null;
+        try {
+            return await prisma.referralAttribution.findUnique({
+                where: { platformID: String(platformID) },
+            });
+        } catch (error) {
+            console.error("Error fetching referral attribution:", error);
+            throw error;
+        }
+    }
+
+    async attachReferralToPlatform({ referralCode, platformID, platformName, adminEmail, subscriptionPlan }) {
+        const cleanCode = this.normalizeReferralCode(referralCode);
+        if (!cleanCode || !platformID) {
+            return { attached: false, reason: "missing_referral_code" };
+        }
+        try {
+            const existing = await prisma.referralAttribution.findUnique({
+                where: { platformID: String(platformID) },
+            });
+            if (existing) return { attached: false, duplicate: true, attribution: existing };
+
+            const partner = await prisma.referralPartner.findUnique({
+                where: { referralCode: cleanCode },
+            });
+            if (!partner) return { attached: false, reason: "referrer_not_found" };
+            if (!partner.emailVerified || partner.status !== "active") {
+                return { attached: false, reason: "referrer_not_active" };
+            }
+
+            const attribution = await prisma.referralAttribution.create({
+                data: {
+                    referralPartnerId: partner.id,
+                    platformID: String(platformID),
+                    platformName: platformName ? String(platformName) : null,
+                    adminEmail: adminEmail ? String(adminEmail).trim().toLowerCase() : null,
+                    subscriptionPlan: subscriptionPlan ? String(subscriptionPlan) : null,
+                    referralCode: partner.referralCode,
+                    status: "pending",
+                },
+            });
+            return { attached: true, attribution, referrer: partner };
+        } catch (error) {
+            console.error("Error attaching referral to platform:", error);
+            throw error;
+        }
+    }
+
+    async creditReferralCommissionForBillingPayment({ platformID, billID, sourceKey, sourcePaymentId, sourceAmount, currency, paidAt, description }) {
+        if (!platformID || !sourceKey) return { credited: false, reason: "missing_source" };
+
+        const sourceAmountDecimal = this.toReferralDecimal(sourceAmount);
+        if (sourceAmountDecimal.lte(0)) return { credited: false, reason: "invalid_amount" };
+
+        const configuredRate = process.env.REFERRAL_COMMISSION_RATE || "0.20";
+        const rate = this.toReferralDecimal(configuredRate, 4);
+        if (rate.lte(0)) return { credited: false, reason: "invalid_rate" };
+
+        const commissionAmount = sourceAmountDecimal.mul(rate).toDecimalPlaces(2);
+        if (commissionAmount.lte(0)) return { credited: false, reason: "zero_commission" };
+
+        const paidAtDate = paidAt ? new Date(paidAt) : new Date();
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const existing = await tx.referralCommission.findUnique({
+                    where: { sourceKey: String(sourceKey) },
+                });
+                if (existing) return { credited: false, duplicate: true, commission: existing };
+
+                const attribution = await tx.referralAttribution.findUnique({
+                    where: { platformID: String(platformID) },
+                });
+                if (!attribution) return { credited: false, reason: "no_referral_attribution" };
+
+                const partner = await tx.referralPartner.findUnique({
+                    where: { id: attribution.referralPartnerId },
+                });
+                if (!partner) return { credited: false, reason: "referrer_not_found" };
+                if (!partner.emailVerified || partner.status !== "active") {
+                    return { credited: false, reason: "referrer_not_active" };
+                }
+
+                const commission = await tx.referralCommission.create({
+                    data: {
+                        referralPartnerId: partner.id,
+                        attributionId: attribution.id,
+                        platformID: String(platformID),
+                        billID: billID ? String(billID) : null,
+                        sourceKey: String(sourceKey),
+                        sourcePaymentId: sourcePaymentId ? String(sourcePaymentId) : null,
+                        sourceAmount: sourceAmountDecimal,
+                        amount: commissionAmount,
+                        rate,
+                        currency: currency || "KES",
+                        status: "credited",
+                        description: description || "Monthly platform subscription referral reward",
+                        paidAt: Number.isNaN(paidAtDate.getTime()) ? new Date() : paidAtDate,
+                    },
+                });
+
+                await tx.referralPartner.update({
+                    where: { id: partner.id },
+                    data: {
+                        balance: { increment: commissionAmount },
+                        lifetimeEarnings: { increment: commissionAmount },
+                    },
+                });
+
+                await tx.referralAttribution.update({
+                    where: { id: attribution.id },
+                    data: {
+                        status: "active",
+                        activatedAt: attribution.activatedAt || (Number.isNaN(paidAtDate.getTime()) ? new Date() : paidAtDate),
+                        lastCommissionAt: Number.isNaN(paidAtDate.getTime()) ? new Date() : paidAtDate,
+                    },
+                });
+
+                return { credited: true, commission };
+            });
+        } catch (error) {
+            if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+                const existing = await prisma.referralCommission.findUnique({
+                    where: { sourceKey: String(sourceKey) },
+                });
+                return { credited: false, duplicate: true, commission: existing };
+            }
+            console.error("Error crediting referral commission:", error);
+            throw error;
+        }
+    }
+
+    async getReferralDashboard(referralPartnerId) {
+        if (!referralPartnerId) return null;
+        try {
+            const monthStart = startOfMonth(new Date());
+            const monthEnd = endOfMonth(new Date());
+            const [
+                partner,
+                referrals,
+                commissions,
+                withdrawals,
+                totalReferrals,
+                activeReferrals,
+                currentMonthEarnings,
+            ] = await Promise.all([
+                prisma.referralPartner.findUnique({ where: { id: referralPartnerId } }),
+                prisma.referralAttribution.findMany({
+                    where: { referralPartnerId },
+                    orderBy: { createdAt: "desc" },
+                    take: 100,
+                }),
+                prisma.referralCommission.findMany({
+                    where: { referralPartnerId },
+                    orderBy: { createdAt: "desc" },
+                    take: 100,
+                }),
+                prisma.referralWithdrawal.findMany({
+                    where: { referralPartnerId },
+                    orderBy: { requestedAt: "desc" },
+                    take: 100,
+                }),
+                prisma.referralAttribution.count({ where: { referralPartnerId } }),
+                prisma.referralAttribution.count({ where: { referralPartnerId, status: "active" } }),
+                prisma.referralCommission.aggregate({
+                    where: {
+                        referralPartnerId,
+                        status: "credited",
+                        paidAt: { gte: monthStart, lte: monthEnd },
+                    },
+                    _sum: { amount: true },
+                }),
+            ]);
+            if (!partner) return null;
+            return {
+                partner,
+                referrals,
+                commissions,
+                withdrawals,
+                stats: {
+                    totalReferrals,
+                    activeReferrals,
+                    pendingReferrals: Math.max(0, totalReferrals - activeReferrals),
+                    currentMonthEarnings: currentMonthEarnings?._sum?.amount || new Prisma.Decimal(0),
+                    commissionRate: process.env.REFERRAL_COMMISSION_RATE || "0.20",
+                },
+            };
+        } catch (error) {
+            console.error("Error fetching referral dashboard:", error);
+            throw error;
+        }
+    }
+
+    async createReferralWithdrawalRequest(referralPartnerId, data) {
+        if (!referralPartnerId || !data) return null;
+        const amount = this.toReferralDecimal(data.amount);
+        if (amount.lte(0)) throw new Error("Invalid withdrawal amount.");
+        const destinationType = String(data.destinationType || "").trim().toLowerCase();
+        if (!["till", "paybill"].includes(destinationType)) {
+            throw new Error("Withdrawal destination must be Till or Paybill.");
+        }
+        const shortCode = String(data.shortCode || "").trim();
+        if (!/^\d{5,8}$/.test(shortCode)) {
+            throw new Error("Enter a valid Till or Paybill number.");
+        }
+        const accountNumber = String(data.accountNumber || "").trim();
+        if (destinationType === "paybill" && !accountNumber) {
+            throw new Error("Paybill withdrawals require an account number.");
+        }
+
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const partner = await tx.referralPartner.findUnique({
+                    where: { id: referralPartnerId },
+                });
+                if (!partner || !partner.emailVerified || partner.status !== "active") {
+                    throw new Error("Referral account is not active.");
+                }
+                if (new Prisma.Decimal(partner.balance || 0).lt(amount)) {
+                    throw new Error("Insufficient referral balance.");
+                }
+
+                const withdrawal = await tx.referralWithdrawal.create({
+                    data: {
+                        referralPartnerId,
+                        amount,
+                        destinationType,
+                        shortCode,
+                        accountNumber: destinationType === "paybill" ? accountNumber : null,
+                        status: "pending",
+                    },
+                });
+                await tx.referralPartner.update({
+                    where: { id: referralPartnerId },
+                    data: {
+                        balance: { decrement: amount },
+                        pendingWithdrawals: { increment: amount },
+                    },
+                });
+                return withdrawal;
+            });
+        } catch (error) {
+            console.error("Error creating referral withdrawal request:", error);
+            throw error;
+        }
+    }
+
+    async getReferralProgramStats() {
+        try {
+            const [partners, activePartners, referrals, activeReferrals, earnings, pendingWithdrawals] = await Promise.all([
+                prisma.referralPartner.count(),
+                prisma.referralPartner.count({ where: { status: "active", emailVerified: true } }),
+                prisma.referralAttribution.count(),
+                prisma.referralAttribution.count({ where: { status: "active" } }),
+                prisma.referralCommission.aggregate({
+                    where: { status: "credited" },
+                    _sum: { amount: true, sourceAmount: true },
+                }),
+                prisma.referralWithdrawal.aggregate({
+                    where: { status: "pending" },
+                    _sum: { amount: true },
+                    _count: { id: true },
+                }),
+            ]);
+            return {
+                partners,
+                activePartners,
+                referrals,
+                activeReferrals,
+                totalCommissionPaid: earnings?._sum?.amount || new Prisma.Decimal(0),
+                referredRevenue: earnings?._sum?.sourceAmount || new Prisma.Decimal(0),
+                pendingWithdrawalAmount: pendingWithdrawals?._sum?.amount || new Prisma.Decimal(0),
+                pendingWithdrawalCount: pendingWithdrawals?._count?.id || 0,
+                commissionRate: process.env.REFERRAL_COMMISSION_RATE || "0.20",
+            };
+        } catch (error) {
+            console.error("Error fetching referral program stats:", error);
+            throw error;
+        }
+    }
+
+    async listReferralWithdrawals(status = "") {
+        try {
+            const where = status ? { status: String(status).trim().toLowerCase() } : {};
+            return await prisma.referralWithdrawal.findMany({
+                where,
+                orderBy: { requestedAt: "desc" },
+                take: 500,
+            });
+        } catch (error) {
+            console.error("Error listing referral withdrawals:", error);
+            throw error;
+        }
+    }
+
+    async resolveReferralWithdrawal(id, { status, note, processedBy }) {
+        if (!id || !status) return null;
+        const normalizedStatus = String(status).trim().toLowerCase();
+        if (!["paid", "rejected"].includes(normalizedStatus)) {
+            throw new Error("Withdrawal can only be marked paid or rejected.");
+        }
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const withdrawal = await tx.referralWithdrawal.findUnique({ where: { id } });
+                if (!withdrawal) throw new Error("Withdrawal request not found.");
+                if (withdrawal.status !== "pending") return withdrawal;
+
+                const amount = new Prisma.Decimal(withdrawal.amount || 0);
+                const updated = await tx.referralWithdrawal.update({
+                    where: { id },
+                    data: {
+                        status: normalizedStatus,
+                        note: note ? String(note) : withdrawal.note,
+                        processedBy: processedBy ? String(processedBy) : null,
+                        processedAt: new Date(),
+                    },
+                });
+
+                const partnerUpdate = {
+                    pendingWithdrawals: { decrement: amount },
+                };
+                if (normalizedStatus === "paid") {
+                    partnerUpdate.paidWithdrawals = { increment: amount };
+                } else {
+                    partnerUpdate.balance = { increment: amount };
+                }
+
+                await tx.referralPartner.update({
+                    where: { id: withdrawal.referralPartnerId },
+                    data: partnerUpdate,
+                });
+
+                return updated;
+            });
+        } catch (error) {
+            console.error("Error resolving referral withdrawal:", error);
             throw error;
         }
     }

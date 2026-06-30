@@ -20,6 +20,15 @@ const retryAtForAttempt = (attempt, now = new Date()) => {
     return new Date(now.getTime() + (attempt > RETRY_DELAYS_MS.length ? 3_600_000 : delay));
 };
 
+const isCheckoutRequestId = (value) => /^ws_CO_/i.test(String(value || "").trim());
+
+const isLikelyMpesaReceiptCode = (value) => {
+    const text = String(value || "").trim().toUpperCase();
+    if (!text || text === "NULL" || text === "UNDEFINED") return false;
+    if (isCheckoutRequestId(text) || text.startsWith("NOVA-")) return false;
+    return /^[A-Z0-9]{10,12}$/.test(text) && /[A-Z]/.test(text) && /\d/.test(text);
+};
+
 class MpesaReconciliationService {
     constructor(controller) {
         this.controller = controller;
@@ -95,16 +104,91 @@ class MpesaReconciliationService {
         }
     }
 
+    getStoredMpesaReceipt(payment = {}) {
+        return [payment.mpesaReceiptNumber, payment.code]
+            .map((value) => String(value || "").trim().toUpperCase())
+            .find((value) => isLikelyMpesaReceiptCode(value)) || "";
+    }
+
+    async completePaymentFromStoredReceipt(payment, receipt, source = "MPESA_RECEIPT_RESOLUTION") {
+        if (!payment?.id || !receipt) {
+            return { state: "SKIPPED", paymentId: payment?.id, platformID: payment?.platformID, reason: "Missing payment or receipt" };
+        }
+
+        if (typeof this.db.claimMpesaForSuccessfulFinalization === "function") {
+            const claimed = await this.db.claimMpesaForSuccessfulFinalization(payment.id);
+            if (!claimed) {
+                return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, receipt, reason: "Payment is already processing or complete" };
+            }
+        }
+
+        const resultDescription = payment.resultDescription || `Resolved from stored M-PESA receipt (${source})`;
+        const completedPayment = {
+            ...payment,
+            code: receipt,
+            mpesaReceiptNumber: receipt,
+            status: "COMPLETE",
+            resultCode: payment.resultCode || "0",
+            resultDescription,
+        };
+
+        let fulfillment = null;
+        if (typeof this.controller.completePaymentForService === "function") {
+            fulfillment = await this.controller.completePaymentForService(completedPayment);
+        }
+
+        const fulfillmentStatus = String(fulfillment?.status || "").toUpperCase();
+        const fulfillmentNeedsAttention = ["PENDING", "FAILED", "LOCKED"].includes(fulfillmentStatus);
+
+        const updateData = {
+            code: receipt,
+            mpesaReceiptNumber: receipt,
+            status: "COMPLETE",
+            resultCode: payment.resultCode || "0",
+            resultDescription,
+            verified: true,
+            lastReconciliationAt: new Date(),
+            reconciliationAttempts: { increment: 1 },
+            lastReconciliationError: fulfillmentNeedsAttention
+                ? `Payment marked COMPLETE from M-PESA receipt, but service fulfillment needs attention: ${fulfillment?.message || fulfillmentStatus || "unknown"}`
+                : null,
+            nextReconciliationAt: null,
+            reconciliationLeaseUntil: null,
+        };
+        if (!fulfillmentNeedsAttention) {
+            updateData.fulfilledAt = new Date();
+        }
+
+        await this.db.updateMpesaCodeByID(payment.id, updateData);
+
+        return {
+            state: "SUCCESS",
+            paymentId: payment.id,
+            platformID: payment.platformID,
+            receipt,
+            resultCode: payment.resultCode || "0",
+            resultDescription,
+            fulfillmentStatus: fulfillment?.status || "COMPLETE",
+            fulfillmentNeedsAttention,
+        };
+    }
+
     async reconcileMpesaPayment(paymentOrId, source = "MPESA_QUERY") {
         const payment = typeof paymentOrId === "string"
             ? await this.db.getMpesaByID(paymentOrId)
             : paymentOrId;
         if (!payment) return { state: "SKIPPED", paymentId: String(paymentOrId), reason: "Payment not found" };
-        const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
-        if (!checkoutRequestId) return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: "Missing CheckoutRequestID" };
         if (!["PENDING", "MANUAL_REVIEW"].includes(String(payment.status).toUpperCase())) {
             return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: `Payment is ${payment.status}` };
         }
+
+        const storedReceipt = this.getStoredMpesaReceipt(payment);
+        if (storedReceipt) {
+            return this.completePaymentFromStoredReceipt(payment, storedReceipt, source);
+        }
+
+        const checkoutRequestId = payment.checkoutRequestId || payment.reqcode;
+        if (!checkoutRequestId) return { state: "SKIPPED", paymentId: payment.id, platformID: payment.platformID, reason: "Missing CheckoutRequestID" };
 
         const settings = this.getSettings();
         const ageMs = Date.now() - new Date(payment.createdAt).getTime();
@@ -189,4 +273,4 @@ class MpesaReconciliationService {
     }
 }
 
-module.exports = { MpesaReconciliationService, nairobiTimestamp, retryAtForAttempt };
+module.exports = { MpesaReconciliationService, nairobiTimestamp, retryAtForAttempt, isLikelyMpesaReceiptCode };

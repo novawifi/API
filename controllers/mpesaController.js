@@ -670,13 +670,13 @@ class MpesaController {
         const shortCode = String(destinationShortCode || "").trim();
         const account = String(destinationAccount || "").trim();
 
-        if (!["till", "paybill"].includes(type)) {
-            throw new Error("Configure MPESA C2B destination as Till or Paybill.");
+        if (type !== "till") {
+            throw new Error("MPESA C2B destination must be a Till number. Paybill is not supported for this C2B mode.");
         }
         if (!/^\d{5,8}$/.test(shortCode)) {
-            throw new Error("MPESA C2B destination must be 5 to 8 digits.");
+            throw new Error("MPESA C2B Till number must be 5 to 8 digits.");
         }
-        return { type, shortCode, account };
+        return { type: "till", shortCode, account: "" };
     }
 
     async initiateC2BStkPush({
@@ -697,14 +697,15 @@ class MpesaController {
             throw new Error("Missing MPESA C2B shortcode or passkey.");
         }
 
-        const destination = destinationShortCode
+        const hasDirectDestination = Boolean(destinationShortCode);
+        const destination = hasDirectDestination
             ? this.validateDirectC2BDestination({ destinationType, destinationShortCode, destinationAccount })
             : {
                 type: String(c2bEnv.shortCodeType || "").toLowerCase() === "paybill" ? "paybill" : "till",
                 shortCode: String(c2bEnv.shortCode || ""),
                 account: "",
             };
-        const isPaybill = destination.type === "paybill";
+        const isPaybill = !hasDirectDestination && destination.type === "paybill";
         const businessShortCode = String(c2bEnv.shortCode);
         const partyB = destination.shortCode;
         const reference = this.sanitizeDarajaText(
@@ -4946,6 +4947,20 @@ class MpesaController {
                 if (!hasUnpaidAmount) {
                     await this.db.clearUnpaidBillNotifications(bill.platformID);
                 }
+            }
+            try {
+                await this.db.creditReferralCommissionForBillingPayment({
+                    platformID: bill.platformID,
+                    billID,
+                    sourceKey: `bill-payment:${payment.id || payment.code || payment.reqcode || billId}`,
+                    sourcePaymentId: payment.id || payment.code || payment.reqcode || null,
+                    sourceAmount: payment.amount || bill.price || bill.amount || 0,
+                    currency: bill.currency || "KES",
+                    paidAt,
+                    description: `20% referral reward for ${bill.name || "platform subscription"}`,
+                });
+            } catch (referralError) {
+                console.warn(`[Referral] Failed to credit commission for bill ${billId}:`, referralError?.message || referralError);
             }
             try {
                 await this.applyPaidDedicatedServerResize(bill.platformID, billId);

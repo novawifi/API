@@ -23,18 +23,21 @@ const payment = (overrides = {}) => ({
 });
 
 const harness = (queryResult) => {
-    const calls = { updates: [], records: [], finalized: 0 };
+    const calls = { updates: [], records: [], finalized: 0, fulfilled: 0, claims: 0, queried: 0 };
     const db = {
         getMpesaByID: async () => payment(),
+        claimMpesaForSuccessfulFinalization: async () => { calls.claims += 1; return true; },
         updateMpesaCodeByID: async (_id, data) => { calls.updates.push(data); return data; },
         recordMpesaReconciliation: async (_id, data) => { calls.records.push(data); return data; },
     };
     const controller = {
         db,
         finalizeReconciledStkPayment: async () => { calls.finalized += 1; },
+        completePaymentForService: async () => { calls.fulfilled += 1; return { status: "COMPLETE" }; },
     };
     const service = new MpesaReconciliationService(controller);
     service.queryStkPushStatus = async () => {
+        calls.queried += 1;
         if (queryResult instanceof Error) throw queryResult;
         return queryResult;
     };
@@ -72,6 +75,24 @@ test("accepted query without ResultCode remains pending", async () => {
     const result = await service.reconcileMpesaPayment(payment());
     assert.equal(result.state, "PENDING");
     assert.ok(calls.records[0].nextReconciliationAt instanceof Date);
+});
+
+test("manual review payment with stored M-PESA receipt completes without STK query", async () => {
+    const { service, calls } = harness({ ResultCode: "0" });
+    const result = await service.reconcileMpesaPayment(payment({
+        checkoutRequestId: null,
+        reqcode: null,
+        code: "UFOGW90C8C",
+        status: "MANUAL_REVIEW",
+    }), "MANUAL_RECONCILIATION");
+
+    assert.equal(result.state, "SUCCESS");
+    assert.equal(result.receipt, "UFOGW90C8C");
+    assert.equal(calls.queried, 0);
+    assert.equal(calls.fulfilled, 1);
+    assert.equal(calls.updates[0].status, "COMPLETE");
+    assert.equal(calls.updates[0].code, "UFOGW90C8C");
+    assert.equal(calls.updates[0].mpesaReceiptNumber, "UFOGW90C8C");
 });
 
 for (const message of ["network timeout", "HTTP 500"]) {

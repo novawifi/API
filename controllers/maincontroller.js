@@ -658,6 +658,123 @@ class Controller {
     return process.env.SERVER_URL || process.env.NEXT_PUBLIC_SERVER_URL || "https://api.novawifi.online";
   }
 
+  getReferralPortalBaseUrl() {
+    return (
+      process.env.REFERRAL_PORTAL_URL ||
+      process.env.LANDING_URL ||
+      process.env.NEXT_PUBLIC_LANDING_URL ||
+      this.getClientBaseUrl()
+    ).replace(/\/+$/, "");
+  }
+
+  getReferralLandingUrl(referralCode = "") {
+    const base = this.getReferralPortalBaseUrl();
+    const code = this.db.normalizeReferralCode(referralCode);
+    return code ? `${base}/?ref=${encodeURIComponent(code)}#register` : `${base}/referrals`;
+  }
+
+  hashReferralVerificationToken(token) {
+    return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+  }
+
+  normalizeReferralEmail(email) {
+    return String(email || "").trim().toLowerCase();
+  }
+
+  normalizeReferralPhone(phone) {
+    return String(phone || "").trim().replace(/\s+/g, "");
+  }
+
+  sanitizeReferralPartner(partner) {
+    if (!partner) return null;
+    const {
+      password,
+      token,
+      emailVerificationTokenHash,
+      emailVerificationExpiresAt,
+      ...safePartner
+    } = partner;
+    return {
+      ...safePartner,
+      referralLink: this.getReferralLandingUrl(partner.referralCode),
+    };
+  }
+
+  buildReferralDashboardPayload(dashboard) {
+    if (!dashboard) return null;
+    return {
+      ...dashboard,
+      partner: this.sanitizeReferralPartner(dashboard.partner),
+      program: this.getReferralProgramCopy(),
+    };
+  }
+
+  getReferralProgramCopy() {
+    return {
+      commissionRate: Number(process.env.REFERRAL_COMMISSION_RATE || 0.2),
+      headline: "Earn 20% monthly for every ISP you refer to Nova WiFi.",
+      description: "Share Nova WiFi with ISP owners. When a referred platform activates and pays its monthly package, your referral account earns 20% of that monthly package payment.",
+      seoTitle: "Nova WiFi Referral Program for ISPs | Earn Monthly Recurring Rewards",
+      seoDescription: "Join the Nova WiFi ISP referral program and earn 20% monthly recurring rewards from referred ISP platforms that activate and pay their subscription.",
+    };
+  }
+
+  async sendReferralVerificationEmail(referrer, verificationToken) {
+    const verifyUrl = `${this.getServerBaseUrl()}/req/referrals/verify?token=${encodeURIComponent(verificationToken)}`;
+    const loginUrl = `${this.getReferralPortalBaseUrl()}/referrals`;
+    const message = [
+      `Hello ${referrer.name || "there"},`,
+      "",
+      "Verify your email to activate your Nova WiFi Referral Program account.",
+      "",
+      `Verify Email: ${verifyUrl}`,
+      "",
+      "Once verified, you can track referrals, activations, monthly earnings, and withdrawal requests.",
+      "",
+      `Referral dashboard: ${loginUrl}`,
+    ].join("\n");
+
+    return this.mailer.EmailTemplate({
+      name: referrer.name || referrer.email,
+      type: "accounts",
+      email: referrer.email,
+      subject: "Verify your Nova WiFi referral account",
+      message,
+      company: "NOVA NETCORE SYSTEMS",
+    });
+  }
+
+  generateReferralAuthToken(referrer) {
+    return jwt.sign({
+      referralPartnerId: referrer.id,
+      email: referrer.email,
+      scope: "referral",
+    }, this.JWT_SECRET, { expiresIn: "30d" });
+  }
+
+  async authReferralSession(token) {
+    const cleanToken = String(token || "").trim();
+    if (!cleanToken) {
+      return { success: false, message: "Missing referral session token." };
+    }
+    try {
+      const decoded = jwt.verify(cleanToken, this.JWT_SECRET);
+      if (decoded?.scope !== "referral" || !decoded?.referralPartnerId) {
+        return { success: false, message: "Invalid referral session." };
+      }
+      const referrer = await this.db.getReferralPartnerByToken(cleanToken);
+      if (!referrer || referrer.id !== decoded.referralPartnerId) {
+        return { success: false, message: "Referral session expired. Please log in again." };
+      }
+      if (!referrer.emailVerified || referrer.status !== "active") {
+        return { success: false, message: "Verify your email before accessing the referral program." };
+      }
+      return { success: true, referrer };
+    } catch (_error) {
+      return { success: false, message: "Referral session expired. Please log in again." };
+    }
+  }
+
   getPaystackSecretKey() {
     return process.env.PAYSTACK_SECRET_KEY || "";
   }
@@ -1572,6 +1689,268 @@ class Controller {
     }
   }
 
+  async referralProgramInfo(req, res) {
+    try {
+      const stats = await this.db.getReferralProgramStats();
+      return res.json({
+        success: true,
+        program: this.getReferralProgramCopy(),
+        stats,
+      });
+    } catch (error) {
+      console.error("Referral program info error:", error);
+      return res.json({
+        success: true,
+        program: this.getReferralProgramCopy(),
+        stats: null,
+      });
+    }
+  }
+
+  async referralRegister(req, res) {
+    const { name, email, phone, password } = req.body || {};
+    const cleanName = String(name || "").trim();
+    const cleanEmail = this.normalizeReferralEmail(email);
+    const cleanPhone = this.normalizeReferralPhone(phone);
+
+    if (!cleanName || !cleanEmail || !cleanPhone || !password) {
+      return res.status(400).json({ success: false, message: "Name, email, phone, and password are required." });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ success: false, message: "Enter a valid email address." });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ success: false, message: "Password must be at least 8 characters." });
+    }
+
+    try {
+      const existingEmail = await this.db.getReferralPartnerByEmail(cleanEmail);
+      if (existingEmail) {
+        return res.status(409).json({ success: false, message: "A referral account already exists for this email." });
+      }
+      const existingPhone = await this.db.getReferralPartnerByPhone(cleanPhone);
+      if (existingPhone) {
+        return res.status(409).json({ success: false, message: "A referral account already exists for this phone number." });
+      }
+
+      const verificationToken = crypto.randomBytes(32).toString("hex");
+      const verificationTokenHash = this.hashReferralVerificationToken(verificationToken);
+      const hashedPassword = await bcrypt.hash(String(password), 10);
+      const referralCode = await this.db.generateUniqueReferralCode(cleanName, cleanEmail);
+
+      const referrer = await this.db.createReferralPartner({
+        name: cleanName,
+        email: cleanEmail,
+        phone: cleanPhone,
+        password: hashedPassword,
+        referralCode,
+        status: "pending_verification",
+        emailVerified: false,
+        emailVerificationTokenHash: verificationTokenHash,
+        emailVerificationExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      });
+
+      let emailWarning = null;
+      try {
+        const emailResult = await this.sendReferralVerificationEmail(referrer, verificationToken);
+        if (!emailResult?.success) {
+          emailWarning = emailResult?.message || "Verification email could not be sent.";
+        }
+      } catch (emailError) {
+        emailWarning = emailError?.message || "Verification email could not be sent.";
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: "Referral account created. Verify your email to activate rewards.",
+        referrer: this.sanitizeReferralPartner(referrer),
+        emailWarning,
+      });
+    } catch (error) {
+      console.error("Referral registration error:", error);
+      return res.status(500).json({ success: false, message: "Failed to create referral account." });
+    }
+  }
+
+  async referralVerifyEmail(req, res) {
+    const token = req.body?.token || req.query?.token;
+    if (!token) {
+      return res.status(400).json({ success: false, message: "Verification token is required." });
+    }
+
+    try {
+      const tokenHash = this.hashReferralVerificationToken(token);
+      const referrer = await this.db.getReferralPartnerByVerificationHash(tokenHash);
+      if (!referrer) {
+        return res.status(400).json({ success: false, message: "Invalid or expired verification link." });
+      }
+      const expiresAt = referrer.emailVerificationExpiresAt ? new Date(referrer.emailVerificationExpiresAt) : null;
+      if (expiresAt && expiresAt < new Date()) {
+        return res.status(400).json({ success: false, message: "Verification link expired. Register again or request a new link." });
+      }
+
+      const updated = await this.db.updateReferralPartner(referrer.id, {
+        status: "active",
+        emailVerified: true,
+        emailVerificationTokenHash: null,
+        emailVerificationExpiresAt: null,
+      });
+
+      if (req.method === "GET") {
+        return res.redirect(`${this.getReferralPortalBaseUrl()}/referrals?verified=true&mode=login`);
+      }
+
+      return res.json({
+        success: true,
+        message: "Email verified. You can now log in to the referral dashboard.",
+        referrer: this.sanitizeReferralPartner(updated),
+      });
+    } catch (error) {
+      console.error("Referral verification error:", error);
+      return res.status(500).json({ success: false, message: "Failed to verify referral email." });
+    }
+  }
+
+  async referralLogin(req, res) {
+    const email = this.normalizeReferralEmail(req.body?.email);
+    const { password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: "Email and password are required." });
+    }
+
+    try {
+      const referrer = await this.db.getReferralPartnerByEmail(email);
+      if (!referrer) {
+        return res.status(401).json({ success: false, message: "Invalid email or password." });
+      }
+      const passwordValid = await bcrypt.compare(String(password), referrer.password);
+      if (!passwordValid) {
+        return res.status(401).json({ success: false, message: "Invalid email or password." });
+      }
+      if (!referrer.emailVerified || referrer.status !== "active") {
+        return res.status(403).json({ success: false, message: "Verify your email before logging in." });
+      }
+
+      const token = this.generateReferralAuthToken(referrer);
+      const updated = await this.db.updateReferralPartner(referrer.id, {
+        token,
+        lastLoginAt: new Date(),
+      });
+      const dashboard = await this.db.getReferralDashboard(referrer.id);
+
+      return res.json({
+        success: true,
+        message: "Login successful.",
+        token,
+        referrer: this.sanitizeReferralPartner(updated),
+        dashboard: this.buildReferralDashboardPayload(dashboard),
+      });
+    } catch (error) {
+      console.error("Referral login error:", error);
+      return res.status(500).json({ success: false, message: "Failed to log in." });
+    }
+  }
+
+  async referralAuth(req, res) {
+    const session = await this.authReferralSession(req.body?.token);
+    if (!session.success) return res.status(401).json(session);
+    return res.json({
+      success: true,
+      message: "Referral session active.",
+      referrer: this.sanitizeReferralPartner(session.referrer),
+    });
+  }
+
+  async referralDashboard(req, res) {
+    const session = await this.authReferralSession(req.body?.token);
+    if (!session.success) return res.status(401).json(session);
+    try {
+      const dashboard = await this.db.getReferralDashboard(session.referrer.id);
+      return res.json({
+        success: true,
+        dashboard: this.buildReferralDashboardPayload(dashboard),
+      });
+    } catch (error) {
+      console.error("Referral dashboard error:", error);
+      return res.status(500).json({ success: false, message: "Failed to fetch referral dashboard." });
+    }
+  }
+
+  async referralWithdraw(req, res) {
+    const session = await this.authReferralSession(req.body?.token);
+    if (!session.success) return res.status(401).json(session);
+    try {
+      const withdrawal = await this.db.createReferralWithdrawalRequest(session.referrer.id, {
+        amount: req.body?.amount,
+        destinationType: req.body?.destinationType,
+        shortCode: req.body?.shortCode,
+        accountNumber: req.body?.accountNumber,
+      });
+      const dashboard = await this.db.getReferralDashboard(session.referrer.id);
+      return res.json({
+        success: true,
+        message: "Withdrawal request submitted for review.",
+        withdrawal,
+        dashboard: this.buildReferralDashboardPayload(dashboard),
+      });
+    } catch (error) {
+      return res.status(400).json({ success: false, message: error?.message || "Failed to submit withdrawal request." });
+    }
+  }
+
+  async referralLogout(req, res) {
+    const session = await this.authReferralSession(req.body?.token);
+    if (session.success) {
+      await this.db.updateReferralPartner(session.referrer.id, { token: null });
+    }
+    return res.json({ success: true, message: "Logged out successfully." });
+  }
+
+  async managerReferralDashboard(req, res) {
+    const { token, withdrawalStatus } = req.body || {};
+    if (!token) return res.json({ success: false, message: "Missing credentials required!" });
+    try {
+      const session = await this.authManagerSession(token);
+      if (!session.success) return res.json({ success: false, message: session.message });
+      const [stats, withdrawals] = await Promise.all([
+        this.db.getReferralProgramStats(),
+        this.db.listReferralWithdrawals(withdrawalStatus || ""),
+      ]);
+      return res.json({
+        success: true,
+        stats,
+        withdrawals,
+        program: this.getReferralProgramCopy(),
+      });
+    } catch (error) {
+      console.error("Manager referral dashboard error:", error);
+      return res.status(500).json({ success: false, message: "Failed to fetch referral program dashboard." });
+    }
+  }
+
+  async managerResolveReferralWithdrawal(req, res) {
+    const { token, id, status, note } = req.body || {};
+    if (!token || !id || !status) {
+      return res.json({ success: false, message: "Missing credentials required!" });
+    }
+    try {
+      const session = await this.authManagerSession(token);
+      if (!session.success) return res.json({ success: false, message: session.message });
+      const withdrawal = await this.db.resolveReferralWithdrawal(id, {
+        status,
+        note,
+        processedBy: session.manager?.email || session.admin?.email || "manager",
+      });
+      return res.json({
+        success: true,
+        message: "Referral withdrawal updated.",
+        withdrawal,
+      });
+    } catch (error) {
+      return res.status(400).json({ success: false, message: error?.message || "Failed to update referral withdrawal." });
+    }
+  }
+
   async managerUpdateBillPayment(req, res) {
     const { token, paymentData } = req.body || {};
     if (!token || !paymentData?.id) {
@@ -1586,6 +1965,7 @@ class Controller {
       if (!payment || payment.service !== "bill") {
         return res.json({ success: false, message: "Bill payment not found!" });
       }
+      const wasComplete = String(payment.status || "").toUpperCase() === "COMPLETE";
       const nextStatus = paymentData.status || payment.status;
       const nextCode = paymentData.code || payment.code;
       const nextAmount = paymentData.amount ?? payment.amount;
@@ -1598,6 +1978,13 @@ class Controller {
         code: nextCode,
         amount: String(nextAmount),
       });
+      if (String(nextStatus || "").toUpperCase() === "COMPLETE" && !wasComplete) {
+        try {
+          await this.mpesa.completePaymentForService(updatedPayment);
+        } catch (fulfillmentError) {
+          console.error("Bill payment fulfillment after manager update failed:", fulfillmentError);
+        }
+      }
       return res.json({
         success: true,
         message: "Bill payment updated successfully",
@@ -3607,9 +3994,7 @@ class Controller {
     const b2bShortCodeType = ["till", "paybill"].includes(String(data.mpesaShortCodeType || "").toLowerCase())
       ? data.mpesaShortCodeType
       : "Till";
-    const c2bShortCodeType = ["till", "paybill"].includes(String(data.mpesaC2BShortCodeType || "").toLowerCase())
-      ? data.mpesaC2BShortCodeType
-      : "Till";
+    const c2bShortCodeType = "Till";
 
     const payload = {
       IsC2B: data.IsC2B === true,
@@ -3622,7 +4007,7 @@ class Controller {
       mpesaAccountNumber: data.mpesaAccountNumber || "",
       mpesaC2BShortCode: data.mpesaC2BShortCode || "",
       mpesaC2BShortCodeType: c2bShortCodeType,
-      mpesaC2BAccountNumber: data.mpesaC2BAccountNumber || "",
+      mpesaC2BAccountNumber: "",
       mpesaAccountInitiator: data.mpesaAccountInitiator || "",
       mpesaAccountInitiatorPassword: data.mpesaAccountInitiatorPassword || "",
       mpesaPassKey: data.mpesaPassKey || "",
@@ -3640,8 +4025,14 @@ class Controller {
 
   validateMpesaSettings(data = {}, adminID) {
     if (data.IsC2B === true) {
-      if (!data.mpesaC2BShortCode || !data.mpesaC2BShortCodeType || !adminID) {
+      if (!data.mpesaC2BShortCode || !adminID) {
         return "All MPESA fields must be filled out!";
+      }
+      if (String(data.mpesaC2BShortCodeType || "Till").toLowerCase() !== "till") {
+        return "MPESA C2B only supports Till numbers. Paybill is not supported for this mode.";
+      }
+      if (!/^\d{5,8}$/.test(String(data.mpesaC2BShortCode || "").trim())) {
+        return "MPESA C2B Till number must be 5 to 8 digits.";
       }
     } else if (data.IsAPI === true) {
       if (!data.mpesaConsumerKey || !data.mpesaConsumerSecret || !data.mpesaShortCode || !data.mpesaShortCodeType || !data.mpesaPassKey || !adminID) {
@@ -3657,7 +4048,6 @@ class Controller {
 
   requiresPackageAccountNumbers(config = {}) {
     return (
-      (config.IsC2B === true && String(config.mpesaC2BShortCodeType || "").toLowerCase() === "paybill") ||
       (config.IsAPI === true && String(config.mpesaShortCodeType || "").toLowerCase() === "paybill") ||
       (config.IsB2B === true && String(config.mpesaShortCodeType || "").toLowerCase() === "paybill")
     );
@@ -6040,6 +6430,7 @@ class Controller {
         message: "Login successful!",
         token,
         user: updatedUser,
+        manager: updatedUser,
       });
     } catch (error) {
       console.error("Login error:", error);
@@ -6061,17 +6452,14 @@ class Controller {
           message: "Missing credentials required!",
         });
       }
-      const admin = await this.db.getSuperUserByToken(token);
-      if (!admin) {
-        return res.json({
-          success: false,
-          message: "Invalid token. Authentication failed!",
-        });
-      }
+      const session = await this.authManagerSession(token);
+      if (!session.success) return res.json(session);
+
       return res.json({
         success: true,
         message: "Authentication successful",
-        admin,
+        admin: session.admin,
+        manager: session.manager,
       });
     } catch (error) {
       console.error("An error occurred during authentication:", error);
@@ -7730,6 +8118,40 @@ class Controller {
 
   }
 
+  async logoutManager(req, res) {
+
+    try {
+      const { token } = req.body;
+      const cleanToken = typeof token === "string" ? token.trim() : "";
+      if (!cleanToken) {
+        return res.json({
+          success: false,
+          message: "Missing credentials required!",
+        });
+      }
+
+      const manager = await this.db.getSuperUserByToken(cleanToken);
+      if (manager) {
+        await this.db.updateSuperUser({
+          id: manager.id,
+          token: `revoked:${manager.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: "Logout successful",
+      });
+    } catch (error) {
+      console.error("An error occurred during manager logout:", error);
+      return res.json({
+        success: false,
+        message: "Internal server error. Please try again later.",
+      });
+    }
+
+  }
+
   async checkIfDomainResolvesToServer(req, res) {
 
     const { url } = req.body;
@@ -7796,11 +8218,19 @@ class Controller {
           message: "Payment not found!",
         });
       }
+      const wasComplete = String(payment.status || "").toUpperCase() === "COMPLETE";
 
       const updatedPayment = await this.db.updateMpesaCodeByID(paymentData.id, {
         status: paymentData.status,
         code: paymentData.code
       });
+      if (updatedPayment?.service === "bill" && String(paymentData.status || "").toUpperCase() === "COMPLETE" && !wasComplete) {
+        try {
+          await this.mpesa.completePaymentForService(updatedPayment);
+        } catch (fulfillmentError) {
+          console.error("Bill payment fulfillment after admin update failed:", fulfillmentError);
+        }
+      }
 
       this.refreshDashboardStats(platformID, { role: auth.admin.role }).catch((err) => {
         console.error("Dashboard stats refresh after payment update failed:", err?.message || err);
@@ -8034,7 +8464,8 @@ class Controller {
   }
 
   async authManagerSession(token) {
-    if (!token) {
+    const cleanToken = typeof token === "string" ? token.trim() : "";
+    if (!cleanToken) {
       return {
         success: false,
         message: "Missing credentials required!",
@@ -8042,17 +8473,36 @@ class Controller {
     }
 
     try {
-      const admin = await this.db.getSuperUserByToken(token);
-      if (!admin) {
+      let decoded = null;
+      try {
+        decoded = jwt.verify(cleanToken, this.JWT_SECRET);
+      } catch (error) {
         return {
           success: false,
           message: "Invalid token. Authentication failed!",
         };
       }
+
+      const manager = await this.db.getSuperUserByToken(cleanToken);
+      if (!manager) {
+        return {
+          success: false,
+          message: "Invalid token. Authentication failed!",
+        };
+      }
+
+      if (decoded?.adminID && manager.email && decoded.adminID !== manager.email) {
+        return {
+          success: false,
+          message: "Invalid token. Authentication failed!",
+        };
+      }
+
       return {
         success: true,
         message: "Authentication successful",
-        admin,
+        admin: manager,
+        manager,
       };
     } catch (error) {
       console.error("An error occurred during authentication:", error);
@@ -9018,7 +9468,7 @@ class Controller {
   }
 
   async addPlatform(req, res) {
-    const { token, name, url, platformID, adminID, email, password, role, phone, adminName, subscriptionPlan, trialDays, trialEndsAt, trialMode } = req.body;
+    const { token, name, url, platformID, adminID, email, password, role, phone, adminName, subscriptionPlan, trialDays, trialEndsAt, trialMode, referralCode, ref, affiliateCode } = req.body;
     if (!token || !name || !url || !platformID || !adminID || !email || !password || !role) {
       return res.json({
         success: false,
@@ -9173,6 +9623,21 @@ class Controller {
 
       data.url = sanitizedUrl;
       const add = await this.db.createPlatform(data);
+      let referral = null;
+      const referralInput = referralCode || ref || affiliateCode;
+      if (referralInput) {
+        try {
+          referral = await this.db.attachReferralToPlatform({
+            referralCode: referralInput,
+            platformID,
+            platformName: name,
+            adminEmail: email,
+            subscriptionPlan: plan,
+          });
+        } catch (referralError) {
+          console.warn(`[AddPlatform] Referral attribution failed for ${platformID}:`, referralError?.message || referralError);
+        }
+      }
       if (billingIsDue) {
         await this.db.upsertPlatformNotification(platformID, "Billing payment due", {
           message: `Your ${plan} plan bill is due. Amount due: KES ${billingAmount}.`,
@@ -9225,6 +9690,7 @@ class Controller {
       return res.status(201).json({
         success: true,
         message: "Platform added successfully",
+        referral,
       });
     } catch (error) {
       console.log("An error occured", error);
@@ -9513,7 +9979,7 @@ class Controller {
   };
 
   async registerPlatform(req, res) {
-    const { name, email, password, phone, url, platformID, adminID, subscriptionPlan } = req.body;
+    const { name, email, password, phone, url, platformID, adminID, subscriptionPlan, referralCode, ref, affiliateCode } = req.body;
     if (!name || !url || !email || !password || !platformID || !adminID) {
       return res.status(400).json({
         success: false,
@@ -9665,6 +10131,21 @@ class Controller {
         subscriptionPlan: plan,
         trialEndsAt,
       });
+      let referral = null;
+      const referralInput = referralCode || ref || affiliateCode;
+      if (referralInput) {
+        try {
+          referral = await this.db.attachReferralToPlatform({
+            referralCode: referralInput,
+            platformID,
+            platformName: name,
+            adminEmail: email,
+            subscriptionPlan: plan,
+          });
+        } catch (referralError) {
+          console.warn(`[Register] Referral attribution failed for ${platformID}:`, referralError?.message || referralError);
+        }
+      }
       this.notifyNewPlatformCreatedSilently(
         { name, url: sanitizedUrl, platformID },
         { phone, name, email }
@@ -9714,6 +10195,7 @@ class Controller {
         },
         token: token,
         platform: newPlatform,
+        referral,
         loginUrl,
         emailWarning,
       });

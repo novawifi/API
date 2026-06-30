@@ -179,6 +179,94 @@ model Platform {
   updatedAt   DateTime @updatedAt
 }
 
+model ReferralPartner {
+  id                           String   @id @default(uuid())
+  name                         String
+  email                        String   @unique
+  phone                        String   @unique
+  password                     String
+  token                        String?  @unique
+  referralCode                 String   @unique
+  status                       String   @default("pending_verification")
+  emailVerified                Boolean  @default(false)
+  emailVerificationTokenHash   String?  @unique
+  emailVerificationExpiresAt   DateTime?
+  balance                      Decimal  @default(0.00) @db.Decimal(14, 2)
+  lifetimeEarnings             Decimal  @default(0.00) @db.Decimal(14, 2)
+  pendingWithdrawals           Decimal  @default(0.00) @db.Decimal(14, 2)
+  paidWithdrawals              Decimal  @default(0.00) @db.Decimal(14, 2)
+  lastLoginAt                  DateTime?
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+
+  @@index([status])
+  @@index([emailVerified])
+}
+
+model ReferralAttribution {
+  id                String    @id @default(uuid())
+  referralPartnerId String
+  platformID        String    @unique
+  platformName      String?
+  adminEmail        String?
+  subscriptionPlan  String?
+  referralCode      String
+  status            String    @default("pending")
+  registeredAt      DateTime  @default(now())
+  activatedAt       DateTime?
+  lastCommissionAt  DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([referralPartnerId])
+  @@index([referralCode])
+  @@index([status])
+}
+
+model ReferralCommission {
+  id                String   @id @default(uuid())
+  referralPartnerId String
+  attributionId     String?
+  platformID        String
+  billID            String?
+  sourceKey         String   @unique
+  sourcePaymentId   String?
+  sourceAmount      Decimal  @default(0.00) @db.Decimal(14, 2)
+  amount            Decimal  @default(0.00) @db.Decimal(14, 2)
+  rate              Decimal  @default(0.20) @db.Decimal(5, 4)
+  currency          String   @default("KES")
+  status            String   @default("credited")
+  description       String?
+  paidAt            DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([referralPartnerId])
+  @@index([platformID])
+  @@index([status])
+  @@index([paidAt])
+}
+
+model ReferralWithdrawal {
+  id                String    @id @default(uuid())
+  referralPartnerId String
+  amount            Decimal   @default(0.00) @db.Decimal(14, 2)
+  destinationType   String
+  shortCode         String
+  accountNumber     String?
+  status            String    @default("pending")
+  requestedAt       DateTime  @default(now())
+  processedAt       DateTime?
+  processedBy       String?
+  note              String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([referralPartnerId])
+  @@index([status])
+  @@index([requestedAt])
+}
+
 model PlatformNotification {
   id          String    @id @default(uuid())
   platformID  String

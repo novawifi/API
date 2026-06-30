@@ -2302,11 +2302,17 @@ Price: KSH ${service.price}</p>
     async reconcilePendingPayments(platform) {
         const platformID = platform.platformID;
         const cutoff = new Date(Date.now() - 2 * 60 * 1000);
-        const pending = await this.db.getMpesaByStatuses(platformID, ["PENDING", "PROCESSING"], cutoff);
+        const pending = await this.db.getMpesaByStatuses(platformID, ["PENDING", "PROCESSING", "MANUAL_REVIEW"], cutoff);
         if (!pending || pending.length === 0) return;
 
         for (const payment of pending) {
             try {
+                const storedReceipt = this.mpesa.reconciliation?.getStoredMpesaReceipt?.(payment);
+                if (storedReceipt) {
+                    await this.mpesa.reconciliation.completePaymentFromStoredReceipt(payment, storedReceipt, "CRON_RECEIPT_RESOLUTION");
+                    continue;
+                }
+
                 const invoiceId = payment.reqcode || payment.code;
                 const statusInfo = await this.mpesa.fetchIntaSendStatus(invoiceId);
                 if (!statusInfo?.state) continue;
